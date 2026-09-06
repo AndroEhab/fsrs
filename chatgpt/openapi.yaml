@@ -246,12 +246,13 @@ paths:
       operationId: getDueFlashcards
       summary: Get flashcards due for review
       description: >
-        Returns flashcards that are due for review right now: new cards (never
-        reviewed) plus cards whose scheduled FSRS due time has arrived, ordered
-        earliest-due first. Optionally restrict to one deck (by deckId —
-        stable deck id preferred — or legacy deck name) and paginate with
-        pageSize/pageToken. Read-only; does not modify scheduling. After the
-        user answers a card, record the result with reviewFlashcard.
+        Returns active flashcards that are due for review right now: new cards
+        (never reviewed) plus cards whose scheduled FSRS due time has arrived;
+        suspended cards are excluded. Results are ordered earliest-due first.
+        Optionally restrict to one deck (by deckId — stable deck id preferred —
+        or legacy deck name) and paginate with pageSize/pageToken. Read-only;
+        does not modify scheduling. After the user answers a card, record the
+        result with reviewFlashcard.
       parameters:
         - name: deckId
           in: query

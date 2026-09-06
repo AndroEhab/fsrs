@@ -173,8 +173,8 @@ function msOf(value: { toMillis(): number } | number): number {
  *  - Suspended cards never match the search_cards review facet — the
  *    `suspended` filter is the only way to select them (a suspended card is
  *    not "due", "not due", "new", or "reviewed" within THIS query's facets;
- *    the existing dueFlashcards/review-session endpoints do not read the
- *    field and behave exactly as before).
+ *    dueFlashcards also excludes suspended cards, while review-session
+ *    endpoints retain their existing snapshot semantics).
  *  - `due`: due time has arrived (new cards are due immediately at
  *    creation — their `due` equals creation time).
  *  - `notDue`: scheduled strictly in the future.

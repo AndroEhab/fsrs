@@ -62,7 +62,7 @@ backend **only when `NODE_ENV=production`**; `health` is always public.
 | POST | `/createFlashcardHandler` | `createFlashcard` | Create a card (front/back, optional `deckId`/`deck`/tags) |
 | POST | `/bulkCreateFlashcardsHandler` | `bulkCreateFlashcards` | Atomically create up to 100 cards (`{ cards: [...] }` → `201 { cards }`) |
 | GET | `/listFlashcardsHandler` | `listFlashcards` | List (filters `deckId`/`deck`, `tags` ANY-of; pagination `pageSize`, `pageToken`) |
-| GET | `/dueFlashcardsHandler` | `getDueFlashcards` | Cards due for review now (new + scheduled, earliest due first; optional `deckId`/`deck` + pagination) |
+| GET | `/dueFlashcardsHandler` | `getDueFlashcards` | Active cards due for review now (new + scheduled; suspended cards excluded), earliest due first; optional `deckId`/`deck` + pagination |
 | POST | `/startReviewSessionHandler` | `startReviewSession` | Start a persistent review session: snapshot EVERY matching card (the due queue, or optional `deckId`/`deck`/`tags`/`cardIds` selectors — never capped, earliest due first); reports mode/dueCount/remainingCount; returns session + first card |
 | GET | `/getReviewSessionHandler/{sessionId}` | `getReviewSession` | Get a review session (any status) plus its current card; only the starting API key can read it (403 otherwise) |
 | POST | `/submitSessionReviewHandler/{sessionId}` | `submitSessionReview` | Rate the session's expected current card (`{ rating, reviewAt? }`); atomically applies FSRS and advances the session; returns session + next card |

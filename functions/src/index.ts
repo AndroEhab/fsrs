@@ -366,6 +366,7 @@ export const dueFlashcardsHandler = onRequest({ cors: true }, async (req, res) =
 
   const url = new URL(req.url, `https://${req.headers.host}`);
   const query = {
+    deckId: url.searchParams.get('deckId') || undefined,
     deck: url.searchParams.get('deck') || undefined,
     pageSize: url.searchParams.get('pageSize') ? parseInt(url.searchParams.get('pageSize')!, 10) : undefined,
     pageToken: url.searchParams.get('pageToken') || undefined,

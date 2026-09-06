@@ -751,7 +751,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Get due flashcards',
       description:
-        'Returns flashcards that are due for review right now: new cards (never reviewed) plus cards whose scheduled FSRS due time has arrived, ordered earliest-due first. Optionally restrict to one deck by deckId (stable deck id — preferred) or legacy deck name (deck), and paginate with pageSize (1-100, default 20) and pageToken (pass the nextPageToken from a previous response to get the next page). Use this when the user wants to review or study their cards. Read-only; does not modify scheduling.',
+        'Returns active flashcards that are due for review right now: new cards (never reviewed) plus cards whose scheduled FSRS due time has arrived, ordered earliest-due first. Suspended cards are excluded. Optionally restrict to one deck by deckId (stable deck id — preferred) or legacy deck name (deck), and paginate with pageSize (1-100, default 20) and pageToken (pass the nextPageToken from a previous response to get the next page). Use this when the user wants to review or study their cards. Read-only; does not modify scheduling.',
       inputSchema: {
         deckId: z.string().max(100).optional(),
         deck: z.string().max(100).optional(),
@@ -1035,7 +1035,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Suspend flashcards',
       description:
-        'Suspends one or more flashcards by id (up to 100, unique ids): sets the persisted `suspended: true` flag. A suspended card keeps ALL content and scheduling state (due, FSRS fields, reviewLog — nothing is lost or rescheduled); it is simply excluded from active review surfaces: search_cards with `suspended: true` selects them, they never match its review facet, and with no suspended filter they still appear. NOTE: the legacy due/review endpoints (get_due_flashcards, review sessions) do NOT read the flag and behave exactly as before — suspending never reschedules or hides a card from an already-started session. The backend commits atomically in one transaction; ids that do not exist are omitted (never an error). Returns the updated cards in input order. Use suspend_flashcards to pause cards the user does not want to review right now (e.g. too-hard or skipped cards), and unsuspend_flashcards to resume them.',
+        'Suspends one or more flashcards by id (up to 100, unique ids): sets the persisted `suspended: true` flag. A suspended card keeps ALL content and scheduling state (due, FSRS fields, reviewLog — nothing is lost or rescheduled); it is excluded from active due-card review, while search_cards with `suspended: true` selects it and it never matches that tool\'s review facet. With no suspended filter, search_cards still returns both states; review sessions retain their existing snapshot semantics. The backend commits atomically in one transaction; ids that do not exist are omitted (never an error). Returns the updated cards in input order.',
       inputSchema: {
         ids: z.array(z.string().min(1, 'id is required')).min(1, 'At least one id is required').max(100, 'No more than 100 ids per request').refine((ids) => new Set(ids).size === ids.length, { message: 'Duplicate card ids are not allowed' }),
       },

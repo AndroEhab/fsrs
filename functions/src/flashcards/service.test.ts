@@ -599,11 +599,10 @@ describe('Flashcard Service', () => {
       expect(result.nextPageToken).toBe('2');
     });
 
-    it('does NOT filter suspended cards (legacy behavior unchanged — no suspended predicate)', async () => {
-      // A suspended card is still returned by the existing due endpoint: the
-      // suspended attribute is filterable ONLY via search_cards.
+    it('excludes suspended cards while retaining active due cards', async () => {
       const mockDocs = [
-        { id: '1', data: () => ({ front: 'F1', back: 'B1', tags: [], createdAt: {}, updatedAt: {}, due: mockTimestamp(new Date('2026-08-01T00:00:00Z')), state: 0, stability: 0, difficulty: 0, reps: 0, lapses: 0, reviewLog: [], suspended: true }) },
+        { id: 'suspended', data: () => ({ front: 'Suspended', back: 'B', tags: [], createdAt: {}, updatedAt: {}, due: mockTimestamp(new Date('2026-08-01T00:00:00Z')), state: 0, stability: 0, difficulty: 0, reps: 0, lapses: 0, reviewLog: [], suspended: true }) },
+        { id: 'active', data: () => ({ front: 'Active', back: 'B', tags: [], createdAt: {}, updatedAt: {}, due: mockTimestamp(new Date('2026-08-01T00:00:00Z')), state: 0, stability: 0, difficulty: 0, reps: 0, lapses: 0, reviewLog: [] }) },
       ];
       mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
       mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
@@ -613,11 +612,20 @@ describe('Flashcard Service', () => {
       const result = await dueFlashcards({ pageSize: 20 });
 
       expect(result.cards).toHaveLength(1);
-      expect(result.cards[0].suspended).toBe(true);
-      // No where() on a suspended field was ever issued.
-      const whereCalls = (mockFlashcardCollectionRef.where as jest.Mock).mock.calls.map((c) => c[0]);
-      expect(whereCalls).not.toContain('suspended');
-      expect(whereCalls).toContain('due');
+      expect(result.cards[0].id).toBe('active');
+      expect(result.cards[0].suspended).toBe(false);
+    });
+
+    it('filters due cards by deckId', async () => {
+      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
+      mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
+      mockFlashcardCollectionRef.limit.mockReturnValue(mockFlashcardCollectionRef);
+      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [] });
+
+      await dueFlashcards({ deckId: 'deck-1', pageSize: 20 }, 'owner-1');
+
+      expect(mockFlashcardCollectionRef.where).toHaveBeenCalledWith('ownerId', '==', 'owner-1');
+      expect(mockFlashcardCollectionRef.where).toHaveBeenCalledWith('deckId', '==', 'deck-1');
     });
   });
 

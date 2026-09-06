@@ -852,14 +852,13 @@ export async function listFlashcards(query: ListFlashcardsQuery, ownerId?: strin
 }
 
 /**
- * Lists cards that are due for review right now: cards that have never been
- * reviewed (New, due immediately) plus cards whose scheduled `due` time has
- * arrived (Learning/Review/Relearning). Optionally restricted to one deck
- * (by stable deckId or legacy deck name).
+ * Lists active cards that are due for review right now: cards that have never
+ * been reviewed (New, due immediately) plus cards whose scheduled `due` time
+ * has arrived (Learning/Review/Relearning). Suspended cards are excluded.
+ * Optionally restricted to one deck (by stable deckId or legacy deck name).
  *
- * Cards are ordered by due time ascending (earliest due first) and paginated
- * with the same id-cursor convention as listFlashcards (pageToken = last card
- * id of the previous page).
+ * Cards are ordered by due time ascending and paginated with the same id-cursor
+ * convention as listFlashcards (pageToken = last returned card id).
  */
 export async function dueFlashcards(query: DueFlashcardsQuery, ownerId?: string): Promise<DueFlashcardsResponse> {
   const now = Timestamp.now();
@@ -884,18 +883,33 @@ export async function dueFlashcards(query: DueFlashcardsQuery, ownerId?: string)
     }
   }
 
-  const snapshot = await q.limit(pageSize + 1).get();
-  const docs = snapshot.docs;
+  // Suspended is intentionally filtered in memory: `where('suspended', '!=',
+  // true)` would also exclude legacy cards where the field is absent. Scan
+  // ordered pages until the response is full or the due queue is exhausted.
+  const cards: Flashcard[] = [];
+  let cursor: QueryDocumentSnapshot<DocumentData> | undefined;
+  while (cards.length <= pageSize) {
+    const snapshot = await q.limit(pageSize + 1).get();
+    if (snapshot.docs.length === 0) break;
 
-  const hasMore = docs.length > pageSize;
-  const cards = docs.slice(0, pageSize).map(docToFlashcard);
+    for (const doc of snapshot.docs) {
+      cursor = doc as QueryDocumentSnapshot<DocumentData>;
+      const card = docToFlashcard(doc);
+      if (card.suspended) continue;
+      cards.push(card);
+      if (cards.length > pageSize) break;
+    }
 
-  let nextPageToken: string | null = null;
-  if (hasMore) {
-    nextPageToken = docs[pageSize - 1].id;
+    if (cards.length > pageSize || snapshot.docs.length < pageSize + 1 || !cursor) break;
+    q = q.startAfter(cursor);
   }
 
-  return { cards, nextPageToken };
+  const hasMore = cards.length > pageSize;
+  const page = cards.slice(0, pageSize);
+  return {
+    cards: page,
+    nextPageToken: hasMore ? page[page.length - 1].id : null,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1399,17 +1413,16 @@ export async function setFlashcardDueDate(ids: string[], due: string, ownerId?: 
 /**
  * Suspends one or more flashcards: sets the persisted `suspended: true`
  * flag. A suspended card keeps ALL its content and scheduling state (due,
- * FSRS fields, reviewLog — nothing is lost or rescheduled); it is simply
- * excluded from the surfaces that honor the flag. Semantics per the existing
- * suspension contract:
- *  - `search_cards` is the ONLY query surface that reads the flag:
- *    `suspended: true` selects these cards; with no `suspended` filter they
- *    still appear (absent = both states); they NEVER match the `review`
- *    facet (due/notDue/new/reviewed).
- *  - The due endpoints (`dueFlashcards`), review-session queues and
- *    `review_flashcard` do NOT read the flag and behave exactly as before —
- *    suspending never mutates scheduling, and a card suspended mid-session
- *    keeps its place in an already-snapshotted session.
+ * FSRS fields, reviewLog — nothing is lost or rescheduled); it is excluded
+ * from due-card queues while remaining visible to list and review-session
+ * surfaces. Semantics per the suspension contract:
+ *  - `search_cards` can select suspended cards explicitly with
+ *    `suspended: true`; with no `suspended` filter it returns both states, and
+ *    suspended cards NEVER match its `review` facet.
+ *  - `dueFlashcards` excludes suspended cards. Review-session queues and
+ *    `review_flashcard` do NOT read the flag; suspending never mutates
+ *    scheduling, and a card suspended mid-session keeps its place in an
+ *    already-snapshotted session.
  * Returns the updated cards (existing ids only, in input order).
  */
 export async function suspendFlashcards(ids: string[], ownerId?: string): Promise<SchedulingActionResponse> {

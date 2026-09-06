@@ -192,12 +192,10 @@ export interface Flashcard {
   /**
    * Whether the card is suspended. Default false; ABSENT on documents
    * written before this field existed, in which case it reads as false (see
-   * docToFlashcard). This is a persisted, filterable attribute ONLY: the
-   * existing list/due/review-session endpoints do NOT read it and behave
-   * exactly as before (a suspended card still appears in dueFlashcards and
-   * review sessions). It is queried exclusively through `search_cards`
-   * (`suspended: true|false`; suspended cards never match its `review`
-   * facet).
+   * docToFlashcard). Suspended cards are excluded from dueFlashcards, while
+   * listFlashcards and review-session queues continue to expose them. The
+   * field is also queryable through `search_cards` (`suspended: true|false`);
+   * suspended cards never match its `review` facet.
    */
   suspended?: boolean;
   createdAt: Timestamp;
