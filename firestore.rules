@@ -1,0 +1,50 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // DENY-BY-DEFAULT.  All reads/writes below are performed by the
+    // Firebase Admin SDK inside Cloud Functions, which bypasses security
+    // rules.  Every path that must NOT be reachable through the public
+    // (mobile/web) client SDKs is locked to `false`; nothing is readable or
+    // writable from a direct Firestore client.
+    //
+    // Historical notes:
+    // - `isValidApiKey()` used to gate reads/writes on `request.auth != null`,
+    //   which every Firebase Auth user satisfies - it never authenticated the
+    //   API key.  API-key verification happens in the functions layer
+    //   (verifyApiKey in functions/src/flashcards/service.ts).
+    // - `isDevEnvironment()` used to return `request.resource == null || true`,
+    //   i.e. always true.  Emulator-local code must use the Admin SDK or the
+    //   emulator's rules-bypass mode; there is no rules flag that can tell an
+    //   emulator client from a production client, so this escape hatch was
+    //   removed entirely (it would also apply in production).
+    match /apiKeys/{key} {
+      allow read, write: if false; // Admin-only (verified inside Cloud Functions)
+    }
+
+    // Flashcards - admin-only
+    match /flashcards/{cardId} {
+      allow read, write: if false;
+    }
+
+    // Decks - admin-only (functions-owned lookup/sync layer)
+    match /decks/{deckId} {
+      allow read, write: if false;
+    }
+
+    // Review sessions - admin-only
+    match /reviewSessions/{sessionId} {
+      allow read, write: if false;
+
+      // v2 queue chunks (bounded root + queueChunks/{paddedIndex} children):
+      // subcollection of the session document; admin-only like its parent.
+      match /queueChunks/{chunkIndex} {
+        allow read, write: if false;
+      }
+    }
+
+    // Review events (append-only review history) - admin-only
+    match /reviewEvents/{eventId} {
+      allow read, write: if false; // Admin-only; functions never update/delete events
+    }
+  }
+}

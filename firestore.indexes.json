@@ -1,0 +1,1853 @@
+{
+ "indexes": [
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "actorId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "lapses",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "lapses",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "decks",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "name",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "decks",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "cardId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "stateBefore",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "rating",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "reviewedAt",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "due",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "ownerId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "videos",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "retention_status",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "processed_at",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "createdAt",
+     "order": "DESCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "DESCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deckId",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "tags",
+     "arrayConfig": "CONTAINS"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  },
+  {
+   "collectionGroup": "flashcards",
+   "queryScope": "COLLECTION",
+   "fields": [
+    {
+     "fieldPath": "deck",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "state",
+     "order": "ASCENDING"
+    },
+    {
+     "fieldPath": "__name__",
+     "order": "ASCENDING"
+    }
+   ]
+  }
+ ],
+ "fieldOverrides": [
+  {
+   "collectionGroup": "flashcards",
+   "fieldPath": "reviewLog",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "fieldPath": "cardFrontSnapshot",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewEvents",
+   "fieldPath": "deckName",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "flashcards",
+   "fieldPath": "images",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "cardIds",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "reviewedCardIds",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "processedRequestIds",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "ratingCounts",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "source.cardIds",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "queueChunksPrefix",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "queueChunks",
+   "fieldPath": "items",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "queueChunks",
+   "fieldPath": "startPosition",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "queueChunks",
+   "fieldPath": "itemCount",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "queueChunks",
+   "fieldPath": "pendingCount",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "name",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "buildError",
+   "indexes": []
+  },
+  {
+   "collectionGroup": "reviewSessions",
+   "fieldPath": "buildStatus",
+   "indexes": []
+  }
+ ]
+}

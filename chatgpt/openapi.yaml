@@ -1,0 +1,2582 @@
+# ChatGPT GPT Action — FSRS Flashcard integration
+#
+# This schema is the current, supported integration surface for letting ChatGPT
+# call an external API: a **GPT Action** (Custom GPT + OpenAPI schema), not the
+# retired legacy ChatGPT Plugins (ai-plugin.json era, shut down April 2024).
+#
+# Paste this file into the "Actions" section of a Custom GPT:
+#   https://chatgpt.com/gpts/editor
+#
+# ROUTING NOTE — matches the Firebase backend exactly:
+#   The backend (functions/src/index.ts) deploys each handler as a SEPARATE
+#   named Cloud Function (no rewrites/router prefix):
+#     health, createFlashcardHandler, bulkCreateFlashcardsHandler,
+#     listFlashcardsHandler, dueFlashcardsHandler, reviewFlashcardHandler,
+#     getFlashcardHandler, updateFlashcardHandler, deleteFlashcardHandler,
+#     bulkUpdateFlashcardsHandler, bulkDeleteFlashcardsHandler,
+#     createDeckHandler, listDecksHandler, getDeckHandler, updateDeckHandler,
+#     deleteDeckHandler, migrateDecksHandler,
+#     attachImageHandler, uploadImageHandler, listImagesHandler, removeImageHandler,
+#     startReviewSessionHandler, getReviewSessionHandler,
+#     submitSessionReviewHandler, endReviewSessionHandler
+#   Card/deck/session ids are appended to the function URL path, e.g.
+#     https://us-central1-cuelingua.cloudfunctions.net/getFlashcardHandler/<id>
+#
+#   Server URL (see chatgpt/README.md):
+#     https://us-central1-cuelingua.cloudfunctions.net
+#
+#   AUTH: every handler except /health requires the shared API key as the
+#   `X-API-Key` header. The backend enforces it on ANY non-emulator runtime
+#   (FUNCTIONS_EMULATOR unset — GCF does not set NODE_ENV, so the old
+#   NODE_ENV==='production' gate failed open; see functions/src/environment.ts).
+#   Missing/invalid keys get a 401 (the per-path 401 responses below).
+openapi: 3.1.0
+info:
+  title: FSRS Flashcard API
+  description: >
+    Create, list, read, update, and delete spaced-repetition flashcards for the
+    FSRS (Free Spaced Repetition Scheduler) study system. Use this action when
+    the user wants to save a new flashcard, capture knowledge as a
+    question/answer pair, organize cards into decks, tag them, review or edit
+    existing cards, retrieve cards that are due for review, record a review
+    rating, or check whether the flashcard service is reachable. The backend
+    runs the FSRS scheduler: new cards are due immediately and each review
+    (Again/Hard/Good/Easy) advances the card's next due time.
+  version: 1.0.0
+servers:
+  - url: https://us-central1-cuelingua.cloudfunctions.net
+    description: Deployed Firebase Functions endpoint (us-central1) for the CueLingua project.
+paths:
+  /health:
+    get:
+      operationId: checkHealth
+      summary: Check that the flashcard service is reachable
+      description: >
+        Returns service status and a timestamp. Use this first when the user
+        reports an error or asks whether the flashcard service works. Does not
+        require an API key.
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                    description: Service health, always "ok" when reachable.
+                  timestamp:
+                    type: string
+                    format: date-time
+                    description: Server time when the check ran.
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /createFlashcardHandler:
+    post:
+      operationId: createFlashcard
+      summary: Create a new flashcard
+      description: >
+        Creates a flashcard with front/back, optional deck/tags. New cards are
+        due immediately and start in the New state; each later review advances
+        the due time through the FSRS scheduler. Returns card id and due.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlashcardCreate"
+      responses:
+        "201":
+          description: Flashcard created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Flashcard"
+        "400":
+          description: Invalid input (validation failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /bulkCreateFlashcardsHandler:
+    post:
+      operationId: bulkCreateFlashcards
+      summary: Create multiple flashcards at once (up to 100)
+      description: >
+        Atomically creates up to 100 flashcards in one request. Each item has a
+        front (question), a back (answer), and optional deck and tags. The
+        backend validates every item before writing and commits the whole batch
+        in a single Firestore batch: either all cards are created or none are
+        (no partial success). Returns every created card with its
+        server-assigned id. Use this when the user asks for several cards at
+        once instead of calling createFlashcard repeatedly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkFlashcardCreate"
+      responses:
+        "201":
+          description: All cards created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkCreateResult"
+        "400":
+          description: Invalid input (validation failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /listFlashcardsHandler:
+    get:
+      operationId: listFlashcards
+      summary: List flashcards
+      description: >
+        Lists the user's flashcards, most recently created first. Optionally
+        filter by deckId (stable deck id — preferred), deck (legacy deck
+        name), or tags (cards matching ANY of the given tags) and paginate
+        with pageSize/pageToken.
+      parameters:
+        - name: deckId
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 100
+          description: Only return cards in this deck (stable deck id).
+        - name: deck
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 100
+          description: Only return cards in this deck (legacy deck name).
+        - name: tags
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 500
+          description: >
+            Comma-separated tags; returns cards that have ANY of them.
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Maximum number of cards to return.
+        - name: pageToken
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque continuation token from a previous list response (last card id of the page).
+      responses:
+        "200":
+          description: A page of flashcards
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cards]
+                properties:
+                  cards:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Flashcard"
+                  nextPageToken:
+                    type: [string, "null"]
+                    description: Present when more cards are available; pass it back as pageToken.
+        "400":
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /dueFlashcardsHandler:
+    get:
+      operationId: getDueFlashcards
+      summary: Get flashcards due for review
+      description: >
+        Returns flashcards that are due for review right now: new cards (never
+        reviewed) plus cards whose scheduled FSRS due time has arrived, ordered
+        earliest-due first. Optionally restrict to one deck (by deckId —
+        stable deck id preferred — or legacy deck name) and paginate with
+        pageSize/pageToken. Read-only; does not modify scheduling. After the
+        user answers a card, record the result with reviewFlashcard.
+      parameters:
+        - name: deckId
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 100
+          description: Only return due cards in this deck (stable deck id).
+        - name: deck
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 100
+          description: Only return due cards in this deck (legacy deck name).
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Maximum number of cards to return.
+        - name: pageToken
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque continuation token from a previous response (last card id of the page).
+      responses:
+        "200":
+          description: A page of due flashcards
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cards]
+                properties:
+                  cards:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Flashcard"
+                  nextPageToken:
+                    type: [string, "null"]
+                    description: Present when more cards are available; pass it back as pageToken.
+        "400":
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /reviewFlashcardHandler/{id}:
+    post:
+      operationId: reviewFlashcard
+      summary: Review a flashcard (FSRS rating)
+      description: >
+        Records a review of one flashcard by id with an FSRS rating:
+        1=Again (forgot), 2=Hard, 3=Good, 4=Easy. The backend applies the FSRS
+        scheduler and returns the updated card with its new due time, plus the
+        review log entry. Call this after the user answers a card retrieved via
+        getDueFlashcards. Optionally pass reviewAt (ISO 8601) as the review
+        time; defaults to the server time.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id, appended to the function URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlashcardReview"
+      responses:
+        "201":
+          description: Review recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewResult"
+        "400":
+          description: Invalid rating/reviewAt or missing card id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /getFlashcardHandler/{id}:
+    get:
+      operationId: getFlashcard
+      summary: Get a single flashcard
+      description: >
+        Returns one flashcard by its server-assigned id. Use this when the user
+        references a specific card.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id, appended to the function URL.
+      responses:
+        "200":
+          description: The requested card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Flashcard"
+        "400":
+          description: Missing card id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /updateFlashcardHandler/{id}:
+    patch:
+      operationId: updateFlashcard
+      summary: Update a flashcard
+      description: >
+        Updates editable fields of an existing card. Only the fields present in
+        the request body are changed; omitted fields keep their current values.
+        Changing front or back does not reset FSRS scheduling state.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id, appended to the function URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlashcardUpdate"
+      responses:
+        "200":
+          description: Updated card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Flashcard"
+        "400":
+          description: Invalid update payload or missing card id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /bulkUpdateFlashcardsHandler:
+    post:
+      operationId: bulkUpdateFlashcards
+      summary: Update multiple flashcards at once (up to 100)
+      description: >
+        Atomically updates up to 100 existing flashcards in one request. Each
+        item must include the card id plus any of front/back/deck/tags to
+        change; omitted fields keep their current values. The backend validates
+        every item, checks every id inside a single Firestore transaction, and
+        commits atomically: either every update lands or none do (no partial
+        success). Returns the updated cards in input order; ids that did not
+        exist are omitted. Scheduling fields (state, stability, difficulty,
+        reps, lapses, due, reviewLog) are never accepted here — they remain
+        backend-managed. Use this when several cards need the same fix (e.g.
+        retagging or moving to a deck).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkFlashcardUpdate"
+      responses:
+        "200":
+          description: Updated cards
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkUpdateResult"
+        "400":
+          description: Invalid input (validation failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /deleteFlashcardHandler/{id}:
+    delete:
+      operationId: deleteFlashcard
+      summary: Delete a flashcard
+      description: >
+        Permanently removes a flashcard by its id. Use this only when the user
+        explicitly asks to delete a card.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id, appended to the function URL.
+      responses:
+        "204":
+          description: Card deleted
+        "400":
+          description: Missing card id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /bulkDeleteFlashcardsHandler:
+    post:
+      operationId: bulkDeleteFlashcards
+      summary: Delete multiple flashcards at once (up to 100)
+      description: >
+        Atomically deletes up to 100 flashcards by id in one request. The
+        backend checks every id inside a single Firestore transaction and
+        commits atomically: either every existing id is deleted or none are (no
+        partial success). Returns the ids actually deleted; ids that did not
+        exist are omitted. Use this only when the user explicitly asks to
+        delete several cards at once. To remove an entire deck, use
+        deleteDeck instead — it deletes the deck and detaches (does NOT
+        delete) its cards.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkFlashcardDelete"
+      responses:
+        "200":
+          description: Deleted card ids
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkDeleteResult"
+        "400":
+          description: Invalid input (validation failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /createDeckHandler:
+    post:
+      operationId: createDeck
+      summary: Create a deck
+      description: >
+        Creates a deck: a named group that flashcards reference by stable
+        deckId. Deck names are unique — creating a deck with an existing name
+        fails with 400. Returns the created deck with its server-assigned id.
+        After creating a deck, assign cards to it with createFlashcard or
+        updateFlashcard using deckId.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeckCreate"
+      responses:
+        "201":
+          description: Deck created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deck"
+        "400":
+          description: Invalid input or duplicate deck name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /listDecksHandler:
+    get:
+      operationId: listDecks
+      summary: List decks
+      description: >
+        Lists decks, most recently created first, paginated with pageSize
+        (1-100, default 20) and pageToken (pass the nextPageToken from a
+        previous response to get the next page). Use this to find a deck id for
+        filtering cards or assigning cards to a deck.
+      parameters:
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Maximum number of decks to return.
+        - name: pageToken
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque continuation token from a previous response.
+      responses:
+        "200":
+          description: A page of decks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [decks]
+                properties:
+                  decks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Deck"
+                  nextPageToken:
+                    type: [string, "null"]
+                    description: Present when more decks are available.
+        "400":
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /getDeckHandler/{id}:
+    get:
+      operationId: getDeck
+      summary: Get a single deck
+      description: >
+        Returns one deck by its server-assigned id. Use this when the user
+        references a specific deck (resolve a name to an id with listDecks).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned deck id, appended to the function URL.
+      responses:
+        "200":
+          description: The requested deck
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deck"
+        "400":
+          description: Missing deck id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Deck not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /updateDeckHandler/{id}:
+    patch:
+      operationId: updateDeck
+      summary: Update a deck
+      description: >
+        Updates a deck's name and/or description by id. Only the fields present
+        are changed; omitted fields keep their current values. Deck names are
+        unique — renaming to a name used by another deck fails with 400. When a
+        deck is renamed, the backend also rewrites the deck name on all of its
+        cards so filters and card summaries stay coherent.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned deck id, appended to the function URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeckUpdate"
+      responses:
+        "200":
+          description: Updated deck
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deck"
+        "400":
+          description: Invalid payload or duplicate deck name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Deck not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /deleteDeckHandler/{id}:
+    delete:
+      operationId: deleteDeck
+      summary: Delete a deck (cards are detached, not deleted)
+      description: >
+        Deletes a deck by id. This is destructive to the DECK but NOT to its
+        cards: the deck is removed and every card that referenced it is
+        DETACHED (deckId/deck fields removed), leaving the cards themselves
+        intact with all FSRS scheduling preserved. Returns
+        { deleted: true, detachedCards: N }. Cards are detached in chunked
+        batches (≤500 writes each), so decks of any size can be deleted; the
+        deck document is deleted only after every detach batch succeeds. This
+        is NOT a single atomic transaction: if a batch fails partway, earlier
+        detaches remain committed (cards stay detached, the deck is not
+        deleted) and retrying the delete is safe and completes the rest.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned deck id, appended to the function URL.
+      responses:
+        "200":
+          description: Deck deleted with cards detached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteDeckResult"
+        "400":
+          description: Missing deck id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Deck not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /migrateDecksHandler:
+    post:
+      operationId: migrateDecks
+      summary: Backfill deckId from legacy deck names (maintenance)
+      description: >
+        MAINTENANCE ROUTE — do not call during normal use. Explicitly backfills
+        `deckId` onto cards that still only carry a legacy `deck` name string
+        (cards created before deck entities existed). For each distinct legacy
+        name a deck is found-or-created. Idempotent and paged (up to 100 cards
+        per call); returns { migrated: N } — call repeatedly until 0.
+      responses:
+        "200":
+          description: Backfill ran
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [migrated]
+                properties:
+                  migrated:
+                    type: integer
+                    description: Number of cards backfilled in this call.
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /attachImageHandler/{cardId}:
+    post:
+      operationId: attachImage
+      summary: Attach an image to a flashcard (by URL)
+      description: >
+        Attaches an image to a flashcard by URL. The backend stores ONLY the
+        URL reference plus optional alt text and MIME type — never the image
+        bytes. The URL must be http(s) and either declare an allowed MIME type
+        (image/jpeg, image/png, image/gif, image/webp, image/avif, image/bmp,
+        image/svg+xml) or end in a matching extension. A card can hold at most
+        5 images. Does not affect FSRS scheduling. Returns the updated card
+        and the attached image.
+      parameters:
+        - name: cardId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageAttach"
+      responses:
+        "201":
+          description: Image attached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageAttachResult"
+        "400":
+          description: Invalid URL/MIME, image limit reached, or missing card id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /uploadImageHandler/{cardId}:
+    post:
+      operationId: uploadImage
+      summary: Upload an image to a flashcard (Firebase Storage)
+      description: >
+        Uploads an image for a flashcard as base64 data. The backend decodes
+        the bytes (max 10 MiB), validates the content type (allowed raster
+        types: image/jpeg, image/png, image/gif, image/webp, image/avif,
+        image/bmp — SVG is NOT accepted for upload), writes them to Firebase
+        Storage under a card-scoped sanitized path, and persists metadata on
+        the card: id, storagePath, downloadUrl (signed URL), contentType,
+        sizeBytes, alt, addedAt. A card can hold at most 5 images. Does not
+        affect FSRS scheduling. Returns the updated card and the uploaded
+        image with its cloud metadata.
+      parameters:
+        - name: cardId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageUpload"
+      responses:
+        "201":
+          description: Image uploaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageUploadResult"
+        "400":
+          description: Invalid base64/contentType/limits or missing card id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /listImagesHandler/{cardId}:
+    get:
+      operationId: listImages
+      summary: List a flashcard's images
+      description: >
+        Lists the image attachments on a flashcard. Each image includes its id
+        and url (the external URL for URL attachments, or the signed download
+        URL for cloud uploads), optional alt/mimeType and addedAt, plus cloud
+        metadata for uploaded images: storagePath, downloadUrl, and sizeBytes.
+        Read-only.
+      parameters:
+        - name: cardId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id.
+      responses:
+        "200":
+          description: The card's image attachments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageListResult"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /removeImageHandler/{cardId}:
+    delete:
+      operationId: removeImage
+      summary: Remove an image from a flashcard (by URL)
+      description: >
+        Removes an image attachment from a flashcard by its URL. The URL must
+        exactly match an attached image's url. Returns { cardId, removed } —
+        removed is false when no image with that URL was attached. Only the
+        card's reference is removed; the externally hosted image file is NOT
+        deleted.
+      parameters:
+        - name: cardId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned card id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageRemove"
+      responses:
+        "200":
+          description: Removal result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageRemoveResult"
+        "400":
+          description: Missing card id or invalid body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /startReviewSessionHandler:
+    post:
+      operationId: startReviewSession
+      summary: Start a persistent review session
+      description: >
+        Starts a persistent review session: the backend snapshots EVERY
+        matching card into the session queue (never capped, no pagination).
+        NO selectors -> the standard DUE queue (new + scheduled cards,
+        ordered earliest due first). Optional selectors (any combination):
+        deckId (stable id) and/or deck (legacy name; deckId wins), tags
+        (ANY-of), cardIds (explicit allowlist, deduped, every id must exist;
+        combined with deck/tags by INTERSECTION). Selector-defined sessions
+        may include NON-due cards; the selector query is authoritative.
+        Persists the session source metadata ('due' | 'deck' | 'custom').
+        Returns
+        the session (id, status, mode spaced_repetition, dueCount — the EXACT
+        number of cards snapshotted at start — cardIds, currentIndex,
+        reviewedCount, remainingCount, ratingCounts, timestamps) plus
+        the FIRST card to review (card is null when nothing is due). The
+        queue is stable across retries; cards that become due later are not
+        added. Sessions are scoped to the API key that starts them — only
+        that key can get/submit/end them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewSessionStart"
+      responses:
+        "201":
+          description: Session started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewSessionWithCard"
+        "400":
+          description: Invalid input (validation failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /getReviewSessionHandler/{sessionId}:
+    get:
+      operationId: getReviewSession
+      summary: Get a review session and its current card
+      description: >
+        Retrieves a review session by id (any status: active, completed, or
+        ended) plus the card currently awaiting review — null when the queue
+        is exhausted or the session is finished. Includes status, reviewed and
+        current counters, rating counts (again/hard/good/easy), and the
+        remaining card ids. Only the API key that started the session can read
+        it (403 otherwise). Use this to resume an interrupted review flow.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned session id, appended to the function URL.
+      responses:
+        "200":
+          description: The session and its current card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewSessionWithCard"
+        "400":
+          description: Missing session id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Session started by a different API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /submitSessionReviewHandler/{sessionId}:
+    post:
+      operationId: submitSessionReview
+      summary: Submit a rating for the current card of a review session
+      description: >
+        Submits an FSRS rating (1=Again, 2=Hard, 3=Good, 4=Easy) for the
+        EXPECTED current card of a review session (the card returned by
+        startReviewSession or getReviewSession). The backend atomically
+        applies the FSRS scheduler to that card AND advances the session
+        (currentIndex, reviewedCount, ratingCounts, status) in one
+        transaction, so retries and concurrent submissions can never
+        double-apply a review or lose progress. Returns the updated session
+        and the NEXT card to review (null when the session just completed).
+        Cards deleted since the snapshot are skipped automatically. A session
+        that is already completed or ended rejects the submission (409).
+        Optionally pass reviewAt (ISO 8601); defaults to server time.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned session id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionReviewSubmit"
+      responses:
+        "200":
+          description: Review recorded; session advanced
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewSessionWithCard"
+        "400":
+          description: Invalid rating/reviewAt or missing session id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Session started by a different API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Session is not active (completed or ended)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /endReviewSessionHandler/{sessionId}:
+    post:
+      operationId: endReviewSession
+      summary: End a review session
+      description: >
+        Ends an active review session without rating the remaining cards: the
+        session status becomes ended with an endedAt timestamp and it no
+        longer accepts ratings. Idempotent — ending an already-completed or
+        already-ended session is a no-op that returns it unchanged. Only the
+        API key that started the session can end it (403 otherwise). Use this
+        when the user wants to stop studying before the queue is finished.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Server-assigned session id.
+      responses:
+        "200":
+          description: The session with status ended
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewSession"
+        "400":
+          description: Missing session id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Session started by a different API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /getReviewHistoryHandler:
+    get:
+      operationId: getReviewHistory
+      summary: Read the API key's review-event history
+      description: >
+        Actor-scoped review history: events of the calling API key, newest
+        first (reviewedAt DESC, document id ASC tie-break), cursor-paginated.
+        Filters combine by AND: from (INCLUSIVE lower bound on reviewedAt),
+        to (EXCLUSIVE upper bound — [from, to); date-only to excludes the
+        whole day it names), cardId, deckId, ratings (array of 1=Again..4=Easy,
+        ANY-of), pageSize (1-100, default 50). nextPageToken is an opaque cursor that
+        MUST be paired with the same filters. Each event: id, cardId,
+        actorId, rating, stateBefore, reviewedAt/recordedAt (ISO),
+        stabilityAfter/difficultyAfter/repsAfter/lapsesAfter,
+        dueBefore/dueAfter (ISO; absent when the source event did not record
+        them), deckId/deckName, cardFrontSnapshot (<=300 chars), sessionId.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema: { type: string }
+        - name: to
+          in: query
+          required: false
+          schema: { type: string }
+        - name: cardId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: deckId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: ratings
+          in: query
+          required: false
+          description: Events of ANY of these ratings (1=Again..4=Easy). Repeat the param and/or comma-separate (e.g. ?ratings=1,2 or ?ratings=1&ratings=2).
+          schema:
+            type: array
+            items: { type: integer, enum: [1,2,3,4] }
+        - name: pageSize
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: pageToken
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Review history page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewHistoryPage"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /getStudyStatsHandler:
+    get:
+      operationId: getStudyStats
+      summary: Get read-time study statistics (flat)
+      description: >
+        FLAT study statistics for the calling API key over a REQUIRED
+        reviewedAt window [from, to) (from inclusive, to exclusive; ISO 8601
+        or YYYY-MM-DD). Optional deckId restricts to events of one deck;
+        optional topLimit (1-25, default 10) sizes the top-lapsed ranking.
+        Computed by Firestore count() aggregation — never downloads events.
+        Returns the flat object: from, to, totalReviews, ratingCounts and
+        ratingPercentages (again/hard/good/easy), observedRetention
+        (successful 2/3/4 divided by totalReviews), matureReviews (pre-review
+        state Review/Relearning), matureRatingCounts, matureRetention
+        (successful mature / mature), topLapsedCards. LAPSE DEFINITION:
+        ratingCounts.again counts EVERY Again rating (Learning/New/Relearning
+        included); the persisted card `lapses` field and topLapsedCards count
+        ONLY FSRS mature failures — Again ratings from the Review state (2).
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string }
+        - name: deckId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: topLimit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 25, default: 10 }
+      responses:
+        "200":
+          description: Study statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StudyStats"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /getTopLapsedCardsHandler:
+    get:
+      operationId: getTopLapsedCards
+      summary: Get the current all-time top-lapsed ranking
+      description: >
+        Cards ranked by CURRENT all-time lapse count: the persisted `lapses`
+        field counts ONLY FSRS MATURE FAILURES — Again ratings from the
+        Review state (2), the exact ts-fsrs lapse rule (Learning/New/
+        Relearning Again ratings never increment it) — read at request time;
+        zero-lapse cards excluded; indexed query, no event scan. Optional
+        deckId restricts to cards currently in one deck; limit 1-25 (default
+        10). Each entry: cardId, lapses, reps, front (current),
+        deckId/deckName, lastReview.
+      parameters:
+        - name: deckId
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 25, default: 10 }
+      responses:
+        "200":
+          description: Top-lapsed cards
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TopLapsedCards"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /migrateReviewEventsHandler:
+    post:
+      operationId: migrateReviewEvents
+      summary: Migrate legacy embedded reviewLog entries into reviewEvents (EXPLICIT)
+      description: >
+        EXPLICIT operator-invoked maintenance migration: backfills
+        `reviewEvents` from card-embedded reviewLog arrays written before the
+        event model shipped (newest-100 embedded window; older trimmed
+        entries are unrecoverable). Body REQUIRES legacyActorId — the
+        operator-supplied actor recorded on migrated events (never
+        hardcoded). Optional pageSize (1-100, default 100) and
+        resumeAfterCardId (resume a previous run exactly where it stopped).
+        Idempotent: deterministic event ids + per-entry existence checks;
+        pages by document id; each event's dueAfter comes from the next log
+        entry, or the card's current due for its newest entry, when
+        available. Returns { cardsMigrated, eventsWritten, hasMore,
+        nextResumeAfterCardId } — pass nextResumeAfterCardId as
+        resumeAfterCardId to continue. NEVER call automatically.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MigrateReviewEventsRequest"
+      responses:
+        "200":
+          description: Migration result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MigrateReviewEventsResult"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  schemas:
+    FlashcardCreate:
+      type: object
+      required: [front, back]
+      additionalProperties: false
+      properties:
+        front:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: >
+            The question or prompt side of the card. This is what the user sees
+            during review and must be self-contained (no vague references).
+        back:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: The answer side of the card.
+        deckId:
+          type: [string, "null"]
+          maxLength: 100
+          description: >
+            Stable deck reference (id of a deck from listDecks/createDeck).
+            The recommended way to assign a card to a deck. null explicitly
+            means no deck. When both deckId and deck are present, deckId wins.
+        deck:
+          type: [string, "null"]
+          maxLength: 100
+          description: >
+            Legacy deck name. When deckId is absent, the backend finds-or-
+            creates a deck with this name and assigns the card to it. null
+            explicitly means no deck. Kept for backward compatibility.
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            minLength: 1
+            maxLength: 50
+          description: Optional tags for organizing and searching cards.
+    FlashcardUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        front:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: New question side of the card.
+        back:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: New answer side of the card.
+        deckId:
+          type: [string, "null"]
+          maxLength: 100
+          description: >
+            Stable deck reference. null detaches the card from its deck
+            (deckId and deck fields are removed). When both deckId and deck are
+            present, deckId wins.
+        deck:
+          type: [string, "null"]
+          maxLength: 100
+          description: >
+            Legacy deck name (find-or-create). null detaches the card from its
+            deck. Kept for backward compatibility.
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            minLength: 1
+            maxLength: 50
+          description: Replaces the full tag set.
+    BulkFlashcardCreate:
+      type: object
+      required: [cards]
+      additionalProperties: false
+      properties:
+        cards:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: >
+            The flashcards to create, all in one atomic batch. At most 100
+            items; every item is validated before any write.
+          items:
+            $ref: "#/components/schemas/FlashcardCreate"
+    BulkFlashcardUpdate:
+      type: object
+      required: [cards]
+      additionalProperties: false
+      properties:
+        cards:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: >
+            The cards to update. At most 100 items; every item must carry the
+            card id plus any fields to change. Scheduling fields are not
+            accepted — they remain backend-managed.
+          items:
+            $ref: "#/components/schemas/FlashcardUpdateItem"
+    FlashcardUpdateItem:
+      type: object
+      required: [id]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: Server-assigned card id to update.
+        front:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: New question side of the card.
+        back:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: New answer side of the card.
+        deckId:
+          type: [string, "null"]
+          maxLength: 100
+          description: Stable deck reference; null detaches the card from its deck.
+        deck:
+          type: [string, "null"]
+          maxLength: 100
+          description: Legacy deck name (find-or-create); null detaches.
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            minLength: 1
+            maxLength: 50
+          description: Replaces the full tag set.
+    BulkFlashcardDelete:
+      type: object
+      required: [ids]
+      additionalProperties: false
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: >
+            The card ids to delete, all in one atomic transaction. At most 100
+            ids. Ids that do not exist are skipped (the commit is still
+            atomic).
+          items:
+            type: string
+    BulkCreateResult:
+      type: object
+      required: [cards]
+      properties:
+        cards:
+          type: array
+          description: Every created card, with its server-assigned id.
+          items:
+            $ref: "#/components/schemas/Flashcard"
+    BulkUpdateResult:
+      type: object
+      required: [cards]
+      properties:
+        cards:
+          type: array
+          description: >
+            The updated cards in input order. Ids that did not exist are
+            omitted (they were not written).
+          items:
+            $ref: "#/components/schemas/Flashcard"
+    BulkDeleteResult:
+      type: object
+      required: [deletedIds]
+      properties:
+        deletedIds:
+          type: array
+          description: The ids actually deleted (ids that did not exist are omitted).
+          items:
+            type: string
+    DeckCreate:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Unique deck name.
+        description:
+          type: string
+          maxLength: 500
+          description: Optional human-readable description.
+    DeckUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: New unique deck name.
+        description:
+          type: string
+          maxLength: 500
+          description: New description.
+    Deck:
+      type: object
+      required: [id, name, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          description: Server-assigned unique deck id (Firestore document id).
+        name:
+          type: string
+          description: Unique deck name.
+        description:
+          type: string
+          description: Optional human-readable description.
+        createdAt:
+          type: object
+          description: Creation timestamp ({ _seconds, _nanoseconds } wire shape).
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        updatedAt:
+          type: object
+          description: Last modification timestamp ({ _seconds, _nanoseconds }).
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+    DeleteDeckResult:
+      type: object
+      required: [deleted, detachedCards]
+      properties:
+        deleted:
+          type: boolean
+          description: Always true on success.
+        detachedCards:
+          type: integer
+          description: Number of cards detached from the deck (cards are preserved, never deleted).
+    Flashcard:
+      type: object
+      required: [id, front, back, tags, createdAt, updatedAt, due]
+      properties:
+        id:
+          type: string
+          description: Server-assigned unique card id (Firestore document id).
+        front:
+          type: string
+          description: The question side of the card.
+        back:
+          type: string
+          description: The answer side of the card.
+        deckId:
+          type: string
+          description: >
+            Stable deck reference (id of a deck in the decks collection);
+            absent when the card has no deck. Prefer this for filtering.
+        deck:
+          type: string
+          description: >
+            Denormalized deck name; kept for readable/legacy filtering and
+            stays coherent when the deck is renamed.
+        tags:
+          type: array
+          items:
+            type: string
+          description: Tags on the card.
+        createdAt:
+          type: object
+          description: >
+            Creation timestamp. The backend returns Firestore Timestamp
+            objects as-is (res.json(card)), so on the wire they serialize to
+            { _seconds: number, _nanoseconds: number } (protobuf style), not
+            ISO 8601 strings.
+          properties:
+            _seconds:
+              type: integer
+              description: Seconds since the Unix epoch (UTC).
+            _nanoseconds:
+              type: integer
+              description: Nanoseconds within the second.
+        updatedAt:
+          type: object
+          description: >
+            Last modification timestamp. Same wire shape as createdAt
+            (Firestore Timestamp → { _seconds, _nanoseconds }).
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        due:
+          type: object
+          description: >
+            Next review time computed by the FSRS scheduler. New cards are due
+            at creation time; each review advances it. Same wire shape as
+            createdAt (Firestore Timestamp → { _seconds, _nanoseconds }).
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        state:
+          type: integer
+          enum: [0, 1, 2, 3]
+          description: >
+            FSRS scheduling state: 0=New, 1=Learning, 2=Review, 3=Relearning.
+        stability:
+          type: number
+          description: FSRS stability (expected interval in days when the card is in Review/Relearning).
+        difficulty:
+          type: number
+          description: FSRS difficulty (higher = harder).
+        reps:
+          type: integer
+          description: Number of completed reviews.
+        lapses:
+          type: integer
+          description: Number of times the card was forgotten (rated Again after graduating).
+        lastReview:
+          type: object
+          description: Time of the last review, if any. Same wire shape as createdAt.
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        reviewLog:
+          type: array
+          description: Full FSRS review history, oldest first.
+          items:
+            $ref: "#/components/schemas/ReviewLogEntry"
+        images:
+          type: array
+          description: >
+            Image attachments on the card. The backend stores ONLY validated
+            URL references plus optional alt/mimeType and addedAt — never the
+            image bytes. At most 5 per card.
+          items:
+            $ref: "#/components/schemas/CardImage"
+    CardImage:
+      type: object
+      required: [id, url, addedAt]
+      properties:
+        id:
+          type: string
+          description: Stable image id (server-assigned).
+        url:
+          type: string
+          maxLength: 2048
+          description: >
+            The image URL: the external http(s) URL for URL attachments, or
+            the signed download URL for cloud uploads. The backend never
+            stores image bytes in Firestore.
+        alt:
+          type: string
+          maxLength: 500
+          description: Optional short description / alt text.
+        mimeType:
+          type: string
+          maxLength: 100
+          description: >
+            Image MIME type (image/jpeg, image/png, image/gif, image/webp,
+            image/avif, image/bmp, image/svg+xml). Optional.
+        addedAt:
+          type: object
+          description: When the image was attached ({ _seconds, _nanoseconds }).
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        storagePath:
+          type: string
+          description: Firebase Storage object path (cloud uploads only), e.g. card-images/{cardId}/{imageId}.jpg.
+        downloadUrl:
+          type: string
+          description: Signed download URL (cloud uploads only).
+        sizeBytes:
+          type: integer
+          description: Decoded byte size (cloud uploads only).
+    ImageAttach:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          description: The http(s) image URL to attach.
+        alt:
+          type: string
+          maxLength: 500
+          description: Optional short description / alt text.
+        mimeType:
+          type: string
+          maxLength: 100
+          description: >
+            Optional declared MIME type (must be an allowed image type).
+            Without it, the URL path extension is used.
+    ImageAttachResult:
+      type: object
+      required: [card, image]
+      properties:
+        card:
+          $ref: "#/components/schemas/Flashcard"
+        image:
+          $ref: "#/components/schemas/CardImage"
+    ImageUpload:
+      type: object
+      required: [data, fileName, contentType]
+      additionalProperties: false
+      properties:
+        data:
+          type: string
+          minLength: 1
+          maxLength: 14000012
+          description: Base64-encoded image data (decoded size <= 10 MiB).
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Original file name (the backend derives a sanitized, card-scoped object name).
+        contentType:
+          type: string
+          maxLength: 100
+          description: >
+            Image MIME type. Allowed: image/jpeg, image/png, image/gif,
+            image/webp, image/avif, image/bmp. SVG is NOT accepted for upload.
+        alt:
+          type: string
+          maxLength: 500
+          description: Optional short description / alt text.
+    ImageUploadResult:
+      type: object
+      required: [card, image]
+      properties:
+        card:
+          $ref: "#/components/schemas/Flashcard"
+        image:
+          $ref: "#/components/schemas/CardImage"
+    ImageListResult:
+      type: object
+      required: [cardId, images]
+      properties:
+        cardId:
+          type: string
+          description: The card id.
+        images:
+          type: array
+          items:
+            $ref: "#/components/schemas/CardImage"
+    ImageRemove:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          description: The exact URL of the attached image to remove.
+    ImageRemoveResult:
+      type: object
+      required: [cardId, removed]
+      properties:
+        cardId:
+          type: string
+          description: The card id.
+        removed:
+          type: boolean
+          description: True when the image was found and removed; false when no image with that URL was attached.
+    FlashcardReview:
+      type: object
+      required: [rating]
+      additionalProperties: false
+      properties:
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 4
+          description: >
+            FSRS rating: 1=Again (forgot), 2=Hard, 3=Good, 4=Easy.
+        reviewAt:
+          type: string
+          format: date-time
+          description: >
+            Optional review time in ISO 8601 (e.g. 2026-08-28T12:00:00.000Z).
+            Defaults to the server's current time.
+    ReviewLogEntry:
+      type: object
+      required: [rating, state, review, due, stability, difficulty, reps, lapses]
+      properties:
+        rating:
+          type: integer
+          enum: [1, 2, 3, 4]
+          description: The rating given in this review.
+        state:
+          type: integer
+          enum: [0, 1, 2, 3]
+          description: Card state before this review.
+        review:
+          type: object
+          description: When the review was performed. Same wire shape as createdAt.
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        due:
+          type: object
+          description: The card's due time before this review. Same wire shape as createdAt.
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        stability:
+          type: number
+        difficulty:
+          type: number
+        reps:
+          type: integer
+        lapses:
+          type: integer
+    ReviewResult:
+      type: object
+      required: [card, reviewLogItem]
+      properties:
+        card:
+          $ref: "#/components/schemas/Flashcard"
+        reviewLogItem:
+          $ref: "#/components/schemas/ReviewLogEntry"
+    ReviewSessionStart:
+      type: object
+      additionalProperties: false
+      properties:
+        deckId:
+          type: string
+          maxLength: 100
+          description: >
+            Restrict the snapshot to cards of this deck (stable deck id from
+            listDecks). deckId wins when both deckId and deck are present.
+        deck:
+          type: string
+          maxLength: 100
+          description: >
+            Legacy deck filter by name (same semantics as the list/due `deck`
+            filter — matches the denormalized deck field). Resolved to a
+            stable deck id when a deck entity exists.
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            maxLength: 50
+          description: >
+            Restrict the snapshot to cards carrying ANY of these tags
+            (ANY-of semantics). Combined with a deck selector by intersection.
+        cardIds:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            maxLength: 200
+          description: >
+            Explicit card-id allowlist (deduped server-side; every id must
+            exist or the request fails — missing ids are never silently
+            substituted). May include non-due cards. Combined with deck/tags
+            by intersection.
+        repeatSessionId:
+          type: string
+          maxLength: 200
+          description: >
+            Continue lineage: the id of the session this session REPEATS (the
+            widget's Continue action). Persisted on the root only — a single
+            bounded string, never an array, so a Continue chain never grows
+            the document.
+        cardType:
+          type: string
+          enum: [qa, cloze]
+          description: >
+            Session presentation card type: qa (default) or cloze.
+            Presentation ONLY — the stored card is never modified; the
+            session carries the mode so get/submit/continue resume it.
+        name:
+          type: string
+          maxLength: 200
+          description: Optional user-facing session display name (e.g. the deck name).
+    SessionReviewSubmit:
+      type: object
+      required: [rating]
+      additionalProperties: false
+      properties:
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 4
+          description: >
+            FSRS rating for the session's expected current card: 1=Again
+            (forgot), 2=Hard, 3=Good, 4=Easy.
+        reviewAt:
+          type: string
+          format: date-time
+          description: >
+            Optional review time in ISO 8601 (e.g. 2026-08-28T12:00:00.000Z).
+            Defaults to the server's current time.
+        requestId:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: >
+            Stable idempotency key (client-generated, e.g. a UUID). When
+            provided the backend records it and a retried submission with the
+            SAME key is a no-op returning the recorded result — background
+            retries and parallel submissions never double-apply a rating.
+        expectedCardId:
+          type: string
+          maxLength: 200
+          description: >
+            The card id this rating applies to — any live, unrated snapshot
+            card at or after the current position (parallel submissions may
+            rate out of order). A mismatch or already-rated card fails 409.
+            Omitted falls back to the session's current card.
+        expectedPosition:
+          type: integer
+          minimum: 0
+          description: >
+            v2 bounded alternative to expectedCardId: the queue POSITION
+            (0-based) the rating applies to — for clients that do not hold
+            the full card-id queue (only currentPosition / queueWindow). A
+            claimed, skipped, or out-of-range position fails 409.
+    SessionRatingCounts:
+      type: object
+      required: [again, hard, good, easy, ratingCounts]
+      properties:
+        again:
+          type: integer
+          description: Number of Again (1) ratings applied in this session.
+        hard:
+          type: integer
+          description: Number of Hard (2) ratings applied in this session.
+        good:
+          type: integer
+          description: Number of Good (3) ratings applied in this session.
+        easy:
+          type: integer
+          description: Number of Easy (4) ratings applied in this session.
+        ratingCounts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: >
+            The same counters keyed by FSRS rating number (1=Again, 2=Hard,
+            3=Good, 4=Easy) for machine-friendly access.
+    ReviewSession:
+      type: object
+      required: [id, apiKeyName, status, mode, limit, dueCount, currentIndex, reviewedCount, truncated, continuationAvailable, ratingCounts, startedAt]
+      properties:
+        id:
+          type: string
+          description: Server-assigned session id.
+        apiKeyName:
+          type: string
+          description: The API key name that started the session (ownership; only that key can get/submit/end it).
+        status:
+          type: string
+          enum: [active, completed, ended, failed]
+          description: >
+            active (accepting ratings), completed (every snapshot card was
+            reviewed / queue exhausted), ended (abandoned by the client),
+            failed (v2 queue build failed after the root write — NOT
+            reviewable; start a fresh session; see buildFailed).
+        storageVersion:
+          type: integer
+          description: >
+            Storage layout version: 2 = bounded root + queueChunks child
+            documents (queue arrays ABSENT from the root); absent/1 = legacy
+            in-root arrays. NEW sessions always use 2.
+        repeatSessionId:
+          type: string
+          description: >
+            Id of the session this session REPEATS (Continue lineage; root
+            only, bounded — never an array).
+        chunkCount:
+          type: integer
+          description: v2 number of queueChunks child documents (ceil(limit/200)).
+        completedChunks:
+          type: integer
+          description: v2 number of fully-consumed leading chunks.
+        queueChunksPrefix:
+          type: string
+          description: v2 fixed child collection name ('queueChunks').
+        position:
+          type: integer
+          description: v2 total queue positions (equals limit; canonical root name totalCount).
+        totalCount:
+          type: integer
+          description: v2 canonical total queue positions (== limit == position).
+        currentChunkIndex:
+          type: integer
+          description: v2 canonical chunk ordinal owning currentPosition (the ACTIVE chunk; -1 when empty).
+        deletedCount:
+          type: integer
+          description: v2 exact count of snapshot positions skipped because their card was deleted.
+        remainingQueueCount:
+          type: integer
+          description: v2 exact count of unrated live positions (persisted on the bounded root).
+        buildStatus:
+          type: string
+          enum: [building, ready, failed]
+          description: v2 build lifecycle — building (root written, chunks being written; NOT reviewable), ready (reviewable), failed (NOT reviewable).
+        buildFailed:
+          type: boolean
+          description: v2 true when the queue build failed (buildStatus failed) — the session is NOT reviewable.
+        buildError:
+          type: string
+          description: v2 recorded build error (present when buildFailed).
+        mode:
+          type: string
+          enum: [spaced_repetition]
+          description: >
+            The session mode. Only spaced_repetition exists today; the field
+            is structured so future modes can be added without breaking the
+            wire contract.
+        deckId:
+          type: string
+          description: Optional deck restriction captured at start.
+        source:
+          type: object
+          description: >
+            Persisted provenance of the session's card set: what selectors
+            defined the snapshot ('due' | 'deck' | 'custom') plus the
+            selector details (deck id/name, tags, explicit card ids). The
+            widget shows 'due' as "Due cards", 'deck' as the deck name, and
+            'custom' as "Custom"; Continue replays the exact selection.
+          properties:
+            type:
+              type: string
+              enum: [due, deck, custom]
+            deckId:
+              type: string
+            deckName:
+              type: string
+            tags:
+              type: array
+              items:
+                type: string
+            cardIds:
+              type: array
+              items:
+                type: string
+        limit:
+          type: integer
+          description: Number of cards snapshotted into the session (always equals cardIds.length).
+        dueCount:
+          type: integer
+          description: >
+            Exact number of cards that were due when the session started,
+            counted with the same due query (deck filter included). Always
+            equals cardIds.length for sessions started after the cap was
+            removed.
+        cardIds:
+          type: array
+          items:
+            type: string
+          description: >
+            Snapshot of the matching card ids (LEGACY v1/no-version sessions
+            ONLY — v2 roots deliberately OMIT this array; the queue lives in
+            queueChunks child documents and responses carry the bounded
+            currentPosition + queueWindow instead).
+        currentPosition:
+          type: integer
+          description: >
+            v2 stable queue position of the current card (0-based; null when
+            the queue is exhausted). Carried on session responses.
+        queueWindow:
+          type: object
+          description: >
+            v2 bounded queue window on session responses: the current card
+            plus up to SESSION_PRELOAD upcoming ids (never the full queue).
+          properties:
+            currentPosition:
+              type: integer
+            cardIds:
+              type: array
+              items:
+                type: string
+        currentIndex:
+          type: integer
+          description: Index into cardIds (v1) / current queue position (v2) of the card awaiting the next rating.
+        reviewedCount:
+          type: integer
+          description: Number of cards successfully rated in this session.
+        remainingCount:
+          type: integer
+          description: Number of cards still awaiting review (cardIds.length - currentIndex).
+        truncated:
+          type: boolean
+          description: True only on legacy sessions started while the old 100-card cap was in place (new sessions never truncate).
+        continuationAvailable:
+          type: boolean
+          description: >
+            True only on legacy sessions started while the old 100-card cap
+            was in place (new sessions snapshot every card, so this is
+            always false). Kept for backward compatibility with stored
+            sessions.
+        ratingCounts:
+          $ref: "#/components/schemas/SessionRatingCounts"
+        startedAt:
+          type: object
+          description: When the session was started. Same wire shape as createdAt.
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        lastReviewedAt:
+          type: object
+          description: When the last rating was applied (active sessions). Same wire shape as startedAt.
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+        endedAt:
+          type: object
+          description: When the session became completed or ended. Same wire shape as startedAt.
+          properties:
+            _seconds:
+              type: integer
+            _nanoseconds:
+              type: integer
+    ReviewSessionWithCard:
+      type: object
+      required: [session, card]
+      properties:
+        session:
+          $ref: "#/components/schemas/ReviewSession"
+        card:
+          oneOf:
+            - $ref: "#/components/schemas/Flashcard"
+            - type: "null"
+          description: The current card to review, or null when the queue is exhausted.
+        preloaded:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              front: { type: string }
+              back: { type: string }
+              deck: { type: string }
+              tags:
+                type: array
+                items: { type: string }
+          description: >
+            Upcoming cards (after the current card), up to the bounded
+            SESSION_PRELOAD window.
+        currentPosition:
+          type: integer
+          description: v2 stable queue position of the current card (null when exhausted).
+        queueWindow:
+          type: object
+          description: v2 bounded queue window (current card + preload ids).
+          properties:
+            currentPosition:
+              type: integer
+            currentCardId:
+              type: string
+            cardIds:
+              type: array
+              description: Current + upcoming cards, each with its stable queue position.
+              items:
+                type: object
+                properties:
+                  cardId: { type: string }
+                  position: { type: integer }
+    ReviewHistoryEvent:
+      type: object
+      required: [id, cardId, actorId, rating, stateBefore, reviewedAt, recordedAt, stabilityAfter, difficultyAfter, repsAfter, lapsesAfter, cardFrontSnapshot]
+      properties:
+        id: { type: string }
+        cardId: { type: string }
+        actorId: { type: string }
+        rating: { type: integer, enum: [1,2,3,4] }
+        stateBefore: { type: integer, enum: [0,1,2,3] }
+        reviewedAt: { type: string, description: ISO 8601 whole-millisecond }
+        recordedAt: { type: string, description: ISO 8601 whole-millisecond }
+        stabilityAfter: { type: number }
+        difficultyAfter: { type: number }
+        repsAfter: { type: integer }
+        lapsesAfter: { type: integer }
+        dueBefore: { type: string, description: ISO 8601; absent when the event did not record it }
+        dueAfter: { type: string, description: ISO 8601; absent when the event did not record it }
+        deckId: { type: string }
+        deckName: { type: string }
+        cardFrontSnapshot: { type: string, maxLength: 300 }
+        sessionId: { type: string }
+    ReviewHistoryPage:
+      type: object
+      required: [events, nextPageToken]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReviewHistoryEvent"
+        nextPageToken:
+          type: [string, "null"]
+          description: Opaque cursor for the next page (same filters), or null.
+    RatingHistogram:
+      type: object
+      required: [again, hard, good, easy]
+      properties:
+        again: { type: integer }
+        hard: { type: integer }
+        good: { type: integer }
+        easy: { type: integer }
+    TopLapsedCard:
+      type: object
+      required: [cardId, lapses, reps, front]
+      properties:
+        cardId: { type: string }
+        lapses: { type: integer }
+        reps: { type: integer }
+        front: { type: string }
+        deckId: { type: string }
+        deckName: { type: string }
+        lastReview: { type: string, description: ISO 8601 }
+    TopLapsedCards:
+      type: object
+      required: [cards]
+      properties:
+        cards:
+          type: array
+          items:
+            $ref: "#/components/schemas/TopLapsedCard"
+    StudyStats:
+      type: object
+      required: [from, to, totalReviews, ratingCounts, ratingPercentages, observedRetention, matureReviews, matureRatingCounts, matureRetention, topLapsedCards]
+      properties:
+        from:
+          type: string
+          description: Normalized ISO 8601 inclusive lower bound of the aggregated window.
+        to:
+          type: string
+          description: Normalized ISO 8601 exclusive upper bound of the aggregated window.
+        totalReviews: { type: integer }
+        ratingCounts:
+          $ref: "#/components/schemas/RatingHistogram"
+        ratingPercentages:
+          type: object
+          required: [again, hard, good, easy]
+          properties:
+            again: { type: number, description: 0..1, 3-decimal }
+            hard: { type: number, description: 0..1, 3-decimal }
+            good: { type: number, description: 0..1, 3-decimal }
+            easy: { type: number, description: 0..1, 3-decimal }
+        observedRetention:
+          type: [number, "null"]
+          description: Successful reviews (2/3/4) / totalReviews.
+        matureReviews: { type: integer }
+        matureRatingCounts:
+          $ref: "#/components/schemas/RatingHistogram"
+        matureRetention:
+          type: [number, "null"]
+          description: Successful mature reviews / matureReviews.
+        topLapsedCards:
+          type: array
+          items:
+            $ref: "#/components/schemas/TopLapsedCard"
+    MigrateReviewEventsRequest:
+      type: object
+      required: [legacyActorId]
+      properties:
+        pageSize:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 100
+        legacyActorId:
+          type: string
+          description: Operator-supplied actor recorded on migrated events (never hardcoded).
+        resumeAfterCardId:
+          type: string
+          description: Resume a previous run exactly (pass nextResumeAfterCardId from the last result).
+    MigrateReviewEventsResult:
+      type: object
+      required: [cardsMigrated, eventsWritten, hasMore, nextResumeAfterCardId]
+      properties:
+        cardsMigrated: { type: integer }
+        eventsWritten: { type: integer }
+        hasMore: { type: boolean }
+        nextResumeAfterCardId:
+          type: [string, "null"]
+          description: Resume cursor for the next call (last card doc scanned this call).
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+        issues:
+          type: array
+          description: Validation issue details, present on 400 responses.
+          items:
+            type: object

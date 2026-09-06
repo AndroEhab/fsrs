@@ -1,0 +1,16 @@
+# Local environment files — never commit real secrets.
+.env
+.env.*
+!.env.example
+ 
+# Local harness state and generated artifacts.
+.omp/
+-o
+mcp-server/output/
+
+# Dependency/build artifacts and logs.
+node_modules/
+dist/
+lib/
+coverage/
+*.log
