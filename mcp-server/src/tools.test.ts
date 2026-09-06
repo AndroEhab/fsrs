@@ -106,6 +106,10 @@ describe('registerFlashcardTools', () => {
     expect(due?.description).toContain('due for review');
     const dueProps = (due?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
     expect(Object.keys(dueProps).sort()).toEqual(['deck', 'deckId', 'pageSize', 'pageToken']);
+ 
+    const health = tools.tools.find((t) => t.name === 'health');
+    expect(health?.description).toContain('flashcard service is reachable');
+    expect(health?.description).not.toContain('persistent review session');
 
     const review = tools.tools.find((t) => t.name === 'review_flashcard');
     expect(review?.description).toContain('FSRS rating');
