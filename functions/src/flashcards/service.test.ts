@@ -958,6 +958,9 @@ describe('Bulk Flashcard Service', () => {
       expect(transaction.update).toHaveBeenCalledTimes(2);
       const updateCall = transaction.update.mock.calls[0][1] as Record<string, unknown>;
       expect(updateCall).toMatchObject({ front: 'New A', updatedAt: expect.any(Object) });
+      expect(Math.max(...transaction.get.mock.invocationCallOrder)).toBeLessThan(
+        Math.min(...transaction.update.mock.invocationCallOrder),
+      );
     });
 
     it('returns cards with deck/deckId ABSENT (no Firestore sentinel leak) when detaching via null', async () => {

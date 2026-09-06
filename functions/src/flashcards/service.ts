@@ -1495,7 +1495,13 @@ export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, own
         }
     }
     return getDb().runTransaction(async (t) => {
-        const results = [];
+        // Firestore transactions forbid reads after writes. Read every
+        // targeted card first, then apply the updates in a second pass.
+        const existing: Array<{
+            item: BulkUpdateFlashcardsInput['cards'][number];
+            docRef: DocumentReference<DocumentData>;
+            snap: DocumentSnapshot<DocumentData>;
+        }> = [];
         for (const item of input.cards) {
             const docRef = getDb().collection(COLLECTION).doc(item.id);
             const snap = await t.get(docRef);
@@ -1505,6 +1511,11 @@ export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, own
             // unowned/other-owner card is omitted — never silently updated).
             if (ownerId !== undefined && snap.data()?.ownerId !== ownerId)
                 continue;
+            existing.push({ item, docRef, snap });
+        }
+
+        const results: Flashcard[] = [];
+        for (const { item, docRef, snap } of existing) {
             const updateData: Record<string, unknown> = {
                 updatedAt: Timestamp.now(),
             };
