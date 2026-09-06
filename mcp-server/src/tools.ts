@@ -215,10 +215,9 @@ export interface ReviewSessionSummary {
   /** Session mode; currently always 'spaced_repetition'. */
   mode: 'spaced_repetition';
   /**
-   * Human-readable mode tag for the assistant to repeat verbatim to the user,
-   * e.g. "[Spaced repetition review · 12 cards due]". Exposed in structured
-   * content so UIs that render structuredContent (ChatGPT) see it even when
-   * the text content is hidden.
+   * Human-readable mode tag used by the review widget and full session
+   * summaries, e.g. "[Spaced repetition review · 12 cards due]". It is not
+   * included in the minimal model-facing structured content for session tools.
    */
   modeTag: string;
   /**
@@ -1622,7 +1621,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Start a review session',
       description:
-        'Starts a persistent review session: the backend snapshots EVERY selector/default-matching card into the session queue (never capped, no pagination). NO selectors -> the standard DUE queue (new + scheduled cards, earliest due first). Optional selectors (any combination): deckId (stable id) and/or deck (legacy name; deckId wins), tags (ANY-of - a card matching ANY listed tag qualifies), cardIds (explicit allowlist, deduped, every id must exist; combined with deck/tags by INTERSECTION). A selector-defined session may include NON-due cards - the selector query is authoritative; REVIEW_TEST_MODE only widens the DEFAULT due filter, never an explicit selection. The review widget renders the session, cards, source, and progress - DO NOT narrate, summarize, or repeat the session, its cards, its mode tag, progress, source, or the current card in your reply unless the user explicitly asks; the UI owns display. Returns the MINIMAL model-facing state: session id, status, mode, counters, and the current card id (full widget state incl. card content is delivered to the widget). When the session completes, the widget shows the Finish/Continue choice - do not narrate it. ALWAYS repeat the session modeTag to the user verbatim (e.g. "[Spaced repetition review - 12 cards - Due cards]") and report progress from visibleStatus ("X reviewed, Y remaining of N") - never invent or omit these. The queue is stable across retries: cards that become due later are NOT added. Sessions are scoped to the API key that starts them; only that key can get/submit/end them. Use this when the user wants to study a set of cards, e.g. "start a review session for my spanish deck" or "review my vocab-tagged cards".',
+        'Starts a persistent review session: the backend snapshots EVERY selector/default-matching card into the session queue (never capped, no pagination). NO selectors -> the standard DUE queue (new + scheduled cards, earliest due first). Optional selectors (any combination): deckId (stable id) and/or deck (legacy name; deckId wins), tags (ANY-of - a card matching ANY listed tag qualifies), cardIds (explicit allowlist, deduped, every id must exist; combined with deck/tags by INTERSECTION). A selector-defined session may include NON-due cards - the selector query is authoritative; REVIEW_TEST_MODE only widens the DEFAULT due filter, never an explicit selection. The review widget renders the session, cards, source, and progress - DO NOT narrate, summarize, or repeat the session, its cards, its mode tag, progress, source, or the current card in your reply unless the user explicitly asks; the UI owns display. Returns the MINIMAL model-facing state: session id, status, mode, counters, and the current card id (full widget state incl. card content is delivered to the widget). When the session completes, the widget shows the Finish/Continue choice - do not narrate it. The queue is stable across retries: cards that become due later are NOT added. Sessions are scoped to the API key that starts them; only that key can get/submit/end them. Use this when the user wants to study a set of cards, e.g. "start a review session for my spanish deck" or "review my vocab-tagged cards".',
       inputSchema: {
         deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
         deck: z.string().min(1, 'Deck name cannot be empty').max(100, 'Deck name too long').optional(),

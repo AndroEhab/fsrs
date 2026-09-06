@@ -905,6 +905,8 @@ describe('registerFlashcardTools', () => {
     const sc = (result as { structuredContent?: { session?: { id?: string; status?: string }; card?: { id?: string } | null } }).structuredContent;
     expect(sc?.session?.id).toBe('s1');
     expect(sc?.session?.status).toBe('active');
+    expect((sc?.session as Record<string, unknown>).modeTag).toBeUndefined();
+    expect((sc?.session as Record<string, unknown>).visibleStatus).toBeUndefined();
     // Minimal: card has only the id; the front rides in hidden widgetState.
     expect(sc?.card?.id).toBe('card-1');
     expect((sc?.card as { front?: string } | null | undefined)?.front).toBeUndefined();
@@ -932,6 +934,8 @@ describe('registerFlashcardTools', () => {
     expect(sc?.session?.currentIndex).toBe(1);
     expect(sc?.session?.reviewedCount).toBe(1);
     expect(sc?.session?.status).toBe('active');
+    expect((sc?.session as Record<string, unknown>).modeTag).toBeUndefined();
+    expect((sc?.session as Record<string, unknown>).visibleStatus).toBeUndefined();
     expect(sc?.card?.id).toBe('card-2');
     expect(result.content).toEqual([]);
   });
@@ -995,6 +999,8 @@ describe('registerFlashcardTools', () => {
     const start = tools.tools.find((t) => t.name === 'start_review_session');
     const startProps = (start?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
     expect(Object.keys(startProps).sort()).toEqual(['cardIds', 'cardType', 'deck', 'deckId', 'name', 'repeatSessionId', 'tags']);
+    expect(start?.description ?? '').not.toContain('ALWAYS repeat the session modeTag');
+    expect(start?.description ?? '').toContain('MINIMAL model-facing state');
     const submit = tools.tools.find((t) => t.name === 'submit_review');
     const submitProps = (submit?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
     expect(Object.keys(submitProps).sort()).toEqual(['expectedCardId', 'expectedPosition', 'rating', 'requestId', 'reviewAt', 'sessionId']);

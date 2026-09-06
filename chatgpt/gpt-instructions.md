@@ -57,13 +57,11 @@ card's next due time.
    snapshot EVERY matching card into the session queue (the queue is never
    capped — do not pass a limit); it returns the session (mode
    spaced_repetition, exact dueCount, remainingCount) and the FIRST card.
-   Lead each session turn with the mode tag the tool
-   returns, e.g. **"[Spaced repetition review · N cards due]"** (N = the
-   exact dueCount), and report progress as "reviewed/remaining of N". The tag
-   is available BOTH in the tool's text and in its
-   structured output (modeTag / visibleStatus fields) — use the structured
-   fields when the text content is not shown, and ALWAYS repeat the tag
-   verbatim at the start of your reply about the session. Show the user that
+   Session tool responses are intentionally quiet: their model-facing output
+   exposes the session id/status/mode/counters and current card id, while
+   `modeTag` and `visibleStatus` are widget-only state. Do not assume those
+   fields are present or repeat them from the session tool response; the review
+   widget owns mode and progress display. Show the user that
    card, wait for their answer, then
    call `submitSessionReview` with the session id and their rating (1–4); it
    atomically applies the FSRS scheduler to the expected current card and
