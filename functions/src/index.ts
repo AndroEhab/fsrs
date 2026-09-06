@@ -326,7 +326,9 @@ export const listFlashcardsHandler = onRequest({ cors: true }, async (req, res) 
   if (!identity) return;
 
   const url = new URL(req.url, `https://${req.headers.host}`);
+
   const query = {
+    deckId: url.searchParams.get('deckId') || undefined,
     deck: url.searchParams.get('deck') || undefined,
     tags: url.searchParams.get('tags') || undefined,
     pageSize: url.searchParams.get('pageSize') ? parseInt(url.searchParams.get('pageSize')!, 10) : undefined,

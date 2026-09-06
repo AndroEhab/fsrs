@@ -5445,6 +5445,12 @@ describe('Multi-tenant isolation (owner-scoped calls)', () => {
       await listFlashcards({}, OWNER_A);
       expect(mockCards.where).toHaveBeenCalledWith('ownerId', '==', OWNER_A);
     });
+ 
+    it('listFlashcards applies the deckId filter within the caller owner scope', async () => {
+      await listFlashcards({ deckId: 'deck-1' }, OWNER_A);
+      expect(mockCards.where).toHaveBeenNthCalledWith(1, 'ownerId', '==', OWNER_A);
+      expect(mockCards.where).toHaveBeenNthCalledWith(2, 'deckId', '==', 'deck-1');
+    });
   });
 
   describe('decks', () => {
