@@ -606,33 +606,27 @@ ChatGPT). Choose one of:
 
 - **Dynamic Client Registration (DCR)** — ChatGPT's connector registers its
   OAuth client at add-time via the authorization server's
-  `registration_endpoint` (`/oidc/register`). On this tenant DCR is
-  **enabled**, but the tenant has exhausted its **application/entity quota**:
-  every registration now returns `403 {"errorCode":"too_many_entities"}`,
-  which surfaces in ChatGPT as *"An error occurred while adding the connector
-  link"* BEFORE any MCP call. **Fix (tenant-side, no code change):** delete
-  the stale `tpc_`-prefixed DCR applications created by failed connector
-  attempts (Auth0 Dashboard → Applications), or raise the tenant's entity
-  quota via Auth0 Support; then reconnect the connector once. Also enable
-  **Resource Parameter Compatibility Profile** (Settings → Advanced) so the
-  RFC 9728 `resource` parameter is honored, and authorize **Default
-  Permissions for Third-Party Applications** on the API above so DCR clients
-  get user-delegated access.
+  `registration_endpoint` (`/oidc/register`). This is the active production
+  path: DCR is enabled and the tenant contains a successfully registered
+  ChatGPT public client using authorization-code + PKCE `S256`, rotating
+  refresh tokens, and the callback URI supplied by ChatGPT. **Resource
+  Parameter Compatibility Profile** (Settings → Advanced) is enabled so the
+  RFC 9728 `resource` parameter is honored, and **Default Permissions for
+  Third-Party Applications** grants the API's user-delegated `read:cards` and
+  `write:cards` permissions to DCR clients.
 - **Regular Web App** — create a Regular Web Application (not M2M) in the
   tenant, allowlist ChatGPT's redirect URI (the callback-ID-specific
   `https://chatgpt.com/connector/oauth/{callback_id}`, or the stable
   `https://chatgpt.com/connector_platform_oauth_redirect` once the tenant
   enables "Include Issuer in Authorization Responses" / RFC 9207), and grant
   it **user-delegated access** to the API.
-- **Client ID Metadata Document (CIMD)** — Auth0's recommended option for
-  production MCP and the cleanest way around the DCR quota. Enable **Client
+- **Client ID Metadata Document (CIMD)** — an alternative to DCR. Enable **Client
   ID Metadata Document Registration** in Settings → Advanced (this advertises
   `client_id_metadata_document_supported: true` in discovery, which ChatGPT's
   connector currently does NOT see), then import ChatGPT's client metadata
   URL (from the Apps SDK app management page) via Applications → Create
   Application → **Import from URL**, and grant user-delegated access to the
-  API. Until CIMD is enabled, the connector must rely on DCR — which is
-  currently blocked by the entity quota.
+  API. CIMD is not required while the working DCR path remains enabled.
 
 After the client is registered, ChatGPT runs the authorization-code + PKCE
 flow and presents the access token as `Authorization: Bearer <token>` on

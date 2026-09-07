@@ -4986,7 +4986,7 @@ describe('Review Session Service — v2 chunked storage', () => {
       const db = (b.data().due as { toMillis(): number }).toMillis();
       return (da - db) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
     });
-    let chain: Array<{ type: string; arg?: unknown }> = [];
+    const chain: Array<{ type: string; arg?: unknown }> = [];
     const q: any = {
       orderBy: jest.fn((field: string, dir?: string) => {
         chain.push({ type: 'orderBy:' + field + ':' + (dir ?? 'asc') });

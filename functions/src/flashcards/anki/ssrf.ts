@@ -82,8 +82,8 @@ function expandIpv6(address: string): string[] | null {
     head = address.slice(0, doubleColon);
     tail = address.slice(doubleColon + 2);
   }
-  let headGroups = head === '' ? [] : head.split(':');
-  let tailGroups = tail === '' ? [] : tail.split(':');
+  const headGroups = head === '' ? [] : head.split(':');
+  const tailGroups = tail === '' ? [] : tail.split(':');
   // A dotted-quad tail (::ffff:8.8.8.8) is the LAST two groups as IPv4.
   const last = tailGroups[tailGroups.length - 1];
   if (last !== undefined && /^\d{1,3}(\.\d{1,3}){3}$/.test(last)) {

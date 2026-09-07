@@ -26,14 +26,13 @@ advertising authorization server `https://andrewehab.eu.auth0.com/`.
 Unauthenticated `/mcp` requests receive a `401` with an RFC 9728
 `WWW-Authenticate` challenge pointing at that metadata URL.
 
-**Live ChatGPT connector still requires Auth0 client configuration:** ChatGPT's
-MCP connector needs a registered OAuth client in the Auth0 tenant (M2M
-application + API/audience, or client registration via CIMD/DCR) and the MCP
-authorization flow (authorization-code + PKCE `S256`). That tenant-side
-registration is not yet done; until it is, the live ChatGPT connector cannot be
-created, while the MCP server remains fully usable with local MCP tooling (MCP
-Inspector, stdio clients, tunnels with the optional static Bearer gate). See
-`mcp-server/README.md` → "Auth0-protected HTTP /mcp (RFC 9728)".
+**The live ChatGPT connector is registered in Auth0.** Dynamic Client
+Registration (DCR) is enabled, and ChatGPT has registered a public OAuth client
+using authorization-code + PKCE `S256` for the MCP API audience above. Auth0's
+resource-parameter compatibility profile and default third-party application
+permissions are enabled, so new connector registrations receive the
+user-delegated API access they need. See `mcp-server/README.md` →
+"Auth0-protected HTTP /mcp (RFC 9728)".
 
 ## Superseded: Custom GPT Action (`chatgpt/`)
 

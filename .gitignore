@@ -5,6 +5,8 @@
  
 # Local harness state and generated artifacts.
 .omp/
+.config/
+functions/.firebase-rules-test-*.json
 -o
 mcp-server/output/
 

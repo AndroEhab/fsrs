@@ -13,7 +13,7 @@
     "logs": "firebase functions:log",
     "lint": "eslint --ext .ts src/",
     "test": "jest --passWithNoTests",
-    "test:rules": "firebase emulators:exec --only firestore \"jest src/firestore.rules.test.ts --runInBand --forceExit\""
+    "test:rules": "node scripts/run-firestore-rules-tests.cjs"
   },
   "engines": {
     "node": "22"

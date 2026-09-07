@@ -1941,7 +1941,7 @@ async function loadV2QueueWindow(session: ReviewSession, currentPosition: number
         return { currentPosition: null, currentCardId: null, cardIds: [] };
     }
     // Start from the ACTIVE chunk (root metadata) — never scan from 0.
-    let startChunk = typeof session.currentChunkIndex === 'number' && session.currentChunkIndex >= 0
+    const startChunk = typeof session.currentChunkIndex === 'number' && session.currentChunkIndex >= 0
         ? session.currentChunkIndex
         : chunkOrdinalFor(currentPosition);
     // Bounded candidate scan: the active chunk then, at most, the next chunk.
@@ -2163,7 +2163,7 @@ async function buildV2QueueChunks(
         // Paged query build with projection. Each page resumes after the
         // last (due, docId) of the previous page.
         const query = scopedQueueQuery(selectors);
-        let cursor: BuildCursor = { lastDue: null, lastDocId: null };
+        const cursor: BuildCursor = { lastDue: null, lastDocId: null };
         for (;;) {
             let page = query;
             if (cursor.lastDue !== null && cursor.lastDocId !== null) {
@@ -3073,7 +3073,6 @@ async function submitV2SessionReview(session: ReviewSession, input: SubmitSessio
         let nextCard: Flashcard | null = null;
         {
             const fromChunk = chunkOrdinalFor(startPosition);
-            let scannedDeleted = 0;
             for (let cIdx = fromChunk; cIdx <= fromChunk + 1 && cIdx * SESSION_QUEUE_CHUNK_SIZE < limit; cIdx += 1) {
                 const chunk = await q.chunkFor(cIdx * SESSION_QUEUE_CHUNK_SIZE);
                 if (!chunk) break;
@@ -3089,7 +3088,6 @@ async function submitV2SessionReview(session: ReviewSession, input: SubmitSessio
                         // Deleted since the snapshot: persist the skip NOW so
                         // the chunk metadata and root counters stay exact.
                         q.claim(pos, { status: 'deleted', deletedAt: updatedAt });
-                        scannedDeleted += 1;
                         deletedCount += 1;
                         remainingQueueCount = Math.max(0, remainingQueueCount - 1);
                         continue;
@@ -3253,7 +3251,7 @@ async function submitV2SessionReview(session: ReviewSession, input: SubmitSessio
  *  currentChunkIndex), then at most the next chunk. */
 async function loadV2CurrentCard(session: ReviewSession): Promise<{ card: Flashcard | null; position: number | null }> {
     const limit = session.limit ?? 0;
-    let startChunk = typeof session.currentChunkIndex === 'number' && session.currentChunkIndex >= 0
+    const startChunk = typeof session.currentChunkIndex === 'number' && session.currentChunkIndex >= 0
         ? session.currentChunkIndex
         : chunkOrdinalFor(session.currentIndex ?? 0);
     for (let cIdx = startChunk; cIdx <= startChunk + 1 && cIdx * SESSION_QUEUE_CHUNK_SIZE < limit; cIdx += 1) {
