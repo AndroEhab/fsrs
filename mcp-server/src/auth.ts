@@ -74,19 +74,47 @@ export const METADATA_CORS_HEADERS: Record<string, string> = {
   'access-control-allow-headers': 'authorization, content-type',
 };
 
-function defaultJwks(issuer: string): JWTVerifyGetKey {
-  return createRemoteJWKSet(new URL(`${issuer.replace(/\/+$/, '')}/.well-known/jwks.json`));
+/**
+ * Per-issuer singleton cache for jose's remote JWKS resolver. Each call to
+ * `createRemoteJWKSet` creates an independent key cache; sharing the same
+ * resolver across requests avoids redundant `.well-known/jwks.json` fetches
+ * and lets jose's internal TTL/rate-limit logic work correctly.
+ */
+const jwksResolvers = new Map<string, JWTVerifyGetKey>();
+
+/**
+ * Returns a cached remote JWKS resolver for the given issuer URL. The same
+ * `JWTVerifyGetKey` instance is returned for identical normalized URLs, so
+ * jose's built-in key caching and rotation logic is preserved.
+ */
+export function getJwks(issuer: string): JWTVerifyGetKey {
+  const url = new URL(`${issuer.replace(/\/+$/, '')}/.well-known/jwks.json`).href;
+  let resolver = jwksResolvers.get(url);
+  if (!resolver) {
+    resolver = createRemoteJWKSet(new URL(url));
+    jwksResolvers.set(url, resolver);
+  }
+  return resolver;
+}
+
+/**
+ * Clears the JWKS resolver cache. Exported for test isolation — each test
+ * suite should call this in `afterEach` to prevent stale resolvers from
+ * leaking across tests that use different issuer URLs.
+ */
+export function invalidateJwksCache(): void {
+  jwksResolvers.clear();
 }
 
 /**
  * Returns the JWT payload when the header carries a valid Auth0 RS256 token,
  * else null. `jwks` is injectable for tests; it defaults to the Auth0 tenant's
- * remote JWKS.
+ * remote JWKS (shared via the singleton cache).
  */
 export async function verifyAuth0Token(
   authHeader: string | undefined,
   config: ServerConfig,
-  jwks: JWTVerifyGetKey = defaultJwks(config.auth0Issuer),
+  jwks: JWTVerifyGetKey = getJwks(config.auth0Issuer),
 ): Promise<Record<string, unknown> | null> {
   if (!auth0Configured(config)) return null;
 

@@ -97,81 +97,83 @@ function serveHttp(): Promise<void> {
     return Promise.reject(new Error(guardError));
   }
   const httpServer = createServer(async (req, res) => {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-
-    // RFC 9728 protected-resource metadata. Served at the /mcp-suffixed path
-    // (the challenge target) and the root-level path (what the ChatGPT MCP
-    // connector actually queries). CORS is enabled (the connector fetches
-    // these cross-origin from chatgpt.com) and OPTIONS preflights are
-    // answered so the browser can read the document.
-    const isMetadataPath = url.pathname === OAUTH_RESOURCE_METADATA_MCP_PATH || url.pathname === OAUTH_RESOURCE_METADATA_PATH;
-    if (isMetadataPath) {
-      if (req.method === 'OPTIONS') {
-        res.writeHead(204, METADATA_CORS_HEADERS);
-        res.end();
-        return;
-      }
-      if (req.method === 'GET') {
-        serveResourceMetadata(res, config);
-        return;
-      }
-      res.writeHead(405, METADATA_CORS_HEADERS).end('Method Not Allowed');
-      return;
-    }
-
-    if (req.method === 'OPTIONS' && url.pathname === MCP_PATH) {
-      handleOptions(res);
-      return;
-    }
-
-    if (url.pathname !== MCP_PATH || !req.method || !MCP_METHODS.has(req.method)) {
-      res.writeHead(404).end('Not Found');
-      return;
-    }
-
-    // Auth0 gate (fails closed when AUTH0_ISSUER/AUTH0_AUDIENCE are set).
-    const gate = await gateRequest(req, config);
-    if (!gate.ok) {
-      res.writeHead(401, {
-        'content-type': 'application/json',
-        'WWW-Authenticate': challengeFor(config),
-      }).end(JSON.stringify({ error: 'Unauthorized' }));
-      return;
-    }
-
-    // Identity propagation: the VERIFIED token (gate.token) is handed to the
-    // per-request bridge, which forwards it to the backend as Authorization
-    // so the Firebase API scopes the call to the caller's verified `sub`.
-    const bearerToken = gate.token ?? undefined;
-
-    // Optional static Bearer gate (defense in depth behind a tunnel).
-    if (config.authToken) {
-      const auth = req.headers.authorization ?? '';
-      if (auth !== `Bearer ${config.authToken}`) {
-        res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Unauthorized' }));
-        return;
-      }
-    }
-
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
-
-    const server = createAppServer(bearerToken);
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless mode — one server per request
-      enableJsonResponse: true,
-    });
-
-    res.on('close', () => {
-      transport.close();
-      server.close();
-    });
-
     try {
+      // Use a fixed base: only req.url (pathname+query) drives routing — the
+      // caller-supplied Host header is never needed and could be malformed.
+      const url = new URL(req.url ?? '/', 'http://localhost');
+
+      // RFC 9728 protected-resource metadata. Served at the /mcp-suffixed path
+      // (the challenge target) and the root-level path (what the ChatGPT MCP
+      // connector actually queries). CORS is enabled (the connector fetches
+      // these cross-origin from chatgpt.com) and OPTIONS preflights are
+      // answered so the browser can read the document.
+      const isMetadataPath = url.pathname === OAUTH_RESOURCE_METADATA_MCP_PATH || url.pathname === OAUTH_RESOURCE_METADATA_PATH;
+      if (isMetadataPath) {
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204, METADATA_CORS_HEADERS);
+          res.end();
+          return;
+        }
+        if (req.method === 'GET') {
+          serveResourceMetadata(res, config);
+          return;
+        }
+        res.writeHead(405, METADATA_CORS_HEADERS).end('Method Not Allowed');
+        return;
+      }
+
+      if (req.method === 'OPTIONS' && url.pathname === MCP_PATH) {
+        handleOptions(res);
+        return;
+      }
+
+      if (url.pathname !== MCP_PATH || !req.method || !MCP_METHODS.has(req.method)) {
+        res.writeHead(404).end('Not Found');
+        return;
+      }
+
+      // Auth0 gate (fails closed when AUTH0_ISSUER/AUTH0_AUDIENCE are set).
+      const gate = await gateRequest(req, config);
+      if (!gate.ok) {
+        res.writeHead(401, {
+          'content-type': 'application/json',
+          'WWW-Authenticate': challengeFor(config),
+        }).end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+
+      // Identity propagation: the VERIFIED token (gate.token) is handed to the
+      // per-request bridge, which forwards it to the backend as Authorization
+      // so the Firebase API scopes the call to the caller's verified `sub`.
+      const bearerToken = gate.token ?? undefined;
+
+      // Optional static Bearer gate (defense in depth behind a tunnel).
+      if (config.authToken) {
+        const auth = req.headers.authorization ?? '';
+        if (auth !== `Bearer ${config.authToken}`) {
+          res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Unauthorized' }));
+          return;
+        }
+      }
+
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+
+      const server = createAppServer(bearerToken);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined, // stateless mode — one server per request
+        enableJsonResponse: true,
+      });
+
+      res.on('close', () => {
+        transport.close();
+        server.close();
+      });
+
       await server.connect(transport);
       await transport.handleRequest(req, res);
     } catch (err) {
-      console.error('MCP request error:', err);
+      console.error('Unhandled request error:', err);
       if (!res.headersSent) {
         res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Internal server error' }));
       }

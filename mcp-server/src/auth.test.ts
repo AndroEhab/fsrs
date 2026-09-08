@@ -1,7 +1,7 @@
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type GenerateKeyPairResult } from 'jose';
 import type { ServerResponse } from 'node:http';
 import { ServerConfig } from './config';
-import { OAUTH_RESOURCE_METADATA_MCP_PATH, OAUTH_RESOURCE_METADATA_PATH, challengeFor, gateRequest, serveResourceMetadata, shouldEnforceAuth, verifyAuth0Token } from './auth';
+import { OAUTH_RESOURCE_METADATA_MCP_PATH, OAUTH_RESOURCE_METADATA_PATH, challengeFor, gateRequest, getJwks, invalidateJwksCache, serveResourceMetadata, shouldEnforceAuth, verifyAuth0Token } from './auth';
 
 type KeyPair = GenerateKeyPairResult;
 
@@ -26,6 +26,8 @@ function config(overrides: Partial<ServerConfig> = {}): ServerConfig {
     ...overrides,
   };
 }
+
+afterEach(() => invalidateJwksCache());
 
 /* ------------------------------------------------------------------ */
 /* Config / enforcement                                                */
@@ -108,6 +110,31 @@ describe('verifyAuth0Token', () => {
 
   it('returns null when Auth0 is not configured (no verification attempted)', async () => {
     expect(await verifyAuth0Token(`Bearer ${await sign()}`, config({ auth0Issuer: '', auth0Audience: '' }), jwks)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* getJwks — resolver caching                                         */
+/* ------------------------------------------------------------------ */
+
+describe('getJwks', () => {
+  it('returns the same resolver instance for the same issuer (shared caching)', () => {
+    const a = getJwks(ISSUER);
+    const b = getJwks(ISSUER);
+    expect(a).toBe(b);
+  });
+
+  it('returns different resolvers for different issuers', () => {
+    const a = getJwks(ISSUER);
+    const b = getJwks('https://other-issuer.example/');
+    expect(a).not.toBe(b);
+  });
+
+  it('invalidateJwksCache clears the cache so the next call creates a fresh resolver', () => {
+    const before = getJwks(ISSUER);
+    invalidateJwksCache();
+    const after = getJwks(ISSUER);
+    expect(after).not.toBe(before);
   });
 });
 

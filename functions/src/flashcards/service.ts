@@ -109,18 +109,30 @@ function docToDeck(doc: DocumentSnapshot<DocumentData>): Deck {
 }
 
 /**
+ * Strips Firestore `FieldValue.delete()` sentinels from an object. These
+ * internal markers must never leak into API responses — a deleted field
+ * reads as ABSENT, not as an opaque object. Applied after every in-memory
+ * merge that may include delete sentinels (unsuspend's `suspended`, reset's
+ * `lastReview`, deck detaches, etc.).
+ */
+function stripFieldDeleteSentinels(obj: Record<string, unknown>): void {
+  for (const key of Object.keys(obj)) {
+    const value = obj[key];
+    if (value instanceof FieldValue) {
+      delete obj[key];
+    }
+  }
+}
+
+/**
  * Builds the card object returned to API clients after an in-memory merge
  * with an update payload. Firestore `FieldValue.delete()` sentinels must NOT
- * leak into responses: a detach (`deckId: null`) removes the fields entirely.
+ * leak into responses: a deleted field reads as ABSENT on the returned card,
+ * matching what a re-read of the document would produce.
  */
 function mergeCardForResponse(snap: DocumentSnapshot<DocumentData>, updateData: Partial<Flashcard>): Flashcard {
   const merged = { ...docToFlashcard(snap), ...updateData };
-  if (merged.deckId && typeof merged.deckId === 'object' && (merged.deckId as { __fieldDelete?: boolean }).__fieldDelete) {
-    delete merged.deckId;
-  }
-  if (merged.deck && typeof merged.deck === 'object' && (merged.deck as { __fieldDelete?: boolean }).__fieldDelete) {
-    delete merged.deck;
-  }
+  stripFieldDeleteSentinels(merged as Record<string, unknown>);
   return merged;
 }
 
@@ -170,9 +182,11 @@ async function findOrCreateDeckByName(name: string, ownerId?: string): Promise<s
   return docRef.id;
 }
 
-/** Returns the id of an existing deck with the given name, or null. When
- *  `ownerId` is given the name lookup is scoped to that owner's decks (deck
- *  names are unique per owner). */
+/** Returns the id of an existing deck with the given name, scoped to the
+ *  owner's decks when `ownerId` is supplied (deck names are unique per owner).
+ *  The only caller that omits `ownerId` is the operator-level
+ *  `migrateLegacyDeckNames` migration which intentionally operates across
+ *  owners. All user-facing callers always supply `ownerId`. */
 async function findDeckIdByName(name: string, ownerId?: string): Promise<string | null> {
   let q = getDb().collection(DECKS_COLLECTION).where('name', '==', name);
   if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
@@ -191,7 +205,7 @@ async function findDeckIdByName(name: string, ownerId?: string): Promise<string 
  */
 async function resolveDeckRef(
   input: { deckId?: string | null; deck?: string | null },
-  ownerId?: string,
+  ownerId: string,
 ): Promise<{ deckId?: string; deck?: string } | null> {
   if (input.deckId !== undefined && input.deckId !== null) {
     const deckDoc = await getDb().collection(DECKS_COLLECTION).doc(input.deckId).get();
@@ -201,7 +215,7 @@ async function resolveDeckRef(
     // Owner-scoped callers may only reference their own decks (a deck id of
     // an unowned/other-owner deck must not resolve — it would attach the
     // card to a deck the caller does not own).
-    if (ownerId !== undefined && deckDoc.data()?.ownerId !== ownerId) {
+    if (deckDoc.data()?.ownerId !== ownerId) {
       throw new DeckNotFoundError(input.deckId);
     }
     const data = deckDoc.data();
@@ -223,11 +237,11 @@ function applyDeckRef(target: Record<string, unknown>, ref: { deckId?: string; d
 
 /** Throws when any referenced deck id does not exist (used by bulk create/update).
  *  Owner-scoped callers may only reference their own decks. */
-async function validateDeckIds(deckIds: Array<string | null | undefined>, ownerId?: string): Promise<void> {
+async function validateDeckIds(deckIds: Array<string | null | undefined>, ownerId: string): Promise<void> {
   const unique = [...new Set(deckIds.filter((id): id is string => typeof id === 'string' && id.length > 0))];
   for (const id of unique) {
     const doc = await getDb().collection(DECKS_COLLECTION).doc(id).get();
-    if (!doc.exists || (ownerId !== undefined && doc.data()?.ownerId !== ownerId)) {
+    if (!doc.exists || doc.data()?.ownerId !== ownerId) {
       throw new DeckNotFoundError(id);
     }
   }
@@ -237,7 +251,7 @@ async function validateDeckIds(deckIds: Array<string | null | undefined>, ownerI
 /* Decks                                                               */
 /* ------------------------------------------------------------------ */
 
-export async function createDeck(input: CreateDeckInput, ownerId?: string): Promise<Deck> {
+export async function createDeck(input: CreateDeckInput, ownerId: string): Promise<Deck> {
   // Deck names are unique PER OWNER: legacy card `deck` strings resolve to a
   // single deck by name, so a duplicate would make that resolution ambiguous.
   const existingId = await findDeckIdByName(input.name, ownerId);
@@ -248,7 +262,7 @@ export async function createDeck(input: CreateDeckInput, ownerId?: string): Prom
   const now = Timestamp.now();
   const docRef = getDb().collection(DECKS_COLLECTION).doc();
   const deck: Omit<Deck, 'id'> = {
-    ...(ownerId !== undefined ? { ownerId } : {}),
+    ownerId,
     name: input.name,
     ...(input.description !== undefined ? { description: input.description } : {}),
     createdAt: now,
@@ -258,21 +272,21 @@ export async function createDeck(input: CreateDeckInput, ownerId?: string): Prom
   return { id: docRef.id, ...deck };
 }
 
-export async function getDeck(id: string, ownerId?: string): Promise<Deck | null> {
+export async function getDeck(id: string, ownerId: string): Promise<Deck | null> {
   const doc = await getDb().collection(DECKS_COLLECTION).doc(id).get();
   if (!doc.exists) return null;
   // Owner-scoped callers may only read their OWN decks (ownerless legacy or
   // another tenant's deck reads as not found — no existence leak).
-  if (ownerId !== undefined && doc.data()?.ownerId !== ownerId) return null;
+  if (doc.data()?.ownerId !== ownerId) return null;
   return docToDeck(doc as QueryDocumentSnapshot<DocumentData>);
 }
 
-export async function updateDeck(id: string, input: UpdateDeckInput, ownerId?: string): Promise<Deck | null> {
+export async function updateDeck(id: string, input: UpdateDeckInput, ownerId: string): Promise<Deck | null> {
   const docRef = getDb().collection(DECKS_COLLECTION).doc(id);
   const doc = await docRef.get();
   if (!doc.exists) return null;
   // Owner-scoped callers may only update their OWN decks.
-  if (ownerId !== undefined && doc.data()?.ownerId !== ownerId) return null;
+  if (doc.data()?.ownerId !== ownerId) return null;
 
   // Renaming must not collide with another of the owner's deck names.
   if (input.name !== undefined) {
@@ -300,11 +314,11 @@ export async function updateDeck(id: string, input: UpdateDeckInput, ownerId?: s
   // committed, deck NOT yet renamed); retrying completes the rewrite.
   if (renaming) {
     const byIdQuery = getDb().collection(COLLECTION).where('deckId', '==', id);
-    const byId = await (ownerId !== undefined ? byIdQuery.where('ownerId', '==', ownerId) : byIdQuery).get();
+    const byId = await byIdQuery.where('ownerId', '==', ownerId).get();
     await updateCardsChunked(byId.docs, () => ({ deck: input.name as string }));
     if (oldName !== undefined) {
       const byNameQuery = getDb().collection(COLLECTION).where('deck', '==', oldName);
-      const byName = await (ownerId !== undefined ? byNameQuery.where('ownerId', '==', ownerId) : byNameQuery).get();
+      const byName = await byNameQuery.where('ownerId', '==', ownerId).get();
       await updateCardsChunked(
         byName.docs.filter((cardDoc) => cardDoc.data().deckId !== id),
         () => ({ deck: input.name as string }),
@@ -383,20 +397,20 @@ async function updateCardsChunked(
  * the operation completes the remaining detaches. Returns the number of cards
  * detached.
  */
-export async function deleteDeck(id: string, ownerId?: string): Promise<DeleteDeckResult | null> {
+export async function deleteDeck(id: string, ownerId: string): Promise<DeleteDeckResult | null> {
   const deckRef = getDb().collection(DECKS_COLLECTION).doc(id);
 
   const preDeck = await deckRef.get();
   if (!preDeck.exists) return null;
   // Owner-scoped callers may only delete their OWN decks.
-  if (ownerId !== undefined && preDeck.data()?.ownerId !== ownerId) return null;
+  if (preDeck.data()?.ownerId !== ownerId) return null;
   const deckName = preDeck.data()?.name as string | undefined;
 
   let detachedCards = 0;
 
   // 1. Detach by stable reference (chunked), scoped to the owner's cards.
   const byIdQuery = getDb().collection(COLLECTION).where('deckId', '==', id);
-  const byId = await (ownerId !== undefined ? byIdQuery.where('ownerId', '==', ownerId) : byIdQuery).get();
+  const byId = await byIdQuery.where('ownerId', '==', ownerId).get();
   detachedCards += await updateCardsChunked(byId.docs, (cardData) => {
     const patch: Record<string, unknown> = { deckId: FieldValue.delete() };
     if (deckName !== undefined && cardData?.deck === deckName) {
@@ -408,7 +422,7 @@ export async function deleteDeck(id: string, ownerId?: string): Promise<DeleteDe
   // 2. Detach legacy name-only cards (no deckId) carrying the deck name.
   if (deckName !== undefined) {
     const byNameQuery = getDb().collection(COLLECTION).where('deck', '==', deckName);
-    const byName = await (ownerId !== undefined ? byNameQuery.where('ownerId', '==', ownerId) : byNameQuery).get();
+    const byName = await byNameQuery.where('ownerId', '==', ownerId).get();
     detachedCards += await updateCardsChunked(
       byName.docs.filter((doc) => doc.data().deckId !== id),
       () => ({ deck: FieldValue.delete() }),
@@ -430,7 +444,7 @@ export async function deleteDeck(id: string, ownerId?: string): Promise<DeleteDe
       return;
     }
     const sweepByIdQuery = getDb().collection(COLLECTION).where('deckId', '==', id);
-    const sweepById = await t.get(ownerId !== undefined ? sweepByIdQuery.where('ownerId', '==', ownerId) : sweepByIdQuery);
+    const sweepById = await t.get(sweepByIdQuery.where('ownerId', '==', ownerId));
     for (const doc of sweepById.docs) {
       const patch: Record<string, unknown> = { deckId: FieldValue.delete(), updatedAt: Timestamp.now() };
       if (txnName !== undefined && doc.data().deck === txnName) {
@@ -441,7 +455,7 @@ export async function deleteDeck(id: string, ownerId?: string): Promise<DeleteDe
     }
     if (txnName !== undefined) {
       const sweepByNameQuery = getDb().collection(COLLECTION).where('deck', '==', txnName);
-      const sweepByName = await t.get(ownerId !== undefined ? sweepByNameQuery.where('ownerId', '==', ownerId) : sweepByNameQuery);
+      const sweepByName = await t.get(sweepByNameQuery.where('ownerId', '==', ownerId));
       for (const doc of sweepByName.docs) {
         if (doc.data().deckId === id) continue;
         t.update(doc.ref, { deck: FieldValue.delete(), updatedAt: Timestamp.now() });
@@ -520,11 +534,11 @@ export async function migrateLegacyDeckNames(pageSize = BULK_LIMIT): Promise<{ m
   return { migrated };
 }
 
-export async function listDecks(query: ListDecksQuery, ownerId?: string): Promise<ListDecksResponse> {
+export async function listDecks(query: ListDecksQuery, ownerId: string): Promise<ListDecksResponse> {
   const pageSize = Math.min(query.pageSize || PAGE_SIZE_DEFAULT, PAGE_SIZE_MAX);
 
   let q: FirebaseFirestore.Query<DocumentData> = getDb().collection(DECKS_COLLECTION);
-  if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+  q = q.where('ownerId', '==', ownerId);
   q = q.orderBy('createdAt', 'desc');
   if (query.pageToken) {
     const tokenDoc = await getDb().collection(DECKS_COLLECTION).doc(query.pageToken).get();
@@ -561,12 +575,12 @@ export async function listDecks(query: ListDecksQuery, ownerId?: string): Promis
  * is already present) appear exactly once, so a caller that rewrites a card
  * once never counts it twice.
  */
-async function cardsWithAnyTag(names: string[], ownerId?: string): Promise<Array<QueryDocumentSnapshot<DocumentData>>> {
+async function cardsWithAnyTag(names: string[], ownerId: string): Promise<Array<QueryDocumentSnapshot<DocumentData>>> {
   const seen = new Set<string>();
   const docs: Array<QueryDocumentSnapshot<DocumentData>> = [];
   for (const name of names) {
     let q = getDb().collection(COLLECTION).where('tags', 'array-contains', name);
-    if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+    q = q.where('ownerId', '==', ownerId);
     const snap = await q.get();
     for (const doc of snap.docs) {
       if (seen.has(doc.ref.path)) continue;
@@ -608,12 +622,12 @@ function dedupeTags(tags: string[]): string[] {
  * unique and sort-stable, so the name cursor never skips or duplicates a
  * tag, even when cards change between pages.
  */
-export async function listTags(query: ListTagsQuery, ownerId?: string): Promise<ListTagsResponse> {
+export async function listTags(query: ListTagsQuery, ownerId: string): Promise<ListTagsResponse> {
   const counts = new Map<string, number>();
   let lastDoc: QueryDocumentSnapshot<DocumentData> | null = null;
   for (;;) {
     let q: FirebaseFirestore.Query<DocumentData> = getDb().collection(COLLECTION);
-    if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+    q = q.where('ownerId', '==', ownerId);
     q = q.orderBy('__name__').limit(500);
     if (lastDoc) q = q.startAfter(lastDoc);
     const page = await q.get();
@@ -667,7 +681,7 @@ export async function listTags(query: ListTagsQuery, ownerId?: string): Promise<
 async function runTagAction(
   names: string[],
   rewrite: (tags: string[]) => string[],
-  ownerId?: string,
+  ownerId: string,
 ): Promise<TagActionResult> {
   const docs = await cardsWithAnyTag(names, ownerId);
   const refs = docs.map((doc) => ({ ref: doc.ref, data: () => doc.data() }));
@@ -690,7 +704,7 @@ async function runTagAction(
  * that no card carries is a successful no-op (`affectedCards: 0`); `to`
  * already existing on all of them is likewise a no-op (nothing changed).
  */
-export async function renameTag(input: RenameTagInput, ownerId?: string): Promise<TagActionResult> {
+export async function renameTag(input: RenameTagInput, ownerId: string): Promise<TagActionResult> {
   return runTagAction([input.from], (tags) => tags.map((t) => (t === input.from ? input.to : t)), ownerId);
 }
 
@@ -701,7 +715,7 @@ export async function renameTag(input: RenameTagInput, ownerId?: string): Promis
  * no-op (`affectedCards: 0`). Cards whose array becomes empty keep an empty
  * `tags` array (the same representation create writes for untagged cards).
  */
-export async function deleteTag(input: DeleteTagInput, ownerId?: string): Promise<TagActionResult> {
+export async function deleteTag(input: DeleteTagInput, ownerId: string): Promise<TagActionResult> {
   return runTagAction([input.name], (tags) => tags.filter((t) => t !== input.name), ownerId);
 }
 
@@ -713,7 +727,7 @@ export async function deleteTag(input: DeleteTagInput, ownerId?: string): Promis
  * up carrying `to`. `from` and `to` must differ (validator-enforced). A
  * `from` that no card carries is a successful no-op (`affectedCards: 0`).
  */
-export async function mergeTags(input: MergeTagsInput, ownerId?: string): Promise<TagActionResult> {
+export async function mergeTags(input: MergeTagsInput, ownerId: string): Promise<TagActionResult> {
   return runTagAction([input.from], (tags) => {
     const hasFrom = tags.includes(input.from);
     if (!hasFrom) return tags;
@@ -725,14 +739,14 @@ export async function mergeTags(input: MergeTagsInput, ownerId?: string): Promis
 /* Flashcards                                                          */
 /* ------------------------------------------------------------------ */
 
-export async function createFlashcard(input: CreateFlashcardInput, ownerId?: string): Promise<Flashcard> {
+export async function createFlashcard(input: CreateFlashcardInput, ownerId: string): Promise<Flashcard> {
   const now = Timestamp.now();
   const scheduling = initialScheduling(now);
   const deckRef = await resolveDeckRef(input, ownerId);
 
   const docRef = getDb().collection(COLLECTION).doc();
   const flashcard: Omit<Flashcard, 'id'> = {
-    ...(ownerId !== undefined ? { ownerId } : {}),
+    ownerId,
     front: input.front,
     back: input.back,
     tags: input.tags || [],
@@ -753,18 +767,18 @@ export async function createFlashcard(input: CreateFlashcardInput, ownerId?: str
   return { id: docRef.id, ...flashcard };
 }
 
-export async function getFlashcard(id: string, ownerId?: string): Promise<Flashcard | null> {
+export async function getFlashcard(id: string, ownerId: string): Promise<Flashcard | null> {
   const doc = await getDb().collection(COLLECTION).doc(id).get();
   if (!doc.exists) return null;
-  if (ownerId !== undefined && doc.data()?.ownerId !== ownerId) return null;
+  if (doc.data()?.ownerId !== ownerId) return null;
   return docToFlashcard(doc as QueryDocumentSnapshot<DocumentData>);
 }
 
-export async function updateFlashcard(id: string, input: UpdateFlashcardInput, ownerId?: string): Promise<Flashcard | null> {
+export async function updateFlashcard(id: string, input: UpdateFlashcardInput, ownerId: string): Promise<Flashcard | null> {
   const docRef = getDb().collection(COLLECTION).doc(id);
   const doc = await docRef.get();
   if (!doc.exists) return null;
-  if (ownerId !== undefined && doc.data()?.ownerId !== ownerId) return null;
+  if (doc.data()?.ownerId !== ownerId) return null;
 
   const updateData: Partial<Flashcard> = {
     updatedAt: Timestamp.now(),
@@ -799,20 +813,20 @@ export async function updateFlashcard(id: string, input: UpdateFlashcardInput, o
   return docToFlashcard(updated as QueryDocumentSnapshot<DocumentData>);
 }
 
-export async function deleteFlashcard(id: string, ownerId?: string): Promise<boolean> {
+export async function deleteFlashcard(id: string, ownerId: string): Promise<boolean> {
   const docRef = getDb().collection(COLLECTION).doc(id);
   const doc = await docRef.get();
   if (!doc.exists) return false;
-  if (ownerId !== undefined && doc.data()?.ownerId !== ownerId) return false;
+  if (doc.data()?.ownerId !== ownerId) return false;
   await docRef.delete();
   // Best-effort cleanup of stored image objects (never blocks the delete).
   await cleanupCardImages(id);
   return true;
 }
 
-export async function listFlashcards(query: ListFlashcardsQuery, ownerId?: string): Promise<ListFlashcardsResponse> {
+export async function listFlashcards(query: ListFlashcardsQuery, ownerId: string): Promise<ListFlashcardsResponse> {
   let q: FirebaseFirestore.Query<DocumentData> = getDb().collection(COLLECTION);
-  if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+  q = q.where('ownerId', '==', ownerId);
   q = q.orderBy('createdAt', 'desc');
 
   if (query.deckId) {
@@ -860,11 +874,11 @@ export async function listFlashcards(query: ListFlashcardsQuery, ownerId?: strin
  * Cards are ordered by due time ascending and paginated with the same id-cursor
  * convention as listFlashcards (pageToken = last returned card id).
  */
-export async function dueFlashcards(query: DueFlashcardsQuery, ownerId?: string): Promise<DueFlashcardsResponse> {
+export async function dueFlashcards(query: DueFlashcardsQuery, ownerId: string): Promise<DueFlashcardsResponse> {
   const now = Timestamp.now();
 
   let q: FirebaseFirestore.Query<DocumentData> = getDb().collection(COLLECTION);
-  if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+  q = q.where('ownerId', '==', ownerId);
   q = q.where('due', '<=', now)
     .orderBy('due', 'asc');
 
@@ -925,9 +939,9 @@ export async function dueFlashcards(query: DueFlashcardsQuery, ownerId?: string)
 function applyCountFilters(
   q: FirebaseFirestore.Query,
   query: Pick<CountFlashcardsQuery, 'deckId' | 'deck' | 'tags'>,
-  ownerId?: string,
+  ownerId: string,
 ): FirebaseFirestore.Query {
-  if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+  q = q.where('ownerId', '==', ownerId);
   if (query.deckId) {
     q = q.where('deckId', '==', query.deckId);
   } else if (query.deck) {
@@ -1039,7 +1053,7 @@ async function countBuckets(base: FirebaseFirestore.Query, now: Timestamp): Prom
  * enforced): a filtered breakdown is not expressible as count() aggregates,
  * so groupBy always describes the whole library.
  */
-export async function countFlashcards(query: CountFlashcardsQuery, ownerId?: string): Promise<CountFlashcardsResponse> {
+export async function countFlashcards(query: CountFlashcardsQuery, ownerId: string): Promise<CountFlashcardsResponse> {
   const now = Timestamp.now();
   const whole = await countBuckets(applyCountFilters(getDb().collection(COLLECTION), query, ownerId), now);
 
@@ -1051,14 +1065,14 @@ export async function countFlashcards(query: CountFlashcardsQuery, ownerId?: str
   // count each deck's cards via `deck == name` equality aggregates (plus the
   // owner predicate). No flashcards collection documents are ever fetched.
   const deckQuery: FirebaseFirestore.Query<DocumentData> = getDb().collection(DECKS_COLLECTION);
-  const deckSnap = await (ownerId !== undefined ? deckQuery.where('ownerId', '==', ownerId) : deckQuery).get();
+  const deckSnap = await deckQuery.where('ownerId', '==', ownerId).get();
   const decks = deckSnap.docs.map((doc) => ({ id: doc.id, name: doc.data().name as string }));
 
   const attributed = { total: 0, new: 0, learning: 0, mature: 0, due: 0 };
   const byDeck: CountByDeck[] = [];
   for (const deck of decks) {
     let deckQ: FirebaseFirestore.Query<DocumentData> = getDb().collection(COLLECTION).where('deck', '==', deck.name);
-    if (ownerId !== undefined) deckQ = deckQ.where('ownerId', '==', ownerId);
+    deckQ = deckQ.where('ownerId', '==', ownerId);
     const counts = await countBuckets(deckQ, now);
     byDeck.push({ deckId: deck.id, deck: deck.name, counts });
     attributed.total += counts.total;
@@ -1118,7 +1132,7 @@ export async function countFlashcards(query: CountFlashcardsQuery, ownerId?: str
  * order (createdAt desc, id asc) — identical to the Firestore cursor, so
  * cards sharing a createdAt are never skipped or duplicated across pages.
  */
-export async function searchCards(query: SearchCardsQuery, ownerId?: string): Promise<SearchCardsResponse> {
+export async function searchCards(query: SearchCardsQuery, ownerId: string): Promise<SearchCardsResponse> {
   const now = Timestamp.now();
   const nowMs = now.toMillis();
   const pageSize = Math.min(query.pageSize || PAGE_SIZE_DEFAULT, PAGE_SIZE_MAX);
@@ -1152,7 +1166,7 @@ export async function searchCards(query: SearchCardsQuery, ownerId?: string): Pr
   // cards sharing a createdAt can never be skipped or duplicated across
   // pages.
   let q: FirebaseFirestore.Query<DocumentData> = getDb().collection(COLLECTION);
-  if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+  q = q.where('ownerId', '==', ownerId);
   q = q.orderBy('createdAt', 'desc')
     .orderBy(FieldPath.documentId());
   if (filters.createdFromMs !== undefined) q = q.where('createdAt', '>=', Timestamp.fromMillis(filters.createdFromMs));
@@ -1222,7 +1236,7 @@ export async function searchCards(query: SearchCardsQuery, ownerId?: string): Pr
 export async function reviewFlashcard(
   id: string,
   input: ReviewFlashcardInput,
-  ownerId?: string,
+  ownerId: string,
 ): Promise<ReviewFlashcardResponse | null> {
   const docRef = getDb().collection(COLLECTION).doc(id);
   // The event document ref is created OUTSIDE the transaction callback (the
@@ -1240,7 +1254,7 @@ export async function reviewFlashcard(
     // Owner-scoped callers may only review their OWN cards: a card that is
     // ownerless (pre-multi-tenant legacy) or owned by another tenant reads as
     // not found (404) — never a cross-tenant review or an existence leak.
-    if (ownerId !== undefined && card.ownerId !== ownerId) return null;
+    if (card.ownerId !== ownerId) return null;
 
     // REVIEW_TEST_MODE: like session submissions, a direct review in test
     // mode must NOT mutate the card and must NOT write a review event — the
@@ -1318,7 +1332,7 @@ export async function reviewFlashcard(
 async function runSchedulingAction(
   ids: string[],
   patch: (card: Flashcard) => Record<string, unknown>,
-  ownerId?: string,
+  ownerId: string,
 ): Promise<SchedulingActionResponse> {
   return getDb().runTransaction(async (t) => {
     // All reads happen BEFORE any write (Firestore transactions cannot read
@@ -1330,7 +1344,7 @@ async function runSchedulingAction(
     for (const id of ids) {
       const snap = await t.get(getDb().collection(COLLECTION).doc(id));
       if (!snap.exists) continue;
-      if (ownerId !== undefined && snap.data()?.ownerId !== ownerId) continue;
+      if (snap.data()?.ownerId !== ownerId) continue;
       existing.push({ snap, card: docToFlashcard(snap) });
     }
     const updatedAt = Timestamp.now();
@@ -1343,11 +1357,15 @@ async function runSchedulingAction(
       // suspended) reads as ABSENT on the returned card, matching what a
       // re-read of the document would produce.
       const merged = { ...card, ...updateData };
-      for (const key of Object.keys(merged)) {
-        const value = (merged as Record<string, unknown>)[key];
-        if (value && typeof value === 'object' && (value as { __fieldDelete?: boolean }).__fieldDelete) {
-          delete (merged as Record<string, unknown>)[key];
-        }
+      stripFieldDeleteSentinels(merged as Record<string, unknown>);
+      // `suspended` is a persisted boolean: a never-suspended card has
+      // absent field → false (docToFlashcard semantics), and unsuspend
+      // deletes the field. The response MUST expose the logical boolean
+      // so clients don't see an absent key where a boolean is contractually
+      // expected. Other deleted fields (lastReview, deck, deckId) are
+      // genuinely absent-by-design.
+      if (!('suspended' in merged)) {
+        (merged as Record<string, unknown>).suspended = false;
       }
       cards.push(merged);
     }
@@ -1374,7 +1392,7 @@ async function runSchedulingAction(
  * records of what happened, and a reset is a scheduling reset — history
  * stays queryable (stats keep counting the reset card's past reviews).
  */
-export async function resetFlashcards(ids: string[], ownerId?: string): Promise<SchedulingActionResponse> {
+export async function resetFlashcards(ids: string[], ownerId: string): Promise<SchedulingActionResponse> {
   return runSchedulingAction(ids, () => {
     const now = Timestamp.now();
     const fresh = initialScheduling(now);
@@ -1405,7 +1423,7 @@ export async function resetFlashcards(ids: string[], ownerId?: string): Promise<
  * server's current time, mirroring resolveReviewTime). Returns the updated
  * cards (existing ids only, in input order).
  */
-export async function setFlashcardDueDate(ids: string[], due: string, ownerId?: string): Promise<SchedulingActionResponse> {
+export async function setFlashcardDueDate(ids: string[], due: string, ownerId: string): Promise<SchedulingActionResponse> {
     const parsed = new Date(due);
     const dueTs = Timestamp.fromMillis(Number.isNaN(parsed.getTime()) ? Date.now() : parsed.getTime());
     return runSchedulingAction(ids, () => ({ due: dueTs }), ownerId);
@@ -1425,7 +1443,7 @@ export async function setFlashcardDueDate(ids: string[], due: string, ownerId?: 
  *    already-snapshotted session.
  * Returns the updated cards (existing ids only, in input order).
  */
-export async function suspendFlashcards(ids: string[], ownerId?: string): Promise<SchedulingActionResponse> {
+export async function suspendFlashcards(ids: string[], ownerId: string): Promise<SchedulingActionResponse> {
     return runSchedulingAction(ids, () => ({ suspended: true }), ownerId);
 }
 /**
@@ -1436,7 +1454,7 @@ export async function suspendFlashcards(ids: string[], ownerId?: string): Promis
  * review facets again; its content and scheduling state are untouched.
  * Returns the updated cards (existing ids only, in input order).
  */
-export async function unsuspendFlashcards(ids: string[], ownerId?: string): Promise<SchedulingActionResponse> {
+export async function unsuspendFlashcards(ids: string[], ownerId: string): Promise<SchedulingActionResponse> {
     return runSchedulingAction(ids, () => ({ suspended: FieldValue.delete() }), ownerId);
 }
 /**
@@ -1445,7 +1463,7 @@ export async function unsuspendFlashcards(ids: string[], ownerId?: string): Prom
  * committed in a single Firestore batch so it is all-or-nothing — no partial
  * silent success. Returns the created cards with their Firestore ids.
  */
-export async function bulkCreateFlashcards(input: BulkCreateFlashcardsInput, ownerId?: string): Promise<BulkCreateFlashcardsResponse> {
+export async function bulkCreateFlashcards(input: BulkCreateFlashcardsInput, ownerId: string): Promise<BulkCreateFlashcardsResponse> {
     const now = Timestamp.now();
     const batch = getDb().batch();
     const cards = [];
@@ -1454,7 +1472,7 @@ export async function bulkCreateFlashcards(input: BulkCreateFlashcardsInput, own
         const docRef = getDb().collection(COLLECTION).doc();
         const scheduling = initialScheduling(now);
         const flashcard = {
-            ...(ownerId !== undefined ? { ownerId } : {}),
+            ownerId,
             front: item.front,
             back: item.back,
             tags: item.tags || [],
@@ -1481,7 +1499,7 @@ export async function bulkCreateFlashcards(input: BulkCreateFlashcardsInput, own
  * the updated cards in input order; ids that did not exist are omitted from
  * the result (they failed the per-item existence check and were not written).
  */
-export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, ownerId?: string): Promise<BulkUpdateFlashcardsResponse> {
+export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, ownerId: string): Promise<BulkUpdateFlashcardsResponse> {
     await validateDeckIds(input.cards.map(c => c.deckId), ownerId);
     // Resolve deck references up front: resolution may create legacy-name decks
     // (a standalone write) which is not allowed inside a transaction callback.
@@ -1509,7 +1527,7 @@ export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, own
                 continue;
             // Owner-scoped callers may only update their OWN cards (an
             // unowned/other-owner card is omitted — never silently updated).
-            if (ownerId !== undefined && snap.data()?.ownerId !== ownerId)
+            if (snap.data()?.ownerId !== ownerId)
                 continue;
             existing.push({ item, docRef, snap });
         }
@@ -1558,7 +1576,7 @@ export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, own
  * the collection is deleted or none are — no partial silent success. Returns
  * the ids actually deleted; ids that did not exist are omitted.
  */
-export async function bulkDeleteFlashcards(input: BulkDeleteFlashcardsInput, ownerId?: string): Promise<BulkDeleteFlashcardsResponse> {
+export async function bulkDeleteFlashcards(input: BulkDeleteFlashcardsInput, ownerId: string): Promise<BulkDeleteFlashcardsResponse> {
     const result = await getDb().runTransaction(async (t) => {
         const deletedIds = [];
         // Firestore transactions forbid reads AFTER writes: read every target
@@ -1568,7 +1586,7 @@ export async function bulkDeleteFlashcards(input: BulkDeleteFlashcardsInput, own
         for (const id of input.ids) {
             const docRef = getDb().collection(COLLECTION).doc(id);
             const snap = await t.get(docRef);
-            if (snap.exists && (ownerId === undefined || snap.data()?.ownerId === ownerId))
+            if (snap.exists && snap.data()?.ownerId === ownerId)
                 existing.push(docRef);
         }
         for (const docRef of existing) {
@@ -1675,24 +1693,16 @@ export class ReviewSessionBuildFailedError extends Error {
  * (dev/emulator compatibility). Production always authenticates before
  * reaching the service, so a real request always carries an ownerId.
  */
-function assertSessionOwnership(session: ReviewSession, ownerId?: string, apiKeyName?: string): void {
-    if (ownerId !== undefined) {
-        // Owner-scoped session: the caller must own it. A LEGACY session that
-        // predates owner scoping carries only apiKeyName — the pre-multi-tenant
-        // shared-key world; the owner-equivalence accepts the recorded key
-        // name so dev/emulator tests (which pass the fixture key name) keep
-        // working, while a REAL ownerId never equals a fixture key name and
-        // legacy unowned sessions stay reachable only by unscoped calls.
-        const matchesOwner = session.ownerId === ownerId
-            || (session.ownerId === undefined && session.apiKeyName === ownerId);
-        if (!matchesOwner) {
-            throw new ReviewSessionForbiddenError(session.id);
-        }
-        return;
-    }
-    if (!apiKeyName)
-        return;
-    if (session.apiKeyName !== apiKeyName) {
+function assertSessionOwnership(session: ReviewSession, ownerId: string): void {
+    // Owner-scoped session: the caller must own it. A LEGACY session that
+    // predates owner scoping carries only apiKeyName — the pre-multi-tenant
+    // shared-key world; the owner-equivalence accepts the recorded key
+    // name so dev/emulator tests (which pass the fixture key name) keep
+    // working, while a REAL ownerId never equals a fixture key name and
+    // legacy unowned sessions stay reachable only by unscoped calls.
+    const matchesOwner = session.ownerId === ownerId
+        || (session.ownerId === undefined && session.apiKeyName === ownerId);
+    if (!matchesOwner) {
         throw new ReviewSessionForbiddenError(session.id);
     }
 }
@@ -2008,7 +2018,7 @@ interface BuildCursor {
  *  (validated earlier by resolveSessionDeck). */
 function scopedQueueQuery(selectors: QueueBuildSelectors): FirebaseFirestore.Query {
     let q = getDb().collection(COLLECTION) as FirebaseFirestore.Query;
-    if (selectors.ownerId !== undefined) q = q.where('ownerId', '==', selectors.ownerId);
+    q = q.where('ownerId', '==', selectors.ownerId);
     // Field projection: only `due` is read per card (the id is returned for
     // every doc regardless); the build never fetches full card documents.
     q = q.select('due');
@@ -2041,8 +2051,8 @@ interface QueueBuildSelectors {
     byNameDeck: boolean;
     testMode: boolean;
     now: Timestamp;
-    /** When set, the queue query is scoped to this owner's cards only. */
-    ownerId?: string;
+    /** The queue query is scoped to this owner's cards. */
+    ownerId: string;
 }
 
 /** One in-memory chunk accumulator during a build. */
@@ -2131,7 +2141,7 @@ async function buildV2QueueChunks(
                 // Owner-scoped sessions may never snapshot another tenant's
                 // card: an explicit allowlist id that is not owned by the
                 // caller reads as missing (404), like a nonexistent card.
-                if (selectors.ownerId !== undefined && data?.ownerId !== selectors.ownerId) {
+                if (data?.ownerId !== selectors.ownerId) {
                     throw new ReviewSessionCardNotFoundError(batch[i]);
                 }
                 const due = (data?.due as Timestamp | undefined)?.toMillis?.() ?? 0;
@@ -2204,10 +2214,10 @@ async function buildV2QueueChunks(
 
     return { totalCount, chunkCount };
 }
-async function resolveSessionDeck(input: { deckId?: string; deck?: string }, ownerId?: string): Promise<{ deckId?: string; deckName: string; byName: boolean }> {
+async function resolveSessionDeck(input: { deckId?: string; deck?: string }, ownerId: string): Promise<{ deckId?: string; deckName: string; byName: boolean }> {
     if (input.deckId !== undefined && input.deckId !== '') {
         const deckDoc = await getDb().collection(DECKS_COLLECTION).doc(input.deckId).get();
-        if (!deckDoc.exists || (ownerId !== undefined && deckDoc.data()?.ownerId !== ownerId)) {
+        if (!deckDoc.exists || deckDoc.data()?.ownerId !== ownerId) {
             throw new DeckNotFoundError(input.deckId);
         }
         const name = deckDoc.data()?.name;
@@ -2598,7 +2608,7 @@ async function loadSessionCard(session: ReviewSession): Promise<Flashcard | null
  * queue) plus `currentPosition`/`queueWindow`; legacy v1/no-version sessions
  * keep the existing full-array response unchanged.
  */
-export async function getReviewSession(sessionId: string, ownerId?: string): Promise<ReviewSessionWithCard | null> {
+export async function getReviewSession(sessionId: string, ownerId: string): Promise<ReviewSessionWithCard | null> {
     const docRef = getDb().collection(SESSIONS_COLLECTION).doc(sessionId);
     const snap = await docRef.get();
     if (!snap.exists)
@@ -2686,7 +2696,7 @@ async function getV2ReviewSession(session: ReviewSession): Promise<ReviewSession
  * The legacy v1/no-version path (documents written before v2) is routed to
  * the unchanged legacy implementation below.
  */
-export async function submitSessionReview(sessionId: string, input: SubmitSessionReviewInput, ownerId?: string): Promise<SubmitSessionReviewResult | null> {
+export async function submitSessionReview(sessionId: string, input: SubmitSessionReviewInput, ownerId: string): Promise<SubmitSessionReviewResult | null> {
     // Route by the PERSISTED storage version. A direct root read picks the
     // v2 path (chunked storage); legacy mocks/tests that only wire the
     // transaction fall back to the unchanged legacy path (documents written
@@ -3172,8 +3182,8 @@ async function submitV2SessionReview(session: ReviewSession, input: SubmitSessio
         const nextStatus: SessionStatus = (currentIndex >= limit && remainingQueueCount <= 0) ? 'completed' : 'active';
         const sessionUpdate: Partial<ReviewSession> = {
             currentIndex,
-            currentPosition: nextStatus === 'active' ? currentIndex : undefined,
             currentChunkIndex: nextStatus === 'active' ? chunkOrdinalFor(currentIndex) : -1,
+            ...(nextStatus === 'active' ? { currentPosition: currentIndex } : {}),
             reviewedCount,
             ratingCounts,
             remainingQueueCount,
@@ -3270,7 +3280,7 @@ async function loadV2CurrentCard(session: ReviewSession): Promise<{ card: Flashc
     }
     return { card: null, position: null };
 }
-async function submitLegacySessionReview(sessionId: string, input: SubmitSessionReviewInput, ownerId?: string): Promise<SubmitSessionReviewResult | null> {
+async function submitLegacySessionReview(sessionId: string, input: SubmitSessionReviewInput, ownerId: string): Promise<SubmitSessionReviewResult | null> {
     const sessionRef = getDb().collection(SESSIONS_COLLECTION).doc(sessionId);
     const reviewTime = resolveReviewTime(input.reviewAt, new Date());
     const updatedAt = Timestamp.now();
@@ -3418,7 +3428,7 @@ async function submitLegacySessionReview(sessionId: string, input: SubmitSession
  * terminated session is a no-op that returns it unchanged. v2 and legacy
  * sessions share the root-only status write.
  */
-export async function endReviewSession(sessionId: string, ownerId?: string): Promise<ReviewSession | null> {
+export async function endReviewSession(sessionId: string, ownerId: string): Promise<ReviewSession | null> {
     const sessionRef = getDb().collection(SESSIONS_COLLECTION).doc(sessionId);
     const now = Timestamp.now();
     return getDb().runTransaction(async (t) => {
@@ -3496,13 +3506,13 @@ export function validateImageUrl(url: string, mimeType?: string): void {
         throw new ImageValidationError('Image URL must end in a supported image extension or declare a mimeType');
     }
 }
-export async function attachImage(cardId: string, input: AttachImageInput, ownerId?: string): Promise<AttachImageResponse | null> {
+export async function attachImage(cardId: string, input: AttachImageInput, ownerId: string): Promise<AttachImageResponse | null> {
     validateImageUrl(input.url, input.mimeType);
     const cardRef = getDb().collection(COLLECTION).doc(cardId);
     const card = await cardRef.get();
     if (!card.exists)
         return null;
-    if (ownerId !== undefined && card.data()?.ownerId !== ownerId)
+    if (card.data()?.ownerId !== ownerId)
         return null;
     const image = {
         id: `img_${Date.now().toString(36)}`,
@@ -3519,21 +3529,21 @@ export async function attachImage(cardId: string, input: AttachImageInput, owner
     const updated = await cardRef.get();
     return { card: docToFlashcard(updated), image };
 }
-export async function listImages(cardId: string, ownerId?: string): Promise<ListImagesResponse | null> {
+export async function listImages(cardId: string, ownerId: string): Promise<ListImagesResponse | null> {
     const cardRef = getDb().collection(COLLECTION).doc(cardId);
     const card = await cardRef.get();
     if (!card.exists)
         return null;
-    if (ownerId !== undefined && card.data()?.ownerId !== ownerId)
+    if (card.data()?.ownerId !== ownerId)
         return null;
     return { cardId, images: docToFlashcard(card).images ?? [] };
 }
-export async function removeImage(cardId: string, url: string, ownerId?: string): Promise<RemoveImageResponse | null> {
+export async function removeImage(cardId: string, url: string, ownerId: string): Promise<RemoveImageResponse | null> {
     const cardRef = getDb().collection(COLLECTION).doc(cardId);
     const card = await cardRef.get();
     if (!card.exists)
         return null;
-    if (ownerId !== undefined && card.data()?.ownerId !== ownerId)
+    if (card.data()?.ownerId !== ownerId)
         return null;
     const current = docToFlashcard(card);
     const removedImage = (current.images ?? []).find((img) => img.url === url);
@@ -3549,7 +3559,7 @@ export async function removeImage(cardId: string, url: string, ownerId?: string)
     }
     return { cardId, removed };
 }
-export async function uploadImage(cardId: string, input: UploadImageInput, ownerId?: string): Promise<UploadImageResponse | null> {
+export async function uploadImage(cardId: string, input: UploadImageInput, ownerId: string): Promise<UploadImageResponse | null> {
     if (!input.fileName || input.fileName.length > MAX_IMAGE_FILE_NAME_LENGTH) {
         throw new ImageValidationError('Invalid file name');
     }
@@ -3579,7 +3589,7 @@ export async function uploadImage(cardId: string, input: UploadImageInput, owner
     const card = await cardRef.get();
     if (!card.exists)
         return null;
-    if (ownerId !== undefined && card.data()?.ownerId !== ownerId)
+    if (card.data()?.ownerId !== ownerId)
         return null;
     // Canonical extension from the declared MIME type.
     const MIME_TO_EXT: Record<string, string> = {

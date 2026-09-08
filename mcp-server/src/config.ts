@@ -9,17 +9,19 @@
  * AUTH0_ISSUER and AUTH0_AUDIENCE are both set, the HTTP /mcp endpoint
  * requires a valid RS256 access token from that issuer (see src/auth.ts).
  *
- * Deploy-mode hardening (fail-closed): an HTTP server whose API base URL is
- * a REMOTE origin (https/wss - i.e. not the local emulator or the chatgpt
- * mock) refuses to start without at least one authentication mechanism
- * configured: Auth0 (AUTH0_ISSUER + AUTH0_AUDIENCE) or the static
- * `MCP_AUTH_TOKEN` bearer gate. Auth0 alone is enforced regardless of the
- * token gate. This prevents an accidental public deploy from exposing the
- * server-held backend key (`CUELINGUA_API_KEY`) with no auth. stdio and
- * loopback/local development keep working with no auth - `MCP_AUTH_OPT_OUT`
- * (=true) is the explicit local override that also silences the startup
- * warning when the base URL is remote (tunnels for desktop connectors).
+ * Deploy-mode hardening (fail-closed): an HTTP server refuses to start
+ * without at least one authentication mechanism configured (Auth0 or
+ * `MCP_AUTH_TOKEN`) when either its API base URL is a REMOTE origin or its
+ * listener is bound to a non-loopback interface. The local-backend exception
+ * (no auth) requires BOTH a local backend AND a loopback listener — binding
+ * to 0.0.0.0 (the default) exposes the endpoint to the network and thus
+ * requires auth regardless of the backend address. stdio and explicit
+ * loopback-bound local development keep working with no auth.
+ * `MCP_AUTH_OPT_OUT` (=true) is the explicit override for tunnels that
+ * expose a local server via a non-loopback address.
  */
+
+import { isIP } from 'node:net';
 
 export interface ServerConfig {
   /** API key for the deployed Firebase backend (X-API-Key header). */
@@ -67,19 +69,37 @@ function parsePort(value: string | undefined, fallback: number): number {
 }
 
 /**
+ * True when the address is a loopback — reachable only from the local machine.
+ * Covers 127.0.0.0/8 (full IPv4 loopback range, RFC 5735 §2), localhost,
+ * and ::1.  Unrecognised or syntactically invalid addresses (e.g.
+ * "127.invalid") are NOT treated as loopback — this predicate fails closed.
+ */
+function isLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase().trim();
+  if (h === 'localhost' || h === '::1' || h === '[::1]') return true;
+  // Validated IPv4 loopback: must parse as a real IPv4 address (not
+  // "127.invalid" or other DNS-style strings) before checking the 127/8
+  // range (RFC 5735 §2).  Fail closed on unrecognised formats.
+  const stripped = h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
+  if (isIP(stripped) === 4) return stripped.startsWith('127.');
+  return false;
+}
+
+/**
  * True when the configured server needs an authentication mechanism: it is
- * an HTTP transport AND its backend base URL is a REMOTE origin (not the
- * local Firebase emulator or the local chatgpt mock). stdio and pure-local
- * development never require auth.
+ * an HTTP transport AND either its backend base URL is a REMOTE origin, or
+ * the listener is bound to a non-loopback interface (exposed to the network).
+ * The local-backend exception (no auth) only applies when BOTH the backend
+ * is local AND the listener is loopback. stdio never requires auth.
  */
 export function needsRemoteAuth(config: ServerConfig): boolean {
   if (config.transport !== 'http') return false;
   try {
-    const host = new URL(config.apiBaseUrl).hostname.toLowerCase();
-    if (host === '127.0.0.1' || host === 'localhost' || host === '::1') return false;
+    const rawHost = new URL(config.apiBaseUrl).hostname.toLowerCase();
+    const backendHost = rawHost.startsWith('[') ? rawHost.slice(1, -1) : rawHost;
+    if (isLoopbackHost(backendHost) && isLoopbackHost(config.host)) return false;
   } catch {
     // Unparseable base URL: treat as remote (defense in depth).
-    return true;
   }
   return true;
 }
@@ -98,14 +118,26 @@ export function hasAuthMechanism(config: ServerConfig): boolean {
  * when the configuration is safe.
  */
 export function authGuardError(config: ServerConfig): string | null {
-  if (needsRemoteAuth(config) && !hasAuthMechanism(config) && !config.authOptOut) {
-    return 'Refusing to serve: the HTTP /mcp endpoint targets a remote backend '
-      + `(${config.apiBaseUrl}) but no authentication is configured. Set AUTH0_ISSUER `
-      + 'and AUTH0_AUDIENCE (recommended), set MCP_AUTH_TOKEN (static bearer), or set '
-      + 'MCP_AUTH_OPT_OUT=true to run without auth against a remote backend (local '
-      + 'tunnels only - never for a public deployment).';
+  if (!needsRemoteAuth(config) || hasAuthMechanism(config) || config.authOptOut) {
+    return null;
   }
-  return null;
+  // State the actual reason: remote backend, or non-loopback listener with
+  // a local backend.
+  let exposure: string;
+  try {
+    const rawHost = new URL(config.apiBaseUrl).hostname.toLowerCase();
+    const backendHost = rawHost.startsWith('[') ? rawHost.slice(1, -1) : rawHost;
+    exposure = isLoopbackHost(backendHost)
+      ? `listener (${config.host}) is not loopback`
+      : `targets a remote backend (${config.apiBaseUrl})`;
+  } catch {
+    exposure = `has an unparseable backend URL (${config.apiBaseUrl})`;
+  }
+  return 'Refusing to serve: the HTTP /mcp endpoint ' + exposure
+    + ' but no authentication is configured. Set AUTH0_ISSUER '
+    + 'and AUTH0_AUDIENCE (recommended), set MCP_AUTH_TOKEN (static bearer), or set '
+    + 'MCP_AUTH_OPT_OUT=true to run without auth (local tunnels only — '
+    + 'never for a public deployment).';
 }
 
 /** True when Auth0 (issuer + audience) is fully configured and enforced. */

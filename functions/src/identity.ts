@@ -115,15 +115,34 @@ export interface JwksProvider {
 /** JWKS cache TTL: re-fetch a rotated issuer's keys at most every 10 min. */
 const JWKS_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * Bounded cooldown after fetching for an unknown kid. Prevents repeated
+ * fetches when the same bogus kid circulates, while still allowing a
+ * single re-check after the cooldown expires (legitimate key rotation).
+ */
+export const UNKNOWN_KID_COOLDOWN_MS = 30_000;
+
+/** Per-fetch timeout for the JWKS endpoint. */
+export const FETCH_TIMEOUT_MS = 10_000;
+
 interface JwksCacheEntry {
   keys: Map<string, RsaPublicJwk>;
   fetchedAtMs: number;
+  /** Timestamp of the last fetch triggered by an unknown kid. */
+  lastUnknownLookupMs: number;
+  /** In-flight fetch promise (shared by concurrent getKey calls). */
+  pendingFetch: Promise<Map<string, RsaPublicJwk>> | null;
 }
 
 const jwksCache = new Map<string, JwksCacheEntry>();
 
-const defaultFetchJson = async (url: string): Promise<{ keys?: unknown }> => {
-  const res = await fetch(url, { headers: { accept: 'application/json' } });
+/** Test-only: clear the global JWKS cache for test isolation. */
+export function _resetJwksCacheForTesting(): void {
+  jwksCache.clear();
+}
+
+const defaultFetchJson = async (url: string, opts?: { signal?: AbortSignal }): Promise<{ keys?: unknown }> => {
+  const res = await fetch(url, { headers: { accept: 'application/json' }, signal: opts?.signal });
   if (!res.ok) throw new Error(`JWKS fetch failed: HTTP ${res.status}`);
   return res.json() as Promise<{ keys?: unknown }>;
 };
@@ -131,38 +150,104 @@ const defaultFetchJson = async (url: string): Promise<{ keys?: unknown }> => {
 /**
  * Builds a JWKS provider from an issuer's `/.well-known/jwks.json` endpoint.
  * Keys are cached with a TTL and refreshed on a cache-missing `kid`.
+ * Features:
+ *  - **coalescing**: concurrent getKey calls for the same issuer share a
+ *    single in-flight fetch, avoiding redundant network requests.
+ *  - **unknown-kid cooldown**: after a fetch triggered by an unknown kid,
+ *    further unknown-kid refreshes are suppressed for
+ *    `UNKNOWN_KID_COOLDOWN_MS`, preventing repeated fetches for bogus kids
+ *    while still allowing a single re-check after cooldown (legitimate
+ *    key-rotation).
+ *  - **fetch timeout**: each JWKS fetch uses `FETCH_TIMEOUT_MS` via
+ *    `AbortSignal.timeout` to prevent hanging requests.
+ *  - **fail-closed**: on fetch failure or timeout, `getKey` returns `null`.
+ *
  * `fetcher` is injectable for tests.
  */
 export function createRemoteJwks(
   issuer: string,
-  fetcher: (url: string) => Promise<{ keys?: unknown }> = defaultFetchJson,
+  fetcher: (url: string, opts?: { signal?: AbortSignal }) => Promise<{ keys?: unknown }> = defaultFetchJson,
 ): JwksProvider {
   const url = `${issuer.replace(/\/+$/, '')}/.well-known/jwks.json`;
 
-  const load = async (): Promise<Map<string, RsaPublicJwk>> => {
-    const body = await fetcher(url);
-    const keys = new Map<string, RsaPublicJwk>();
-    if (body && Array.isArray(body.keys)) {
-      for (const k of body.keys as Array<Record<string, unknown>>) {
-        if (typeof k?.kid === 'string' && typeof k?.n === 'string' && typeof k?.e === 'string') {
-          keys.set(k.kid, k as unknown as RsaPublicJwk);
-        }
-      }
-    }
-    return keys;
-  };
-
   return {
     async getKey(kid: string): Promise<RsaPublicJwk | null> {
+      const now = Date.now();
       const cached = jwksCache.get(url);
-      if (cached && Date.now() - cached.fetchedAtMs < JWKS_TTL_MS) {
+
+      // TTL hit: serve known keys directly (no fetch needed).
+      if (cached && now - cached.fetchedAtMs < JWKS_TTL_MS) {
         const hit = cached.keys.get(kid);
         if (hit) return hit;
       }
-      // Cache miss or stale: refresh once (rotation), then answer or null.
-      const fresh = await load();
-      jwksCache.set(url, { keys: fresh, fetchedAtMs: Date.now() });
-      return fresh.get(kid) ?? null;
+
+      // Unknown kid within cooldown window: don't re-fetch.
+      if (
+        cached
+        && !cached.keys.has(kid)
+        && now - cached.lastUnknownLookupMs < UNKNOWN_KID_COOLDOWN_MS
+      ) {
+        return null;
+      }
+
+      // Coalesce concurrent refresh requests via a shared in-flight Promise.
+      if (cached?.pendingFetch) {
+        const keys = await cached.pendingFetch;
+        if (!keys.has(kid)) {
+          cached.lastUnknownLookupMs = Date.now();
+        }
+        return keys.get(kid) ?? null;
+      }
+
+      // Fire a single fetch for this URL (with timeout). The fetch promise
+      // updates `entry.keys` before resolving so coalesced callers see the
+      // fresh data via `entry.keys.get(kid)`.
+      const entry = cached ?? (() => {
+        const e: JwksCacheEntry = {
+          keys: new Map(),
+          fetchedAtMs: 0,
+          lastUnknownLookupMs: -Infinity,
+          pendingFetch: null,
+        };
+        jwksCache.set(url, e);
+        return e;
+      })();
+
+      const fetchPromise = (async () => {
+        try {
+          const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+          const body = await fetcher(url, { signal });
+          const keys = new Map<string, RsaPublicJwk>();
+          if (body && Array.isArray(body.keys)) {
+            for (const k of body.keys as Array<Record<string, unknown>>) {
+              if (typeof k?.kid === 'string' && typeof k?.n === 'string' && typeof k?.e === 'string') {
+                keys.set(k.kid, k as unknown as RsaPublicJwk);
+              }
+            }
+          }
+          // Update shared state BEFORE resolving so coalesced callers see it.
+          entry.keys = keys;
+          entry.fetchedAtMs = Date.now();
+          entry.pendingFetch = null;
+          return keys;
+        } catch {
+          // Fail closed: treat fetch failure/timeout as empty keyset.
+          entry.keys = new Map();
+          entry.fetchedAtMs = Date.now();
+          entry.pendingFetch = null;
+          return new Map<string, RsaPublicJwk>();
+        }
+      })();
+
+      entry.pendingFetch = fetchPromise;
+      await fetchPromise;
+      // Only start cooldown when the requested kid is missing or the fetch
+      // failed. A successful hit must NOT suppress the next unknown-kid
+      // refresh (legitimate rotation arriving immediately after).
+      if (!entry.keys.has(kid)) {
+        entry.lastUnknownLookupMs = Date.now();
+      }
+      return entry.keys.get(kid) ?? null;
     },
   };
 }

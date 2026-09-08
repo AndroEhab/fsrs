@@ -27,9 +27,26 @@ describe('needsRemoteAuth', () => {
     expect(needsRemoteAuth(fullConfig({ transport: 'stdio' }))).toBe(false);
   });
 
-  it('does not require auth against the local Firebase emulator or chatgpt mock', () => {
-    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001/cuelingua/us-central1' }))).toBe(false);
-    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://localhost:8787' }))).toBe(false);
+  it('does not require auth against the local emulator when listener is also loopback', () => {
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001/cuelingua/us-central1', host: '127.0.0.1' }))).toBe(false);
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://localhost:8787', host: 'localhost' }))).toBe(false);
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://[::1]:5001', host: '::1' }))).toBe(false);
+    // 127/8 range: any 127.x.x.x is loopback (RFC 5735 §2).
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://127.0.0.2:5001', host: '127.0.0.2' }))).toBe(false);
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://127.255.255.254:5001', host: '127.255.255.254' }))).toBe(false);
+  });
+
+  it('requires auth for a local backend when listener is on 0.0.0.0 (exposed to network)', () => {
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001/cuelingua/us-central1', host: '0.0.0.0' }))).toBe(true);
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://localhost:8787', host: '0.0.0.0' }))).toBe(true);
+  });
+
+  it('requires auth for a local backend when listener is on a non-loopback IP', () => {
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://localhost:5001', host: '192.168.1.100' }))).toBe(true);
+  });
+
+  it('treats a syntactically invalid 127.x host as non-loopback (fail closed)', () => {
+    expect(needsRemoteAuth(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001', host: '127.invalid' }))).toBe(true);
   });
 
   it('treats an unparseable base URL as remote (defense in depth)', () => {
@@ -41,6 +58,7 @@ describe('hasAuthMechanism / authGuardError (fail-closed deploy guard)', () => {
   it('rejects an HTTP remote server with NO auth configured (would expose the backend key)', () => {
     const cfg = fullConfig({ auth0Issuer: '', auth0Audience: '', authToken: '' });
     expect(hasAuthMechanism(cfg)).toBe(false);
+    expect(authGuardError(cfg)).toMatch(/targets a remote backend/);
     expect(authGuardError(cfg)).toMatch(/no authentication is configured/);
   });
 
@@ -61,9 +79,18 @@ describe('hasAuthMechanism / authGuardError (fail-closed deploy guard)', () => {
     expect(authGuardError(cfg)).toBeNull();
   });
 
-  it('never blocks stdio or a loopback backend regardless of auth config', () => {
+  it('never blocks stdio regardless of auth config', () => {
     expect(authGuardError(fullConfig({ transport: 'stdio', auth0Issuer: '', auth0Audience: '' }))).toBeNull();
-    expect(authGuardError(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001', auth0Issuer: '', auth0Audience: '' }))).toBeNull();
+  });
+
+  it('blocks a local backend when listener is on 0.0.0.0 without auth', () => {
+    const err = authGuardError(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001', host: '0.0.0.0', auth0Issuer: '', auth0Audience: '' }));
+    expect(err).toMatch(/listener \(0\.0\.0\.0\) is not loopback/);
+    expect(err).toMatch(/no authentication is configured/);
+  });
+
+  it('allows a local backend with loopback listener without auth', () => {
+    expect(authGuardError(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001', host: '127.0.0.1', auth0Issuer: '', auth0Audience: '' }))).toBeNull();
   });
 
   it('loadConfig reads MCP_AUTH_OPT_OUT and keeps defaults when unset', () => {

@@ -1,6 +1,7 @@
 import {
   verifyRequest, EMULATOR_OWNER, AUTH0_OPERATOR_SUBS_ENV, AUTH0_ISSUER_ENV, AUTH0_AUDIENCE_ENV,
-  auth0Configured, operatorSubs, createLocalJwks, testKeyPair,
+  auth0Configured, operatorSubs, createLocalJwks, testKeyPair, createRemoteJwks,
+  UNKNOWN_KID_COOLDOWN_MS, FETCH_TIMEOUT_MS, _resetJwksCacheForTesting,
 } from './identity';
 
 const ISSUER = 'https://tenant.example.auth0.com/';
@@ -219,5 +220,262 @@ describe('verifyRequest env defaults', () => {
     });
     expect(identity?.ownerId).toBe('auth0|from-env');
     expect(identity?.isOperator).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* createRemoteJwks — cache, coalescing, cooldown, timeout             */
+/* ------------------------------------------------------------------ */
+
+// Minimal fake clock: replaces Date.now for deterministic TTL/cooldown tests.
+let fakeNow = 0;
+const fakeDateNow = jest.fn(() => fakeNow);
+
+function advanceTime(ms: number) { fakeNow += ms; }
+
+describe('createRemoteJwks', () => {
+  beforeAll(() => { jest.spyOn(Date, 'now').mockImplementation(fakeDateNow); });
+  afterAll(() => { jest.restoreAllMocks(); });
+
+  /** Helper: create a fetcher that counts calls and returns a static JWKS body. */
+  function countingFetcher(keys: Array<{ kid: string; n?: string; e?: string }> = []) {
+    const calls: string[] = [];
+    const fetcher = async (url: string) => { calls.push(url); return { keys }; };
+    return { fetcher, calls };
+  }
+
+  beforeEach(() => { fakeNow = 0; _resetJwksCacheForTesting(); });
+
+  it('fetches once on first getKey and serves from cache within TTL', async () => {
+    const { fetcher, calls } = countingFetcher([
+      { kid: 'k1', n: 'aaa', e: 'AQAB' },
+    ]);
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    const key = await provider.getKey('k1');
+    expect(key).not.toBeNull();
+    expect(key!.kid).toBe('k1');
+    expect(calls).toHaveLength(1);
+
+    // Second call within TTL — no additional fetch.
+    const key2 = await provider.getKey('k1');
+    expect(key2).not.toBeNull();
+    expect(calls).toHaveLength(1);
+
+    advanceTime(60_000); // 1 min, still within 10-min TTL
+    const key3 = await provider.getKey('k1');
+    expect(key3).not.toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('re-fetches after TTL expires (supports key rotation)', async () => {
+    const { fetcher, calls } = countingFetcher([
+      { kid: 'k1', n: 'aaa', e: 'AQAB' },
+    ]);
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    await provider.getKey('k1');
+    expect(calls).toHaveLength(1);
+
+    advanceTime(10 * 60 * 1000 + 1); // expire TTL
+    await provider.getKey('k1');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('coalesces concurrent getKey calls into a single fetch', async () => {
+    const { fetcher, calls } = countingFetcher([
+      { kid: 'k1', n: 'aaa', e: 'AQAB' },
+    ]);
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    // Fire three concurrent getKey calls — should produce only one fetch.
+    const [a, b, c] = await Promise.all([
+      provider.getKey('k1'),
+      provider.getKey('k1'),
+      provider.getKey('k1'),
+    ]);
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(c).not.toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('coalesces concurrent calls for different kids into a single fetch', async () => {
+    const { fetcher, calls } = countingFetcher([
+      { kid: 'k1', n: 'aaa', e: 'AQAB' },
+      { kid: 'k2', n: 'bbb', e: 'AQAB' },
+    ]);
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    const [a, b] = await Promise.all([
+      provider.getKey('k1'),
+      provider.getKey('k2'),
+    ]);
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('returns null for unknown kid and suppresses repeated fetches within cooldown', async () => {
+    const { fetcher, calls } = countingFetcher([
+      { kid: 'known', n: 'aaa', e: 'AQAB' },
+    ]);
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    // First unknown kid — triggers a fetch (cooldown starts now).
+    const miss1 = await provider.getKey('bogus');
+    expect(miss1).toBeNull();
+    expect(calls).toHaveLength(1);
+
+    // Four more unknown kid lookups — all suppressed (no extra fetches).
+    await provider.getKey('bogus2');
+    await provider.getKey('bogus3');
+    await provider.getKey('bogus4');
+    await provider.getKey('bogus5');
+    expect(calls).toHaveLength(1);
+
+    advanceTime(UNKNOWN_KID_COOLDOWN_MS / 2); // still within cooldown
+    await provider.getKey('bogus6');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('allows re-fetch for unknown kid after cooldown expires', async () => {
+    const { fetcher, calls } = countingFetcher([
+      { kid: 'known', n: 'aaa', e: 'AQAB' },
+    ]);
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    await provider.getKey('bogus');
+    expect(calls).toHaveLength(1);
+
+    advanceTime(UNKNOWN_KID_COOLDOWN_MS + 1); // cooldown expired
+
+    // This triggers a fresh fetch (rotation check).
+    await provider.getKey('bogus');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('legitimate key rotation: new kid appears after cooldown refresh', async () => {
+    let currentKeys = [{ kid: 'k1', n: 'aaa', e: 'AQAB' }];
+    const fetcher = jest.fn(async () => ({ keys: currentKeys }));
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    // Initial fetch.
+    expect(await provider.getKey('k1')).not.toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    advanceTime(UNKNOWN_KID_COOLDOWN_MS + 1); // cooldown expired
+
+    // Simulate rotation: new key 'k2' appears in the JWKS.
+    currentKeys = [
+      { kid: 'k1', n: 'aaa', e: 'AQAB' },
+      { kid: 'k2', n: 'bbb', e: 'AQAB' },
+    ];
+
+    // Unknown kid triggers refresh — new key is now available.
+    const rotated = await provider.getKey('k2');
+    expect(rotated).not.toBeNull();
+    expect(rotated!.kid).toBe('k2');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('successful known-key fetch does not start cooldown for a new unknown kid', async () => {
+    let currentKeys = [{ kid: 'k1', n: 'aaa', e: 'AQAB' }];
+    const fetcher = jest.fn(async () => ({ keys: currentKeys }));
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    // First call: fetch k1 successfully.
+    expect(await provider.getKey('k1')).not.toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    // Immediately rotate: k2 appears.
+    currentKeys = [
+      { kid: 'k1', n: 'aaa', e: 'AQAB' },
+      { kid: 'k2', n: 'bbb', e: 'AQAB' },
+    ];
+
+    // k2 request must NOT be suppressed by cooldown — it should fetch and
+    // return k2 immediately (zero time elapsed since last fetch).
+    const key2 = await provider.getKey('k2');
+    expect(key2).not.toBeNull();
+    expect(key2!.kid).toBe('k2');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('unknown kid coalescing records cooldown so next unknown is suppressed', async () => {
+    // Use a delayed fetcher so the known-key fetch is still in-flight when
+    // the unknown-kid request arrives and coalesces onto it.
+    const keys = [{ kid: 'k1', n: 'aaa', e: 'AQAB' }];
+    let resolveFetch: (v: { keys?: unknown }) => void;
+    const fetcher = jest.fn(() => new Promise<{ keys?: unknown }>((r) => { resolveFetch = r; }));
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    // Start a known-key fetch (pending, not yet resolved).
+    const k1Promise = provider.getKey('k1');
+    // Concurrently request an unknown kid — coalesces onto the same fetch.
+    const unknownPromise = provider.getKey('bogus');
+
+    // Settle the shared fetch with only k1 present.
+    resolveFetch!({ keys });
+
+    const [k1, bogus] = await Promise.all([k1Promise, unknownPromise]);
+    expect(k1).not.toBeNull();
+    expect(bogus).toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    // Another unknown-kid request must be suppressed (cooldown was set by
+    // the coalesced caller), with no second fetch.
+    const bogus2 = await provider.getKey('bogus2');
+    expect(bogus2).toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns null on fetch failure (fail-closed)', async () => {
+    const fetcher = jest.fn(async () => { throw new Error('network down'); });
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    const result = await provider.getKey('k1');
+    expect(result).toBeNull();
+  });
+
+  it('returns null on fetch timeout (fail-closed)', async () => {
+    // Stub AbortSignal.timeout to return an already-aborted signal so the
+    // fetcher rejects immediately — zero real timers, fully deterministic.
+    let capturedTimeout: number | undefined;
+    const origTimeout = AbortSignal.timeout;
+    try {
+      AbortSignal.timeout = ((ms: number) => {
+        capturedTimeout = ms;
+        const controller = new AbortController();
+        controller.abort();
+        return controller.signal;
+      }) as typeof AbortSignal.timeout;
+
+      const fetcher = jest.fn(async (_url: string, opts?: { signal?: AbortSignal }) => {
+        if (opts?.signal?.aborted) {
+          throw new DOMException('The operation was aborted.', 'AbortError');
+        }
+        return { keys: [] };
+      });
+      const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+      const result = await provider.getKey('k1');
+      expect(result).toBeNull();
+      expect(capturedTimeout).toBe(FETCH_TIMEOUT_MS);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    } finally {
+      AbortSignal.timeout = origTimeout;
+    }
+  });
+
+  it('returns null for kid not present in fetched JWKS', async () => {
+    const { fetcher, calls } = countingFetcher([
+      { kid: 'k1', n: 'aaa', e: 'AQAB' },
+    ]);
+    const provider = createRemoteJwks('https://issuer.example/', fetcher);
+
+    const result = await provider.getKey('unknown-kid');
+    expect(result).toBeNull();
+    expect(calls).toHaveLength(1);
   });
 });
