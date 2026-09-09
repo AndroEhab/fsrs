@@ -1519,3 +1519,142 @@ export const TOP_LAPSED_LIMIT = 25;
 export interface TopLapsedResponse {
   cards: TopLapsedCard[];
 }
+
+/* ------------------------------------------------------------------ */
+/* Bulk enrollment (resumable, idempotent, chunked)                    */
+/* ------------------------------------------------------------------ */
+
+/** Number of cards per chunk in the enrollment subcollection. Each chunk is
+ *  committed atomically via a Firestore WriteBatch (well under the 500-op
+ *  batch ceiling). */
+export const ENROLLMENT_CHUNK_SIZE = 100;
+
+/** Maximum number of cards accepted in a single enrollment request. The server
+ *  chunks them into ENROLLMENT_CHUNK_SIZE batches and writes each atomically.
+ *  10 000 cards ≈ 50 chunks ≈ 100 s sequential Firestore commits; well within
+ *  Cloud Functions' 540 s timeout. Payload ≈ 5–10 MiB JSON. */
+export const ENROLLMENT_MAX_CARDS = 10_000;
+
+/** Maximum length of a content-addressable card key (SHA-256 hex = 64 chars).
+ *  Defensive bound for Firestore index key safety. */
+export const CARD_KEY_MAX_LENGTH = 64;
+
+/**
+ * Lifecycle of a bulk enrollment job:
+ *  - `pending`:   accepted and chunked; not yet processing.
+ *  - `processing`: chunks are being committed to Firestore.
+ *  - `completed`:  every chunk has been committed (card count = totalCards).
+ *  - `failed`:     an unrecoverable error stopped processing (see `error`).
+ */
+export const ENROLLMENT_STATUSES = ['pending', 'processing', 'completed', 'failed'] as const;
+export type EnrollmentStatus = (typeof ENROLLMENT_STATUSES)[number];
+
+/**
+ * Input for bulk enrollment. Accepts a potentially large array of cards.
+ * The server validates, persists chunk documents to Firestore subcollection
+ * `bulkEnrollmentJobs/{jobId}/chunks/{paddedIndex}`, and returns the jobId
+ * immediately. Each chunk triggers an onDocumentWritten handler that
+ * processes cards atomically via WriteBatch (card writes) and a metadata
+ * transaction (chunk claim + job counters).
+ *
+ * The response is IMMEDIATE (no waiting for card writes to finish): the
+ * client receives a `jobId` and polls `GET /bulk-enroll-status` for progress.
+ * Content-addressable: re-sending the same cards (identical full card
+ * identity: front + back + tags + deckId + topic + suspended) with the
+ * same ownerId returns the existing job and resumes from the last
+ * incomplete chunk — never duplicates cards.
+ */
+export interface BulkEnrollCardsInput {
+  cards: CreateFlashcardInput[];
+}
+
+/**
+ * Immediate response from `POST /bulk-enroll`. Returns the job identity and
+ * total counts so the client can poll for progress.
+ */
+export interface BulkEnrollCardsResponse {
+  /** Content-addressable job id (SHA-256 of sorted card keys). */
+  jobId: string;
+  /** Total number of cards in the enrollment request. */
+  totalCards: number;
+  /** Total number of chunks (ceil(totalCards / ENROLLMENT_CHUNK_SIZE)). */
+  totalChunks: number;
+  /** Number of chunks fully committed (0..totalChunks). */
+  completedChunks: number;
+  /** Initial job status ('pending' on first submission). */
+  status: EnrollmentStatus;
+  /** Number of cards successfully created across committed chunks. */
+  createdCount: number;
+  /** Number of cards skipped because they already exist for this owner. */
+  skippedCount: number;
+  /** Number of cards that failed validation or creation. */
+  failedCount: number;
+}
+
+/**
+ * Content-addressable enrollment job document persisted in Firestore
+ * at `bulkEnrollmentJobs/{jobId}`. Progress fields are updated atomically
+ * as each chunk is committed.
+ */
+export interface BulkEnrollmentJob {
+  /** Content-addressable job id (SHA-256 of sorted card keys). */
+  id: string;
+  /** The owner of this enrollment job (verified Auth0 `sub`). */
+  ownerId: string;
+  /** Lifecycle status. */
+  status: EnrollmentStatus;
+  /** SHA-256 of JSON-sorted card keys (for content-addressable idempotency). */
+  contentHash: string;
+  /** Total number of cards across all chunks. */
+  totalCards: number;
+  /** Total number of chunks. */
+  totalChunks: number;
+  /** Number of chunks fully committed (0..totalChunks). */
+  completedChunks: number;
+  /** Number of cards successfully created across committed chunks. */
+  createdCount: number;
+  /** Number of cards that failed validation or creation. */
+  failedCount: number;
+  /** Number of cards skipped because they already exist for this owner. */
+  skippedCount: number;
+  /** When the job was created. */
+  createdAt: Timestamp;
+  /** When the job was last updated (any chunk committed). */
+  updatedAt: Timestamp;
+  /** When the job completed or failed (absent while pending/processing). */
+  completedAt?: Timestamp;
+  /** Error message when status = 'failed'. */
+  error?: string;
+}
+
+/**
+ * Progress report returned by `GET /bulk-enroll-status`. Mirrors the job
+ * document's progress fields so the client knows exactly how far along
+ * the enrollment is.
+ */
+export interface BulkEnrollStatusResponse {
+  /** Content-addressable job id. */
+  jobId: string;
+  /** Current lifecycle status. */
+  status: EnrollmentStatus;
+  /** Total cards across all chunks. */
+  totalCards: number;
+  /** Total number of chunks. */
+  totalChunks: number;
+  /** Number of chunks fully committed. */
+  completedChunks: number;
+  /** Number of cards successfully created. */
+  createdCount: number;
+  /** Number of cards skipped (already enrolled for this owner). */
+  skippedCount: number;
+  /** Number of cards that failed. */
+  failedCount: number;
+  /** ISO 8601 of when the job was created. */
+  createdAt: string;
+  /** ISO 8601 of when the job was last updated. */
+  updatedAt: string;
+  /** ISO 8601 of when the job completed or failed (absent while pending/processing). */
+  completedAt?: string;
+  /** Error message when status = 'failed' (absent otherwise). */
+  error?: string;
+}

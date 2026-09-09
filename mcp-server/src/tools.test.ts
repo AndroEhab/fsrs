@@ -78,15 +78,16 @@ async function setup(handler: Handler): Promise<{ client: Client; bridge: Fireba
 }
 
 describe('registerFlashcardTools', () => {
-  it('advertises the thirty-eight tools with correct names and descriptions', async () => {
+  it('advertises the forty tools with correct names and descriptions', async () => {
     const { client } = await setup(() => new Response('{}', { status: 200 }));
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name).sort();
     expect(names).toEqual([
-      'attach_image', 'bulk_create_flashcards', 'bulk_delete_flashcards', 'bulk_update_flashcards',
-      'count_flashcards', 'create_deck', 'create_flashcard', 'delete_deck', 'delete_flashcard',
-      'delete_tag', 'end_review_session', 'export_apkg', 'get_deck', 'get_due_flashcards',
-      'get_flashcard', 'get_review_history', 'get_review_session', 'get_study_stats', 'get_top_lapsed_cards',
+      'attach_image', 'bulk_create_flashcards', 'bulk_delete_flashcards', 'bulk_enroll_cards',
+      'bulk_update_flashcards', 'count_flashcards', 'create_deck', 'create_flashcard', 'delete_deck',
+      'delete_flashcard', 'delete_tag', 'end_review_session', 'export_apkg', 'get_deck',
+      'get_due_flashcards', 'get_enrollment_status', 'get_flashcard', 'get_review_history',
+      'get_review_session', 'get_study_stats', 'get_top_lapsed_cards',
       'health', 'import_apkg', 'list_card_images', 'list_decks', 'list_flashcards',
       'list_tags', 'merge_tags', 'migrate_review_events', 'remove_image', 'rename_tag', 'reset_flashcards',
       'review_flashcard', 'search_cards', 'set_due_date',

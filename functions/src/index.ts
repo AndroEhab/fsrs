@@ -1,4 +1,5 @@
 import { onRequest } from 'firebase-functions/v2/https';
+import { onDocumentWritten } from 'firebase-functions/v2/firestore';
 import { initializeApp } from 'firebase-admin/app';
 import {
   verifyRequest, type RequestIdentity,
@@ -19,6 +20,11 @@ import {
   ReviewSessionCardNotFoundError, ReviewSessionBuildFailedError, ReviewSessionSelectionTooLargeError,
 } from './flashcards/service';
 import {
+  bulkEnrollCards, getEnrollmentStatus,
+  EnrollmentValidationError,
+  onEnrollmentChunkWritten,
+} from './flashcards/enrollment';
+import {
   getReviewHistory, getStudyStats, getTopLapsedCards, migrateLegacyReviewEvents,
 } from './flashcards/reviewHistory';
 import {
@@ -38,6 +44,7 @@ import {
   safeValidateStartReviewSession, safeValidateSubmitSessionReview,
   safeValidateSearchCardsQuery, safeValidateCountFlashcardsQuery,
   safeValidateReviewHistoryQuery, safeValidateStudyStatsQuery, safeValidateTopLapsedQuery,
+  safeValidateBulkEnrollCards,
 } from './flashcards/validators';
 
 initializeApp();
@@ -812,6 +819,86 @@ export const bulkDeleteFlashcardsHandler = onRequest({ cors: true }, async (req,
     res.json(result);
   } catch (err) {
     console.error('Bulk delete flashcards error:', err);
+    errorResponse(res, 'Internal server error', 500);
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Bulk enrollment (resumable, idempotent, server-side chunked)        */
+/* ------------------------------------------------------------------ */
+
+/** POST /bulkEnrollCardsHandler — body { cards: CreateFlashcardInput[] } -> 200 { jobId, status, ... }.
+ *  Accepts up to ENROLLMENT_MAX_CARDS (10 000) flashcards. Validates and
+ *  persists chunk documents to Firestore, then returns the jobId immediately.
+ *  Each chunk triggers an onDocumentWritten handler that processes cards
+ *  atomically. Content-addressable: identical card sets produce the same
+ *  jobId, so retrying after a timeout resumes from the last completed
+ *  chunk — never duplicates cards. Existing same-owner cards are skipped
+ *  (scheduling state preserved). Returns the enrollment progress report. */
+export const bulkEnrollCardsHandler = onRequest({ cors: true, timeoutSeconds: 600 }, async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.set(corsHeaders());
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    return errorResponse(res, 'Method not allowed', 405);
+  }
+
+  const identity = await identityOr401(req, res);
+  if (!identity) return;
+
+  const body = await parseBody(req);
+  const validation = safeValidateBulkEnrollCards(body);
+  if (!validation.success) {
+    return errorResponse(res, 'Validation failed', 400, validation.error.issues);
+  }
+
+  try {
+    const result = await bulkEnrollCards(validation.data, identity.ownerId);
+    res.set(corsHeaders());
+    res.status(200).json(result);
+  } catch (err) {
+    if (err instanceof EnrollmentValidationError) {
+      return errorResponse(res, err.message, 400);
+    }
+    console.error('Bulk enroll cards error:', err);
+    errorResponse(res, 'Internal server error', 500);
+  }
+});
+
+/** GET /enrollmentStatusHandler/{jobId} -> 200 { jobId, status, totalCards, ... }.
+ *  Returns the current progress of an enrollment job. Only the job's owner
+ *  can read its status (returns 404 for other owners or unknown ids). */
+export const enrollmentStatusHandler = onRequest({ cors: true }, async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.set(corsHeaders());
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'GET') {
+    return errorResponse(res, 'Method not allowed', 405);
+  }
+
+  const identity = await identityOr401(req, res);
+  if (!identity) return;
+
+  const jobId = getPathId(req);
+  if (!jobId) {
+    return errorResponse(res, 'Job id is required', 400);
+  }
+
+  try {
+    const result = await getEnrollmentStatus(jobId, identity.ownerId);
+    if (!result) {
+      return errorResponse(res, 'Enrollment job not found', 404);
+    }
+    res.set(corsHeaders());
+    res.status(200).json(result);
+  } catch (err) {
+    console.error('Enrollment status error:', err);
     errorResponse(res, 'Internal server error', 500);
   }
 });
@@ -1798,6 +1885,24 @@ export const exportApkgHandler = onRequest({ cors: true }, async (req, res) => {
     res.set(corsHeaders());
     res.json(result);
   } catch (err) {
-    if (deckErrorResponse(res, err, 'Export .apkg error:')) return;
+    deckErrorResponse(res, err, 'Export .apkg error:');
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* Firestore triggers                                                  */
+/* ------------------------------------------------------------------ */
+
+/** Firestore onDocumentWritten trigger on
+ * `bulkEnrollmentJobs/{jobId}/chunks/{chunkIndex}`.
+ * Reads current chunk state; if already completed, no-ops. Otherwise
+ * processes cards via WriteBatch (outside the transaction, idempotent),
+ * then runs a metadata-only transaction that marks chunk completed and
+ * atomically increments job counters. All reads precede all writes in
+ * the transaction. Idempotent: duplicate events see status='completed'
+ * and no-op. Firestore retries failed triggers. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const onEnrollmentChunkWrittenTrigger = onDocumentWritten(
+  'bulkEnrollmentJobs/{jobId}/chunks/{chunkIndex}',
+  onEnrollmentChunkWritten as any,
+);

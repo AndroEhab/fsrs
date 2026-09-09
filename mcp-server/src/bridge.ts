@@ -296,6 +296,18 @@ export class FirebaseBridge {
     return this.request<BulkDeleteFlashcardsResponse>('POST', '/bulkDeleteFlashcardsHandler', { body: input });
   }
 
+  /* -- Bulk enrollment (resumable, idempotent, server-side chunked) -- */
+
+  /** POST /bulkEnrollCardsHandler — starts or resumes a bulk enrollment. */
+  async bulkEnrollCards(input: BulkEnrollCardsInput): Promise<BulkEnrollCardsResponse> {
+    return this.request<BulkEnrollCardsResponse>('POST', '/bulkEnrollCardsHandler', { body: input });
+  }
+
+  /** GET /enrollmentStatusHandler/{jobId} — enrollment progress poll. */
+  async getEnrollmentStatus(jobId: string): Promise<BulkEnrollStatusResponse> {
+    return this.request<BulkEnrollStatusResponse>('GET', `/enrollmentStatusHandler/${encodeURIComponent(jobId)}`);
+  }
+
   /** POST /createDeckHandler */
   async createDeck(input: CreateDeckInput): Promise<Deck> {
     return this.request<Deck>('POST', '/createDeckHandler', { body: input });
@@ -746,6 +758,51 @@ export const bulkDeleteFlashcardsResponseSchema = z.object({
   deletedIds: z.array(z.string()),
 });
 export type BulkDeleteFlashcardsResponse = z.infer<typeof bulkDeleteFlashcardsResponseSchema>;
+
+/* ------------------------------------------------------------------ */
+/* Bulk enrollment wire types — resumable, idempotent, chunked         */
+/* ------------------------------------------------------------------ */
+
+/** Mirrors ENROLLMENT_MAX_CARDS in functions/src/flashcards/types.ts. */
+export const ENROLLMENT_MAX_CARDS = 10_000;
+
+export const enrollmentStatusEnum = z.enum(['pending', 'processing', 'completed', 'failed']);
+export type EnrollmentStatus = z.infer<typeof enrollmentStatusEnum>;
+
+export const bulkEnrollCardsInputSchema = z.object({
+  cards: z.array(createFlashcardInputSchema)
+    .min(1, 'At least one card is required')
+    .max(ENROLLMENT_MAX_CARDS, `No more than ${ENROLLMENT_MAX_CARDS} cards per enrollment request`),
+});
+export type BulkEnrollCardsInput = z.infer<typeof bulkEnrollCardsInputSchema>;
+
+export const bulkEnrollCardsResponseSchema = z.object({
+  jobId: z.string(),
+  status: enrollmentStatusEnum,
+  totalCards: z.number(),
+  totalChunks: z.number(),
+  completedChunks: z.number(),
+  createdCount: z.number(),
+  skippedCount: z.number(),
+  failedCount: z.number(),
+});
+export type BulkEnrollCardsResponse = z.infer<typeof bulkEnrollCardsResponseSchema>;
+
+export const bulkEnrollStatusResponseSchema = z.object({
+  jobId: z.string(),
+  status: enrollmentStatusEnum,
+  totalCards: z.number(),
+  totalChunks: z.number(),
+  completedChunks: z.number(),
+  createdCount: z.number(),
+  skippedCount: z.number(),
+  failedCount: z.number(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  completedAt: z.string().optional(),
+  error: z.string().optional(),
+});
+export type BulkEnrollStatusResponse = z.infer<typeof bulkEnrollStatusResponseSchema>;
 
 /* ------------------------------------------------------------------ */
 /* Deck wire types — mirror functions/src/flashcards/types.ts          */

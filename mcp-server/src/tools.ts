@@ -1311,6 +1311,102 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     },
   );
 
+  /* bulk enroll — resumable, idempotent, server-side chunked */
+  server.registerTool(
+    'bulk_enroll_cards',
+    {
+      title: 'Enroll large card sets safely',
+      description:
+        'Enrolls a large set of flashcards (up to 10,000) in a resumable, idempotent workflow. The server chunks cards into ≤100-card groups stored in Firestore, each processed atomically via an onDocumentWritten trigger. Each card gets a deterministic document id derived from its full identity (front + back + tags + deckId + topic + suspended), so resending the same cards after a timeout resumes from the last completed chunk — never duplicates cards. Existing same-owner cards are skipped (scheduling state preserved). Returns the enrollment job id and progress. Use get_enrollment_status to poll progress. Prefer this over bulk_create_flashcards when the user wants to add more than 100 cards at once.',
+      inputSchema: {
+        cards: z.array(z.object(flashcardInputShape))
+          .min(1, 'At least one card is required')
+          .max(10000, 'No more than 10,000 cards per enrollment request'),
+      },
+      outputSchema: z.object({
+        jobId: z.string(),
+        status: z.enum(['pending', 'processing', 'completed', 'failed']),
+        totalCards: z.number(),
+        totalChunks: z.number(),
+        completedChunks: z.number(),
+        createdCount: z.number(),
+        skippedCount: z.number(),
+        failedCount: z.number(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (args: { cards: Array<{ front: string; back: string; deckId?: string | null; deck?: string | null; topic?: string | null; suspended?: boolean; tags?: string[] }> }) => {
+      requireKey();
+      const result = await bridge.bulkEnrollCards({
+        cards: args.cards.map((c) => ({
+          front: c.front,
+          back: c.back,
+          ...(c.deckId !== undefined ? { deckId: c.deckId } : {}),
+          ...(c.deck !== undefined ? { deck: c.deck } : {}),
+          ...(c.topic !== undefined ? { topic: c.topic } : {}),
+          ...(c.suspended !== undefined ? { suspended: c.suspended } : {}),
+          ...(c.tags !== undefined ? { tags: c.tags } : {}),
+        })),
+      });
+      const text = result.status === 'completed'
+        ? `Enrolled ${result.createdCount} flashcard${result.createdCount === 1 ? '' : 's'} across ${result.totalChunks} chunk${result.totalChunks === 1 ? '' : 's'} (job: ${result.jobId}).`
+        : `Enrollment ${result.status}: ${result.completedChunks}/${result.totalChunks} chunks processed, ${result.createdCount} created, ${result.failedCount} failed (job: ${result.jobId}). Poll get_enrollment_status for progress.`;
+      return {
+        content: [{ type: 'text' as const, text }],
+        structuredContent: result,
+      };
+    },
+  );
+
+  /* enrollment status poll */
+  server.registerTool(
+    'get_enrollment_status',
+    {
+      title: 'Check enrollment progress',
+      description:
+        'Returns the current progress of a bulk enrollment job: status (pending/processing/completed/failed), chunk progress, card counts, and any error. Use this to poll after bulk_enroll_cards returns a non-completed status, or to resume after a timeout by re-sending the same cards (the server detects the existing job and resumes automatically).',
+      inputSchema: {
+        jobId: z.string().min(1, 'Job id is required').max(100, 'Job id too long'),
+      },
+      outputSchema: z.object({
+        jobId: z.string(),
+        status: z.enum(['pending', 'processing', 'completed', 'failed']),
+        totalCards: z.number(),
+        totalChunks: z.number(),
+        completedChunks: z.number(),
+        createdCount: z.number(),
+        skippedCount: z.number(),
+        failedCount: z.number(),
+        createdAt: z.string(),
+        updatedAt: z.string(),
+        completedAt: z.string().optional(),
+        error: z.string().optional(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (args: { jobId: string }) => {
+      requireKey();
+      const result = await bridge.getEnrollmentStatus(args.jobId);
+      const text = result.status === 'completed'
+        ? `Enrollment ${result.jobId} completed: ${result.createdCount} cards created, ${result.failedCount} failed.`
+        : `Enrollment ${result.jobId}: ${result.status} — ${result.completedChunks}/${result.totalChunks} chunks, ${result.createdCount} created, ${result.failedCount} failed.${result.error ? ` Error: ${result.error}` : ''}`;
+      return {
+        content: [{ type: 'text' as const, text }],
+        structuredContent: result,
+      };
+    },
+  );
+
   /* deck: create */
   server.registerTool(
     'create_deck',

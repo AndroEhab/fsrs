@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { CreateFlashcardInput, UpdateFlashcardInput, ListFlashcardsQuery, DueFlashcardsQuery, SearchCardsQuery, ReviewFlashcardInput, BulkCreateFlashcardsInput, BulkUpdateFlashcardsInput, BulkDeleteFlashcardsInput, BULK_LIMIT, CreateDeckInput, UpdateDeckInput, ListDecksQuery, AttachImageInput, RemoveImageInput, UploadImageInput, MAX_IMAGE_URL_LENGTH, MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_FILE_NAME_LENGTH, StartReviewSessionInput, SubmitSessionReviewInput, CountFlashcardsQuery, SchedulingActionInput, SetFlashcardDueDateInput, SCHEDULING_ACTION_LIMIT, ListTagsQuery, RenameTagInput, DeleteTagInput, MergeTagsInput, MIN_TAG_NAME_LENGTH, MAX_TAG_NAME_LENGTH, ReviewHistoryQuery, StudyStatsQuery, TopLapsedQuery } from './types';
+import { CreateFlashcardInput, UpdateFlashcardInput, ListFlashcardsQuery, DueFlashcardsQuery, SearchCardsQuery, ReviewFlashcardInput, BulkCreateFlashcardsInput, BulkUpdateFlashcardsInput, BulkDeleteFlashcardsInput, BULK_LIMIT, CreateDeckInput, UpdateDeckInput, ListDecksQuery, AttachImageInput, RemoveImageInput, UploadImageInput, MAX_IMAGE_URL_LENGTH, MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_FILE_NAME_LENGTH, StartReviewSessionInput, SubmitSessionReviewInput, CountFlashcardsQuery, SchedulingActionInput, SetFlashcardDueDateInput, SCHEDULING_ACTION_LIMIT, ListTagsQuery, RenameTagInput, DeleteTagInput, MergeTagsInput, MIN_TAG_NAME_LENGTH, MAX_TAG_NAME_LENGTH, ReviewHistoryQuery, StudyStatsQuery, TopLapsedQuery, BulkEnrollCardsInput, ENROLLMENT_MAX_CARDS } from './types';
 import { normalizeSearchFilters, searchFiltersKey, readSearchPageToken } from './search';
 import { normalizeHistoryFilters, historyFiltersKey, readHistoryPageToken } from './analytics';
 
@@ -850,6 +850,52 @@ export function safeValidateStudyStatsQuery(data: unknown): { success: true; dat
 
 export function safeValidateTopLapsedQuery(data: unknown): { success: true; data: TopLapsedQuery } | { success: false; error: ValidationError } {
   const result = topLapsedQuerySchema.safeParse(data);
+  if (result.success) {
+    return { success: true, data: result.data };
+  }
+  return { success: false, error: new ValidationError(result.error.issues) };
+}
+
+/* ------------------------------------------------------------------ */
+/* Bulk enrollment validators (resumable, idempotent, chunked)         */
+/* ------------------------------------------------------------------ */
+
+export const bulkEnrollCardsSchema = z.object({
+  cards: createCardSchema.array()
+    .min(1, 'At least one card is required')
+    .max(ENROLLMENT_MAX_CARDS, `No more than ${ENROLLMENT_MAX_CARDS} cards per request`),
+}) satisfies z.ZodType<BulkEnrollCardsInput>;
+
+export const bulkEnrollStatusQuerySchema = z.object({
+  jobId: z.string().min(1, 'Job id is required').max(100, 'Job id too long'),
+}) satisfies z.ZodType<{ jobId: string }>;
+
+export function validateBulkEnrollCards(data: unknown): BulkEnrollCardsInput {
+  const result = bulkEnrollCardsSchema.safeParse(data);
+  if (!result.success) {
+    throw new ValidationError(result.error.issues);
+  }
+  return result.data;
+}
+
+export function validateBulkEnrollStatusQuery(data: unknown): { jobId: string } {
+  const result = bulkEnrollStatusQuerySchema.safeParse(data);
+  if (!result.success) {
+    throw new ValidationError(result.error.issues);
+  }
+  return result.data;
+}
+
+export function safeValidateBulkEnrollCards(data: unknown): { success: true; data: BulkEnrollCardsInput } | { success: false; error: ValidationError } {
+  const result = bulkEnrollCardsSchema.safeParse(data);
+  if (result.success) {
+    return { success: true, data: result.data };
+  }
+  return { success: false, error: new ValidationError(result.error.issues) };
+}
+
+export function safeValidateBulkEnrollStatusQuery(data: unknown): { success: true; data: { jobId: string } } | { success: false; error: ValidationError } {
+  const result = bulkEnrollStatusQuerySchema.safeParse(data);
   if (result.success) {
     return { success: true, data: result.data };
   }

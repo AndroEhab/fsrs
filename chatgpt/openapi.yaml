@@ -11,6 +11,7 @@
 #   The backend (functions/src/index.ts) deploys each handler as a SEPARATE
 #   named Cloud Function (no rewrites/router prefix):
 #     health, createFlashcardHandler, bulkCreateFlashcardsHandler,
+#     bulkEnrollCardsHandler, enrollmentStatusHandler,
 #     listFlashcardsHandler, dueFlashcardsHandler, reviewFlashcardHandler,
 #     getFlashcardHandler, updateFlashcardHandler, deleteFlashcardHandler,
 #     bulkUpdateFlashcardsHandler, bulkDeleteFlashcardsHandler,
@@ -144,6 +145,91 @@ paths:
                 $ref: "#/components/schemas/BulkCreateResult"
         "400":
           description: Invalid input (validation failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /bulkEnrollCardsHandler:
+    post:
+      operationId: bulkEnrollCards
+      summary: Enroll large card sets safely (up to 10,000)
+      description: >
+        Enrolls a large set of flashcards in a resumable, idempotent workflow.
+        The server chunks cards into <=100-card groups stored in Firestore, each
+        processed atomically via an onDocumentWritten trigger. Each card gets a
+        deterministic document id derived from its content (front + back + tags +
+        deckId + topic + suspended), so resending the same cards after a timeout
+        resumes from the last completed chunk — never duplicates cards. Existing
+        same-owner cards are skipped (scheduling state preserved). Returns the
+        enrollment job id and progress. Use GET /enrollmentStatusHandler/{jobId}
+        to poll for progress.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkEnrollCardsInput"
+      responses:
+        "200":
+          description: Enrollment progress report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkEnrollCardsResponse"
+        "400":
+          description: Invalid input (validation failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /enrollmentStatusHandler/{jobId}:
+    get:
+      operationId: getEnrollmentStatus
+      summary: Check enrollment progress
+      description: >
+        Returns the current progress of a bulk enrollment job: status
+        (pending/processing/completed/failed), chunk progress, card counts,
+        and any error. Only the job's owner can read its status.
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The enrollment job id returned by bulkEnrollCardsHandler.
+      responses:
+        "200":
+          description: Enrollment status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkEnrollStatusResponse"
+        "404":
+          description: Job not found or not owned by the caller
           content:
             application/json:
               schema:
@@ -1744,6 +1830,87 @@ components:
           description: The ids actually deleted (ids that did not exist are omitted).
           items:
             type: string
+    BulkEnrollCardsInput:
+      type: object
+      required: [cards]
+      additionalProperties: false
+      properties:
+        cards:
+          type: array
+          description: >
+            The flashcards to enroll. Each item has a front (question), a back
+            (answer), and optional deck (deckId or legacy deck name), tags,
+            topic, and suspended. Up to 10,000 cards per request.
+          minItems: 1
+          maxItems: 10000
+          items:
+            $ref: "#/components/schemas/FlashcardCreate"
+    BulkEnrollCardsResponse:
+      type: object
+      required: [jobId, status, totalCards, totalChunks, completedChunks, createdCount, skippedCount, failedCount]
+      properties:
+        jobId:
+          type: string
+          description: Content-addressable enrollment job id (SHA-256 of sorted card keys).
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+          description: Current lifecycle status of the enrollment job.
+        totalCards:
+          type: integer
+          description: Total number of cards in the enrollment request.
+        totalChunks:
+          type: integer
+          description: Total number of chunks (ceil(totalCards / 100)).
+        completedChunks:
+          type: integer
+          description: Number of chunks fully committed (0..totalChunks).
+        createdCount:
+          type: integer
+          description: Number of cards successfully created across committed chunks.
+        skippedCount:
+          type: integer
+          description: Number of cards skipped because they already exist for this owner (idempotent re-enrollment).
+        failedCount:
+          type: integer
+          description: Number of cards that failed validation or creation.
+    BulkEnrollStatusResponse:
+      type: object
+      required: [jobId, status, totalCards, totalChunks, completedChunks, createdCount, skippedCount, failedCount, createdAt, updatedAt]
+      properties:
+        jobId:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        totalCards:
+          type: integer
+        totalChunks:
+          type: integer
+        completedChunks:
+          type: integer
+        createdCount:
+          type: integer
+        skippedCount:
+          type: integer
+          description: Cards skipped (already enrolled for this owner).
+        failedCount:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+          description: ISO 8601 of when the job was created.
+        updatedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 of when the job was last updated.
+        completedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 of when the job completed or failed (absent while pending/processing).
+        error:
+          type: string
+          description: Error message when status = failed (absent otherwise).
     DeckCreate:
       type: object
       required: [name]
