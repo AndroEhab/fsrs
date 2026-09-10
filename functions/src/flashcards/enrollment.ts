@@ -29,6 +29,7 @@ import {
   BulkEnrollStatusResponse,
   CreateFlashcardInput,
   ENROLLMENT_CHUNK_SIZE, ENROLLMENT_MAX_CARDS,
+  DEFAULT_DECK_NAME,
 } from './types';
 import { initialScheduling } from './scheduler';
 
@@ -161,6 +162,12 @@ function applyDeckRef(
   target.deck = ref.deck;
 }
 
+/** Lazily resolves the default `Uncategorized` deck for an owner. */
+async function resolveDefaultDeck(ownerId: string): Promise<{ deckId: string; deck: string }> {
+  const deckId = await findOrCreateDeckByName(DEFAULT_DECK_NAME, ownerId);
+  return { deckId, deck: DEFAULT_DECK_NAME };
+}
+
 /* ------------------------------------------------------------------ */
 /* Error classes                                                       */
 /* ------------------------------------------------------------------ */
@@ -236,6 +243,32 @@ async function readChunkCards(
     .get();
   if (!snap.exists) return [];
   return (snap.data()?.cards as CreateFlashcardInput[]) || [];
+}
+
+/**
+ * Scans all chunk documents for a job and returns the status of each.
+ * Used by the resume path to detect stuck/pending/processing chunks
+ * that need to be retriggered.
+ */
+async function scanChunkStatuses(
+  jobId: string,
+  totalChunks: number,
+): Promise<Array<{ index: number; status: string | undefined; exists: boolean }>> {
+  const chunksSubcoll = getDb()
+    .collection(JOBS_COLLECTION)
+    .doc(jobId)
+    .collection(CHUNKS_SUBCOLLECTION);
+  const results: Array<{ index: number; status: string | undefined; exists: boolean }> = [];
+  for (let i = 0; i < totalChunks; i++) {
+    const paddedIndex = String(i).padStart(5, '0');
+    const snap = await chunksSubcoll.doc(paddedIndex).get();
+    results.push({
+      index: i,
+      status: snap.exists ? (snap.data()?.status as string | undefined) : undefined,
+      exists: snap.exists,
+    });
+  }
+  return results;
 }
 
 /* ------------------------------------------------------------------ */
@@ -324,11 +357,11 @@ function contentMatches(
  *
  * This handles legacy random-ID cards created by the old bulk_create API.
  *
- * LIMITATION: Cards WITHOUT a deckId are only checked by deterministic
- * card key. Legacy random-ID cards without a deck cannot be safely
+ * LIMITATION: Cards without a deckId in the input are resolved to the
+ * `Uncategorized` default deck, so reconciliation uses the deck-scoped
+ * query path. Legacy random-ID cards without a deckId cannot be safely
  * reconciled without a broad scan of the owner's entire library (no
- * composite index on content fields). Users should assign deck IDs to
- * legacy cards before re-enrolling to avoid duplicates.
+ * composite index on content fields).
  *
  * @param chunkCards  Cards in the current chunk
  * @param ownerId     The authenticated owner
@@ -438,15 +471,17 @@ async function processChunk(
     return { created: 0, skipped: 0, failed: 0, errors: [] };
   }
 
-  // Resolve deck references outside the batch.
+  // Resolve deck references outside the batch.  Every enrolled card must
+  // belong to a deck — fall back to Uncategorized when input omits both.
   const deckCache = new Map<string, { deckId: string; deck: string } | null>();
+  const defaultDeck = await resolveDefaultDeck(ownerId);
   for (const card of chunkCards) {
     const deckKey = `${card.deckId ?? ''}|${card.deck ?? ''}`;
     if (!deckCache.has(deckKey)) {
       if (card.deckId !== undefined || card.deck !== undefined) {
-        deckCache.set(deckKey, await resolveDeckRef(card, ownerId));
+        deckCache.set(deckKey, await resolveDeckRef(card, ownerId) ?? defaultDeck);
       } else {
-        deckCache.set(deckKey, null);
+        deckCache.set(deckKey, defaultDeck);
       }
     }
   }
@@ -558,7 +593,9 @@ async function processChunk(
  *    overwrites the same documents, never duplicates.
  *  - The transaction reads current chunk status: already-completed
  *    chunks are no-ops (zero duplicate increments).
- *  - Firestore retries failed triggers with exponential backoff.
+ *  - Failures are recorded on the chunk (lastError) and parent job
+ *    (status → failed, error). getEnrollmentStatus surfaces them.
+ *    Exact re-submission retriggers non-completed chunks.
  */
 /**
  * Shape of the Firestore onDocumentWritten event.
@@ -614,9 +651,25 @@ export async function onEnrollmentChunkWritten(
 
   // Process cards OUTSIDE any transaction. processChunk is idempotent:
   // deterministic card doc ids mean re-processing overwrites the same
-  // documents. If the transaction retries after this, the card writes
-  // are harmless duplicates (same doc ids, same data).
-  const result = await processChunk(cards, ownerId);
+  // documents. Card writes are harmless duplicates on re-submission.
+  let result: { created: number; skipped: number; failed: number; errors: string[] };
+  try {
+    result = await processChunk(cards, ownerId);
+  } catch (err) {
+    // Best-effort: record error on chunk AND mark parent job failed so
+    // getEnrollmentStatus surfaces the failure. Chunk stays
+    // non-completed → exact re-submission retriggers it.
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const now = Timestamp.now();
+    await chunkDocRef.update({ lastError: errMsg, lastErrorAt: now }).catch(() => {});
+    const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
+    await jobDocRef.update({
+      status: 'failed',
+      error: `Chunk ${chunkId}: ${errMsg}`,
+      updatedAt: now,
+    }).catch(() => {});
+    throw err;
+  }
 
   // Metadata-only transaction: read current chunk + job state, no-op if
   // chunk already completed (handles concurrent/repeated triggers),
@@ -625,45 +678,61 @@ export async function onEnrollmentChunkWritten(
   // documents we just read.
   const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
 
-  await getDb().runTransaction(async (t) => {
-    // ALL reads must come before ANY writes (Firestore tx constraint).
-    const txChunkSnap = await t.get(chunkDocRef);
-    const jobSnap = await t.get(jobDocRef);
+  try {
+    await getDb().runTransaction(async (t) => {
+      // ALL reads must come before ANY writes (Firestore tx constraint).
+      const txChunkSnap = await t.get(chunkDocRef);
+      const jobSnap = await t.get(jobDocRef);
 
-    const txChunkData = txChunkSnap.data();
-    if (!txChunkData || txChunkData.status === 'completed') return;
+      const txChunkData = txChunkSnap.data();
+      if (!txChunkData || txChunkData.status === 'completed') return;
 
-    const jobData = jobSnap.data();
-    if (!jobData) return;
+      const jobData = jobSnap.data();
+      if (!jobData) return;
 
-    // Compute terminal state from read values before any writes.
-    const totalChunks = jobData.totalChunks ?? 0;
-    const newCompletedChunks = (jobData.completedChunks ?? 0) + 1;
-    const isLastChunk = newCompletedChunks >= totalChunks;
+      // Compute terminal state from read values before any writes.
+      const totalChunks = jobData.totalChunks ?? 0;
+      const newCompletedChunks = (jobData.completedChunks ?? 0) + 1;
+      const isLastChunk = newCompletedChunks >= totalChunks;
 
-    // Now issue all writes.
-    t.update(chunkDocRef, {
-      status: 'completed',
-      createdCount: result.created,
-      failedCount: result.failed,
-      skippedCount: result.skipped,
-      error: result.errors.length > 0 ? result.errors[result.errors.length - 1] : null,
-      processedAt: Timestamp.now(),
+      // Now issue all writes.
+      t.update(chunkDocRef, {
+        status: 'completed',
+        createdCount: result.created,
+        failedCount: result.failed,
+        skippedCount: result.skipped,
+        error: result.errors.length > 0 ? result.errors[result.errors.length - 1] : null,
+        processedAt: Timestamp.now(),
+      });
+
+      t.update(jobDocRef, {
+        completedChunks: FieldValue.increment(1),
+        createdCount: FieldValue.increment(result.created),
+        skippedCount: FieldValue.increment(result.skipped),
+        failedCount: FieldValue.increment(result.failed),
+        ...(result.errors.length > 0 ? { lastChunkError: result.errors[result.errors.length - 1] } : {}),
+        ...(isLastChunk ? {
+          status: result.failed > 0 ? 'failed' : 'completed',
+          completedAt: Timestamp.now(),
+        } : {}),
+        updatedAt: Timestamp.now(),
+      });
     });
-
-    t.update(jobDocRef, {
-      completedChunks: FieldValue.increment(1),
-      createdCount: FieldValue.increment(result.created),
-      skippedCount: FieldValue.increment(result.skipped),
-      failedCount: FieldValue.increment(result.failed),
-      ...(result.errors.length > 0 ? { lastChunkError: result.errors[result.errors.length - 1] } : {}),
-      ...(isLastChunk ? {
-        status: result.failed > 0 ? 'failed' : 'completed',
-        completedAt: Timestamp.now(),
-      } : {}),
-      updatedAt: Timestamp.now(),
-    });
-  });
+  } catch (txErr) {
+    // Transaction failed (contention, deadline, etc.). Best-effort: mark
+    // parent job failed for observability. Chunk stays non-completed →
+    // exact re-submission rewrites it as pending and retriggers it.
+    const errMsg = txErr instanceof Error ? txErr.message : String(txErr);
+    const now = Timestamp.now();
+    await chunkDocRef.update({ lastError: errMsg, lastErrorAt: now }).catch(() => {});
+    const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
+    await jobDocRef.update({
+      status: 'failed',
+      error: `Chunk ${chunkId}: ${errMsg}`,
+      updatedAt: now,
+    }).catch(() => {});
+    throw txErr;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -673,8 +742,10 @@ export async function onEnrollmentChunkWritten(
 /**
  * Start or resume a bulk enrollment. Returns IMMEDIATELY with the jobId
  * and initial status. Chunk processing is triggered by Firestore's
- * onDocumentWritten trigger on the chunk subcollection — durable,
- * retried by Firestore, and independent of HTTP connection lifetime.
+ * onDocumentWritten trigger on the chunk subcollection — durable and
+ * independent of HTTP connection lifetime. On failure the chunk and
+ * parent job are marked failed; exact re-submission retriggers
+ * non-completed chunks.
  *
  * Flow:
  *  1. Validate input (1..ENROLLMENT_MAX_CARDS cards).
@@ -687,8 +758,9 @@ export async function onEnrollmentChunkWritten(
  *
  * Each chunk's Firestore trigger fires on document creation and
  * processes the chunk atomically. Progress is updated after each chunk.
- * If the trigger fails, Firestore retries automatically with exponential
- * backoff. The chunk status check short-circuits re-processing.
+ * On failure, the chunk and parent job are marked failed with an error.
+ * The chunk status check short-circuits re-processing of completed chunks.
+ * Exact re-submission retriggers non-completed chunks.
  */
 export async function bulkEnrollCards(
   input: BulkEnrollCardsInput,
@@ -711,6 +783,7 @@ export async function bulkEnrollCards(
   let startChunk: number;
   let createdCount: number;
   let failedCount: number;
+  let retriedChunkCount = 0;
 
   if (existingJob) {
     if (existingJob.ownerId !== ownerId) {
@@ -728,6 +801,7 @@ export async function bulkEnrollCards(
         createdCount: existingJob.createdCount,
         skippedCount: 'skippedCount' in existingJob ? (existingJob.skippedCount as number) : 0,
         failedCount: existingJob.failedCount,
+        retriedChunkCount: 0,
       };
     }
 
@@ -744,46 +818,60 @@ export async function bulkEnrollCards(
       );
     }
 
-    // Conditionally set status to 'processing' — only if the job has not
-    // already completed concurrently (e.g. a trigger finished between our
-    // read above and this write). Using a transaction prevents regressing
-    // a completed job back to 'processing'.
+    // Set status to 'processing' — allows transition from any non-completed
+    // state including 'failed' (self-healing). Only 'completed' is terminal.
     const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
     await getDb().runTransaction(async (t) => {
       const snap = await t.get(jobDocRef);
       const data = snap.data();
-      if (!data || data.status === 'completed' || data.status === 'failed') return;
+      if (!data || data.status === 'completed') return;
       t.update(jobDocRef, { status: 'processing', updatedAt: Timestamp.now() });
     });
 
     // Re-read to get the authoritative status after the transaction.
     const postTxJob = await readJobDocument(jobId);
-    if (postTxJob?.status === 'completed' || postTxJob?.status === 'failed') {
+    if (postTxJob?.status === 'completed') {
       return {
         jobId,
-        status: postTxJob.status,
+        status: 'completed',
         totalCards: postTxJob.totalCards,
         totalChunks: postTxJob.totalChunks,
         completedChunks: postTxJob.totalChunks,
         createdCount: postTxJob.createdCount,
         skippedCount: 'skippedCount' in postTxJob ? (postTxJob.skippedCount as number) : 0,
         failedCount: postTxJob.failedCount,
+        retriedChunkCount: 0,
       };
     }
 
-    // Re-create unprocessed chunks so the onDocumentWritten trigger fires.
-    // Batch all writes for speed (remaining chunks ≤ totalChunks ≤ 100).
+    // Scan ALL chunks to find any that are not completed (pending,
+    // processing, missing, or failed). Rewriting them as 'pending'
+    // triggers the onDocumentWritten handler for reprocessing.
+    // This self-heals: missing chunks (partial batch write), stuck
+    // chunks (trigger/tx failed after card writes), and previously
+    // failed jobs where individual chunks weren't completed.
+    const chunkStatuses = await scanChunkStatuses(jobId, totalChunks);
     const resumeBatch = getDb().batch();
+    retriedChunkCount = 0;
     const chunksSubcoll = getDb()
       .collection(JOBS_COLLECTION)
       .doc(jobId)
       .collection(CHUNKS_SUBCOLLECTION);
-    for (let i = startChunk; i < totalChunks; i++) {
-      const chunkCards = await readChunkCards(jobId, i);
+    for (const cs of chunkStatuses) {
+      if (cs.status === 'completed') continue;
+      // Chunk is pending, processing, missing, or in an unknown state.
+      // For existing chunk docs, read durable card payloads; for missing
+      // chunks (partial initial batch write), reconstruct from input.cards.
+      let chunkCards = await readChunkCards(jobId, cs.index);
+      if (chunkCards.length === 0) {
+        // Missing chunk — reconstruct from the original input.
+        const start = cs.index * ENROLLMENT_CHUNK_SIZE;
+        chunkCards = input.cards.slice(start, start + ENROLLMENT_CHUNK_SIZE);
+      }
       if (chunkCards.length === 0) continue;
-      const paddedIndex = String(i).padStart(5, '0');
+      const paddedIndex = String(cs.index).padStart(5, '0');
       resumeBatch.set(chunksSubcoll.doc(paddedIndex), {
-        chunkIndex: i,
+        chunkIndex: cs.index,
         cards: chunkCards,
         cardCount: chunkCards.length,
         status: 'pending',
@@ -791,6 +879,7 @@ export async function bulkEnrollCards(
         createdCount: 0,
         failedCount: 0,
       });
+      retriedChunkCount++;
     }
     await resumeBatch.commit();
   } else {
@@ -801,6 +890,7 @@ export async function bulkEnrollCards(
     startChunk = 0;
     createdCount = 0;
     failedCount = 0;
+    retriedChunkCount = 0;
 
     await createJobDocument(jobId, ownerId, totalChunks, totalCards);
     await updateJobProgress(jobId, { status: 'processing' });
@@ -818,6 +908,7 @@ export async function bulkEnrollCards(
     createdCount,
     skippedCount: 0,
     failedCount,
+    retriedChunkCount,
   };
 }
 
@@ -832,6 +923,21 @@ export async function getEnrollmentStatus(
   const job = await readJobDocument(jobId);
   if (!job || job.ownerId !== ownerId) return null;
 
+  // Surface per-chunk errors when the job is not terminal.
+  const chunkErrors: Array<{ chunkIndex: number; error: string }> = [];
+  if (job.status !== 'completed') {
+    for (let i = 0; i < (job.totalChunks ?? 0); i++) {
+      const paddedIndex = String(i).padStart(5, '0');
+      const snap = await getDb()
+        .collection(JOBS_COLLECTION).doc(jobId)
+        .collection(CHUNKS_SUBCOLLECTION).doc(paddedIndex).get();
+      const data = snap.data();
+      if (data?.lastError) {
+        chunkErrors.push({ chunkIndex: i, error: data.lastError as string });
+      }
+    }
+  }
+
   return {
     jobId: job.id,
     status: job.status,
@@ -845,5 +951,6 @@ export async function getEnrollmentStatus(
     updatedAt: job.updatedAt.toDate().toISOString(),
     completedAt: job.completedAt?.toDate().toISOString(),
     error: job.error,
+    ...(chunkErrors.length > 0 ? { chunkErrors } : {}),
   };
 }

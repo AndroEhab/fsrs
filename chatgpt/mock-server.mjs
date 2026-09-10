@@ -63,6 +63,11 @@ function resolveDeckRef(body) {
   return null;
 }
 
+// Lazily resolves the default "Uncategorized" deck for the mock server.
+function resolveDefaultDeck() {
+  return findOrCreateDeck("Uncategorized");
+}
+
 // Mirrors backend Timestamp JSON: { _seconds, _nanoseconds } (protobuf style),
 // NOT ISO 8601. Same behavior as firebase-admin Timestamp.now() serialization.
 const nowTimestamp = () => {
@@ -118,13 +123,17 @@ function validateFlashcard(body, { partial }) {
     } else clean.back = body.back;
   }
   if (!partial || body.deckId !== undefined) {
-    if (body.deckId !== undefined && body.deckId !== null && (typeof body.deckId !== "string" || body.deckId.length < 1 || body.deckId.length > 100)) {
-      issues.push({ path: ["deckId"], message: "Deck id must be a string of 1-100 characters or null" });
+    if (body.deckId !== undefined && body.deckId === null) {
+      issues.push({ path: ["deckId"], message: "Cannot set deckId to null; every card must belong to a deck" });
+    } else if (body.deckId !== undefined && (typeof body.deckId !== "string" || body.deckId.length < 1 || body.deckId.length > 100)) {
+      issues.push({ path: ["deckId"], message: "Deck id must be a string of 1-100 characters" });
     } else if (body.deckId !== undefined) clean.deckId = body.deckId;
   }
   if (!partial || body.deck !== undefined) {
-    if (body.deck !== undefined && body.deck !== null && (typeof body.deck !== "string" || body.deck.length > 100)) {
-      issues.push({ path: ["deck"], message: "Deck name must be a string of at most 100 characters or null" });
+    if (body.deck !== undefined && body.deck === null) {
+      issues.push({ path: ["deck"], message: "Cannot set deck to null; every card must belong to a deck" });
+    } else if (body.deck !== undefined && (typeof body.deck !== "string" || body.deck.length > 100)) {
+      issues.push({ path: ["deck"], message: "Deck name must be a string of at most 100 characters" });
     } else if (body.deck !== undefined) clean.deck = body.deck;
   }
   if (!partial || body.tags !== undefined) {
@@ -207,10 +216,14 @@ const server = http.createServer(async (req, res) => {
     }
     const id = `card_${String(nextId++).padStart(4, "0")}`;
     const now = nowTimestamp();
+    // Every newly created card must belong to a deck; fall back to Uncategorized.
+    const resolvedDeck = deckRef ?? resolveDefaultDeck();
     const card = {
       id,
       front: data.front,
       back: data.back,
+      deckId: resolvedDeck.deckId,
+      deck: resolvedDeck.deck,
       tags: data.tags ?? [],
       createdAt: now,
       updatedAt: now,
@@ -223,10 +236,6 @@ const server = http.createServer(async (req, res) => {
       reviewLog: [],
       images: [],
     };
-    if (deckRef) {
-      card.deckId = deckRef.deckId;
-      card.deck = deckRef.deck;
-    }
     cards.set(id, card);
     return json(res, 201, card);
   }
@@ -255,10 +264,14 @@ const server = http.createServer(async (req, res) => {
         throw err;
       }
       const id = `card_${String(nextId++).padStart(4, "0")}`;
+      // Every newly created card must belong to a deck; fall back to Uncategorized.
+      const resolvedDeck = deckRef ?? resolveDefaultDeck();
       const card = {
         id,
         front: data.front,
         back: data.back,
+        deckId: resolvedDeck.deckId,
+        deck: resolvedDeck.deck,
         tags: data.tags ?? [],
         createdAt: now,
         updatedAt: now,
@@ -271,10 +284,6 @@ const server = http.createServer(async (req, res) => {
         reviewLog: [],
       images: [],
       };
-      if (deckRef) {
-        card.deckId = deckRef.deckId;
-        card.deck = deckRef.deck;
-      }
       cards.set(id, card);
       created.push(card);
     }
@@ -425,11 +434,11 @@ const server = http.createServer(async (req, res) => {
       const { issues, data } = validateFlashcard(body, { partial: true });
       if (issues.length) return validationErrorResponse(res, issues);
       for (const k of Object.keys(data)) card[k] = data[k];
-      // Deck reference handling: null detaches; a value resolves to deckId+name.
+      // Deck reference handling: explicit null rejected; a value resolves to deckId+name.
       if (data.deckId === null || data.deck === null) {
-        delete card.deckId;
-        delete card.deck;
-      } else if (data.deckId !== undefined || data.deck !== undefined) {
+        return json(res, 400, { error: "Cannot detach a card from its deck; every card must belong to a deck" });
+      }
+      if (data.deckId !== undefined || data.deck !== undefined) {
         let deckRef;
         try {
           deckRef = resolveDeckRef(data);
@@ -518,12 +527,12 @@ const server = http.createServer(async (req, res) => {
     for (const { id, data } of validated) {
       const card = cards.get(id);
       if (!card) continue; // nonexistent ids are omitted, like the backend
-      for (const k of Object.keys(data)) card[k] = data[k];
-      // Deck reference handling: null detaches; a value resolves to deckId+name.
+      // Deck reference handling: explicit null rejected; a value resolves to deckId+name.
       if (data.deckId === null || data.deck === null) {
-        delete card.deckId;
-        delete card.deck;
-      } else if (data.deckId !== undefined || data.deck !== undefined) {
+        return json(res, 400, { error: "Cannot detach a card from its deck; every card must belong to a deck" });
+      }
+      for (const k of Object.keys(data)) card[k] = data[k];
+      if (data.deckId !== undefined || data.deck !== undefined) {
         let deckRef;
         try {
           deckRef = resolveDeckRef(data);
@@ -637,19 +646,42 @@ const server = http.createServer(async (req, res) => {
     if (handler === "deleteDeckHandler") {
       if (method !== "DELETE") return json(res, 405, { error: "Method not allowed" });
       if (!deck) return json(res, 404, { error: "Deck not found" });
-      // Detach cards (by deckId or matching legacy name) — NEVER delete them.
-      let detachedCards = 0;
+      // Protect the system placeholder deck — deleting it breaks the invariant.
+      if (deck.name === "Uncategorized") {
+        return json(res, 400, { error: 'Cannot delete the "Uncategorized" deck; it is a system-protected placeholder' });
+      }
+      // Reassign cards to the Uncategorized deck — NEVER delete them.
+      const defaultDeck = resolveDefaultDeck();
+      let reassignedCards = 0;
       for (const card of cards.values()) {
         if (card.deckId === deck.id || card.deck === deck.name) {
-          delete card.deckId;
-          delete card.deck;
+          card.deckId = defaultDeck.deckId;
+          card.deck = defaultDeck.deck;
           card.updatedAt = nowTimestamp();
-          detachedCards += 1;
+          reassignedCards += 1;
         }
       }
       decks.delete(deck.id);
-      return json(res, 200, { deleted: true, detachedCards });
+      return json(res, 200, { deleted: true, reassignedCards });
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Assign deckless cards to Uncategorized                               */
+  /* ------------------------------------------------------------------ */
+
+  if (path === "/assignDecklessHandler" && method === "POST") {
+    const defaultDeck = resolveDefaultDeck();
+    let assigned = 0;
+    for (const card of cards.values()) {
+      if (card.deckId === undefined && card.deck === undefined) {
+        card.deckId = defaultDeck.deckId;
+        card.deck = defaultDeck.deck;
+        card.updatedAt = nowTimestamp();
+        assigned += 1;
+      }
+    }
+    return json(res, 200, { assigned });
   }
 
   /* ------------------------------------------------------------------ */

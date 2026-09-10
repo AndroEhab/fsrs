@@ -18,7 +18,9 @@
     "test": "jest",
     "smoke": "npm run build && node scripts/smoke.mjs && node scripts/check-widget-runtime.mjs",
     "smoke:forwarded-token": "npm run build && node scripts/forwarded-token-smoke.mjs",
-    "inspect": "npx @modelcontextprotocol/inspector@latest"
+    "inspect":"npx @modelcontextprotocol/inspector@latest",
+    "preview":"npm run build && node scripts/widget-preview.mjs",
+    "preview:watch":"npm run build && node scripts/widget-preview.mjs --watch"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

@@ -125,12 +125,14 @@ export class FirebaseBridge {
   private async request<T>(method: string, path: string, opts: {
     query?: Record<string, string | undefined>;
     body?: unknown;
+    /** Override the default fetch timeout for this request (ms). */
+    timeoutMs?: number;
   } = {}): Promise<T> {
     const url = this.buildUrl(path, opts.query);
     const init: RequestInit = {
       method,
       headers: this.headers(),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs),
     };
     if (opts.body !== undefined) {
       init.headers = { ...init.headers, 'Content-Type': 'application/json' };
@@ -333,7 +335,7 @@ export class FirebaseBridge {
     return this.request<Deck>('PATCH', `/updateDeckHandler/${encodeURIComponent(id)}`, { body: input });
   }
 
-  /** DELETE /deleteDeckHandler/{id} — returns { deleted, detachedCards } */
+  /** DELETE /deleteDeckHandler/{id} — returns { deleted, reassignedCards } */
   async deleteDeck(id: string): Promise<DeleteDeckResult> {
     return this.request<DeleteDeckResult>('DELETE', `/deleteDeckHandler/${encodeURIComponent(id)}`);
   }
@@ -449,14 +451,25 @@ export class FirebaseBridge {
     return this.request<TagActionResult>('POST', '/mergeTagsHandler', { body: input });
   }
 
-  /** POST /importApkgHandler — body { package, deckPath? } -> 201 summary. */
+  /** POST /importApkgHandler — body { package, deckPath? } -> 201 summary.
+   *  Import involves base64 decode + ZIP inflate + SQLite parse + Firestore
+   *  batch writes which can exceed the default 15 s bridge timeout. */
   async importApkg(input: ImportApkgInput): Promise<ImportApkgResponse> {
-    return this.request<ImportApkgResponse>('POST', '/importApkgHandler', { body: input });
+    return this.request<ImportApkgResponse>('POST', '/importApkgHandler', {
+      body: input,
+      timeoutMs: 55_000,
+    });
   }
 
-  /** POST /exportApkgHandler — body { deck?, cardIds? } -> 200 base64 .apkg. */
+  /** POST /exportApkgHandler — body { deck?, cardIds? } -> 200 base64 .apkg.
+   *  Export involves Firestore card scan + SQLite collection build + media
+   *  fetch + ZIP assembly. 115 s stays under the Cloud Function's 120 s
+   *  timeout with headroom. */
   async exportApkg(input: ExportApkgInput): Promise<ExportApkgResponse> {
-    return this.request<ExportApkgResponse>('POST', '/exportApkgHandler', { body: input });
+    return this.request<ExportApkgResponse>('POST', '/exportApkgHandler', {
+      body: input,
+      timeoutMs: 115_000,
+    });
   }
 
 }
@@ -468,10 +481,10 @@ export class FirebaseBridge {
 export const createFlashcardInputSchema = z.object({
   front: z.string().min(1, 'Front cannot be empty').max(10000, 'Front too long'),
   back: z.string().min(1, 'Back cannot be empty').max(10000, 'Back too long'),
-  /** Stable deck reference (decks collection). null explicitly means no deck. */
-  deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').nullable().optional(),
+  /** Stable deck reference (decks collection). */
+  deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
   /** Legacy deck name (find-or-create). Kept for backward compatibility. */
-  deck: z.string().max(100, 'Deck name too long').nullable().optional(),
+  deck: z.string().max(100, 'Deck name too long').optional(),
   /** Optional free-form topic label (subject-area grouping). null clears it. */
   topic: z.string().min(1, 'Topic cannot be empty').max(200, 'Topic too long').nullable().optional(),
   /** Persisted suspended attribute (boolean, default false); filterable via search_cards. */
@@ -483,10 +496,10 @@ export type CreateFlashcardInput = z.infer<typeof createFlashcardInputSchema>;
 export const updateFlashcardInputSchema = z.object({
   front: z.string().min(1, 'Front cannot be empty').max(10000, 'Front too long').optional(),
   back: z.string().min(1, 'Back cannot be empty').max(10000, 'Back too long').optional(),
-  /** Stable deck reference. null detaches the card from its deck. */
-  deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').nullable().optional(),
-  /** Legacy deck name. null detaches. */
-  deck: z.string().max(100, 'Deck name too long').nullable().optional(),
+  /** Stable deck reference. */
+  deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
+  /** Legacy deck name. */
+  deck: z.string().max(100, 'Deck name too long').optional(),
   /** Optional free-form topic label. null clears it (field removed). */
   topic: z.string().min(1, 'Topic cannot be empty').max(200, 'Topic too long').nullable().optional(),
   /** Sets/clears the persisted suspended attribute; filterable via search_cards. */
@@ -725,8 +738,8 @@ export const bulkUpdateFlashcardsInputSchema = z.object({
     id: z.string().min(1, 'Card id is required'),
     front: z.string().min(1, 'Front cannot be empty').max(10000, 'Front too long').optional(),
     back: z.string().min(1, 'Back cannot be empty').max(10000, 'Back too long').optional(),
-    deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').nullable().optional(),
-    deck: z.string().max(100, 'Deck name too long').nullable().optional(),
+    deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
+    deck: z.string().max(100, 'Deck name too long').optional(),
     /** Optional free-form topic label. null clears it (field removed). */
     topic: z.string().min(1, 'Topic cannot be empty').max(200, 'Topic too long').nullable().optional(),
     /** Sets/clears the persisted suspended attribute; filterable via search_cards. */
@@ -785,6 +798,7 @@ export const bulkEnrollCardsResponseSchema = z.object({
   createdCount: z.number(),
   skippedCount: z.number(),
   failedCount: z.number(),
+  retriedChunkCount: z.number(),
 });
 export type BulkEnrollCardsResponse = z.infer<typeof bulkEnrollCardsResponseSchema>;
 
@@ -801,6 +815,10 @@ export const bulkEnrollStatusResponseSchema = z.object({
   updatedAt: z.string(),
   completedAt: z.string().optional(),
   error: z.string().optional(),
+  chunkErrors: z.array(z.object({
+    chunkIndex: z.number(),
+    error: z.string(),
+  })).optional(),
 });
 export type BulkEnrollStatusResponse = z.infer<typeof bulkEnrollStatusResponseSchema>;
 
@@ -843,7 +861,7 @@ export type ListDecksResponse = z.infer<typeof listDecksResponseSchema>;
 
 export const deleteDeckResultSchema = z.object({
   deleted: z.boolean(),
-  detachedCards: z.number(),
+  reassignedCards: z.number(),
 });
 export type DeleteDeckResult = z.infer<typeof deleteDeckResultSchema>;
 

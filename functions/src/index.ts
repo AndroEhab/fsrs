@@ -11,11 +11,12 @@ import {
   resetFlashcards, setFlashcardDueDate, suspendFlashcards, unsuspendFlashcards,
   bulkCreateFlashcards, bulkUpdateFlashcards, bulkDeleteFlashcards,
   createDeck, getDeck, updateDeck, deleteDeck, listDecks, migrateLegacyDeckNames,
+  assignDecklessToDefault,
   listTags, renameTag, deleteTag, mergeTags,
   attachImage, listImages, removeImage, uploadImage,
   startReviewSession, getReviewSession, submitSessionReview, endReviewSession,
   searchCards, countFlashcards,
-  DeckNotFoundError, DeckNameConflictError, ImageValidationError,
+  DeckNotFoundError, DeckNameConflictError, CardDeckRequiredError, ProtectedDeckError, ImageValidationError,
   ReviewSessionNotActiveError, ReviewSessionForbiddenError, ReviewExpectedCardMismatchError,
   ReviewSessionCardNotFoundError, ReviewSessionBuildFailedError, ReviewSessionSelectionTooLargeError,
 } from './flashcards/service';
@@ -77,6 +78,14 @@ function deckErrorResponse(res: any, err: unknown, logPrefix: string): boolean {
     return true;
   }
   if (err instanceof DeckNameConflictError) {
+    errorResponse(res, err.message, 400);
+    return true;
+  }
+  if (err instanceof CardDeckRequiredError) {
+    errorResponse(res, err.message, 400);
+    return true;
+  }
+  if (err instanceof ProtectedDeckError) {
     errorResponse(res, err.message, 400);
     return true;
   }
@@ -1103,6 +1112,34 @@ export const migrateDecksHandler = onRequest({ cors: true }, async (req, res) =>
   }
 });
 
+/** POST /assignDecklessHandler — assigns the caller's completely deckless
+ * cards (documents with neither `deckId` nor `deck`) to their owner-scoped
+ * `Uncategorized` placeholder deck.  Returns { assigned: N }.  Call
+ * repeatedly until 0 to complete a full migration. */
+export const assignDecklessHandler = onRequest({ cors: true }, async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.set(corsHeaders());
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    return errorResponse(res, 'Method not allowed', 405);
+  }
+
+  const identity = await identityOr401(req, res);
+  if (!identity) return;
+
+  try {
+    const result = await assignDecklessToDefault(identity.ownerId);
+    res.set(corsHeaders());
+    res.json(result);
+  } catch (err) {
+    console.error('Assign deckless error:', err);
+    errorResponse(res, 'Internal server error', 500);
+  }
+});
+
 /* ------------------------------------------------------------------ */
 /* Tag management (list / rename / delete / merge)                     */
 /* ------------------------------------------------------------------ */
@@ -1860,7 +1897,7 @@ export const importApkgHandler = onRequest({ cors: true }, async (req, res) => {
  * ANKI_EXPORT_CARD_LIMIT=1000), one deck (exact name/path), or explicit
  * cardIds (≤1000). Scheduling metadata (review state, reps/lapses, revlog
  * from the FSRS reviewLog) is carried where Anki-compatible. */
-export const exportApkgHandler = onRequest({ cors: true }, async (req, res) => {
+export const exportApkgHandler = onRequest({ cors: true, timeoutSeconds: 120 }, async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.set(corsHeaders());
     res.status(204).send('');
@@ -1900,9 +1937,19 @@ export const exportApkgHandler = onRequest({ cors: true }, async (req, res) => {
  * then runs a metadata-only transaction that marks chunk completed and
  * atomically increments job counters. All reads precede all writes in
  * the transaction. Idempotent: duplicate events see status='completed'
- * and no-op. Firestore retries failed triggers. */
+ * and no-op. On failure, the chunk and parent job are marked failed;
+ * exact re-submission retriggers non-completed chunks.
+ *
+ * Config: 512 MiB memory (prevents OOM from concurrent chunk invocations),
+ * concurrency 1 (sequential processing per instance), maxInstances 2
+ * (bounded parallel throughput while avoiding memory pressure). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const onEnrollmentChunkWrittenTrigger = onDocumentWritten(
-  'bulkEnrollmentJobs/{jobId}/chunks/{chunkIndex}',
-  onEnrollmentChunkWritten as any,
+  {
+    document: 'bulkEnrollmentJobs/{jobId}/chunks/{chunkIndex}',
+    memory: '512MiB',
+    concurrency: 1,
+    maxInstances: 2,
+  },
+  onEnrollmentChunkWritten as unknown as Parameters<typeof onDocumentWritten>[1],
 );

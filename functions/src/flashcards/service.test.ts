@@ -25,6 +25,7 @@ import {
   deleteDeck,
   listDecks,
   migrateLegacyDeckNames,
+  assignDecklessToDefault,
   listTags,
   renameTag,
   deleteTag,
@@ -336,7 +337,7 @@ describe('Flashcard Service', () => {
       }));
     });
 
-    it('detaches the deck when deckId is set to null (fields removed)', async () => {
+    it('rejects deckId null (every card must belong to a deck)', async () => {
       const existingData = {
         ownerId: 'Test Key',
         front: 'F',
@@ -356,17 +357,13 @@ describe('Flashcard Service', () => {
       };
       mockFlashcardDocRef.exists = true;
       mockFlashcardDocRef.data.mockReturnValue(existingData);
-      mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
       mockFlashcardCollectionRef.doc.mockReturnValue(mockFlashcardDocRef);
       mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-      mockFlashcardDocRef.data.mockReturnValue({ ...existingData, deckId: undefined, deck: undefined });
 
-      const result = await updateFlashcard('card-1', { deckId: null }, 'Test Key');
-
-      expect(result).not.toBeNull();
-      const updateCall = mockFlashcardDocRef.update.mock.calls[0][0] as Record<string, unknown>;
-      expect(updateCall.deckId).toEqual(expect.anything()); // FieldValue.delete marker
-      expect(updateCall.deck).toEqual(expect.anything());
+      // deckId: null is no longer accepted — must cast to bypass TS for the mock call
+      await expect(
+        updateFlashcard('card-1', { deckId: null as unknown as string }, 'Test Key'),
+      ).rejects.toThrow('Cannot detach a card from its deck');
     });
   });
 
@@ -983,24 +980,10 @@ describe('Bulk Flashcard Service', () => {
       );
     });
 
-    it('returns cards with deck/deckId ABSENT (no Firestore sentinel leak) when detaching via null', async () => {
-      const base = cardData({ deckId: 'deck-1', deck: 'Spanish' });
-      const mockSnap = { exists: true, data: () => base, id: 'card-a' };
-      mockFlashcardCollectionRef.doc.mockImplementation((id: string) => ({ id }));
-      const transaction = {
-        get: jest.fn().mockResolvedValue(mockSnap),
-        update: jest.fn(),
-      };
-      mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(withEventTx(transaction)));
-
-      const result = await bulkUpdateFlashcards({ cards: [{ id: 'card-a', deckId: null }] }, 'Test Key');
-
-      expect(result.cards).toHaveLength(1);
-      expect('deckId' in result.cards[0]).toBe(false);
-      expect('deck' in result.cards[0]).toBe(false);
-      const updateCall = transaction.update.mock.calls[0][1] as Record<string, unknown>;
-      expect(updateCall.deckId).toBeDefined();
-      expect(updateCall.deck).toBeDefined();
+    it('rejects deckId null in bulk update (every card must belong to a deck)', async () => {
+      await expect(
+        bulkUpdateFlashcards({ cards: [{ id: 'card-a', deckId: null as unknown as string }] }, 'Test Key'),
+      ).rejects.toThrow('Cannot detach a card from its deck');
     });
   });
 
@@ -1268,17 +1251,32 @@ describe('Deck Service', () => {
       return batch.update;
     }
 
-    it('detaches cards by deckId via chunked batches and deletes the deck (cards preserved)', async () => {
+    beforeEach(() => {
+      // Set up deck collection query chain for resolveDefaultDeck (findOrCreateDeckByName).
+      // .where().limit().get() returns empty → "Uncategorized" gets created on demand.
+      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
+      // .doc() must satisfy findOrCreateDeckByName which calls .id and .set().
+      // Per-test overrides replace this with mockReturnValueOnce for their own
+      // deck lookup — the second doc() call (findOrCreateDeckByName) falls back
+      // to mockReturnValue, which must include .set().
+      const defaultDocMock = { id: 'uncategorized-deck', set: jest.fn().mockResolvedValue(undefined) };
+      mockDeckCollectionRef.doc.mockReturnValue(defaultDocMock);
+    });
+
+    it('reassigns cards by deckId via chunked batches and deletes the deck (cards preserved)', async () => {
       const deckSnap = { exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) };
       const cardA = cardDoc('card-a', { deckId: 'deck-1', deck: 'Spanish', front: 'A' });
       const cardB = cardDoc('card-b', { deckId: 'deck-1', deck: 'Spanish', front: 'B' });
-      mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue(deckSnap) });
+      // Use mockReturnValueOnce so beforeEach's fallback handles findOrCreateDeckByName.
+      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
       mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
       mockFlashcardCollectionRef.get
         .mockResolvedValueOnce({ docs: [cardA, cardB] })  // by deckId
-        .mockResolvedValueOnce({ docs: [] });             // by name (already detached)
+        .mockResolvedValueOnce({ docs: [] });             // by name (already reassigned)
 
-      // Chunked batch for the byId detach.
+      // Chunked batch for the byId reassignment.
       const batchUpdate = mockBatchSequence(mockDb);
       // Final race-sweep transaction.
       const transaction = {
@@ -1292,14 +1290,14 @@ describe('Deck Service', () => {
 
       const result = await deleteDeck('deck-1', 'Test Key');
 
-      expect(result).toEqual({ deleted: true, detachedCards: 2 });
-      // Two card detach writes went through the chunked batch.
+      expect(result).toEqual({ deleted: true, reassignedCards: 2 });
+      // Two card reassignment writes went through the chunked batch.
       expect(batchUpdate).toHaveBeenCalledTimes(2);
       const first = batchUpdate.mock.calls[0][1] as Record<string, unknown>;
-      expect(first).toMatchObject({ deckId: expect.anything(), updatedAt: expect.anything() });
+      expect(first).toMatchObject({ deckId: 'uncategorized-deck', deck: 'Uncategorized' });
       // The deck doc is deleted in the final transaction.
       expect(transaction.delete).toHaveBeenCalledTimes(1);
-      // Cards are updated (detached), NEVER deleted.
+      // Cards are updated (reassigned), NEVER deleted.
       expect(transaction.delete).not.toHaveBeenCalledWith(cardA.ref);
     });
 
@@ -1309,7 +1307,8 @@ describe('Deck Service', () => {
       mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
       const deckSnap = { exists: true, data: () => ({ name: 'Huge', ownerId: 'Test Key' }) };
       const many = Array.from({ length: 1200 }, (_, i) => cardDoc('c' + i, { deckId: 'deck-huge', deck: 'Huge' }));
-      mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue(deckSnap) });
+      // Use mockReturnValueOnce so beforeEach's mockImplementation handles findOrCreateDeckByName.
+      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
       mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
       mockFlashcardCollectionRef.get
         .mockResolvedValueOnce({ docs: many }) // by deckId (1200)
@@ -1334,7 +1333,7 @@ describe('Deck Service', () => {
 
       const result = await deleteDeck('deck-huge', 'Test Key');
 
-      expect(result).toEqual({ deleted: true, detachedCards: 1200 });
+      expect(result).toEqual({ deleted: true, reassignedCards: 1200 });
       expect(batches.length).toBe(3); // 500 + 500 + 200
       expect(batches[0].update).toHaveBeenCalledTimes(500);
       expect(batches[1].update).toHaveBeenCalledTimes(500);
@@ -1342,12 +1341,13 @@ describe('Deck Service', () => {
       expect(transaction.delete).toHaveBeenCalledTimes(1);
     });
 
-    it('detaches legacy name-only cards (no deckId) by matching deck name', async () => {
+    it('reassigns legacy name-only cards (no deckId) by matching deck name', async () => {
       mockFlashcardCollectionRef.get.mockReset();
       mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
       const deckSnap = { exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) };
       const legacyCard = cardDoc('card-l', { deck: 'Spanish', front: 'L' });
-      mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue(deckSnap) });
+      // Use mockReturnValueOnce so beforeEach's mockImplementation handles findOrCreateDeckByName.
+      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
       mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
       mockFlashcardCollectionRef.get
         .mockResolvedValueOnce({ docs: [] })           // by deckId — none
@@ -1365,9 +1365,9 @@ describe('Deck Service', () => {
 
       const result = await deleteDeck('deck-1', 'Test Key');
 
-      expect(result).toEqual({ deleted: true, detachedCards: 1 });
+      expect(result).toEqual({ deleted: true, reassignedCards: 1 });
       const updateCall = batchUpdate.mock.calls[0][1] as Record<string, unknown>;
-      expect(updateCall).toMatchObject({ deck: expect.anything(), updatedAt: expect.anything() });
+      expect(updateCall).toMatchObject({ deckId: 'uncategorized-deck', deck: 'Uncategorized', updatedAt: expect.anything() });
     });
 
     it('returns null when the deck does not exist', async () => {
@@ -1378,12 +1378,21 @@ describe('Deck Service', () => {
       expect(result).toBeNull();
     });
 
+    it('rejects deletion of the Uncategorized placeholder deck (ProtectedDeckError)', async () => {
+      const uncatSnap = { exists: true, data: () => ({ name: 'Uncategorized', ownerId: 'Test Key' }) };
+      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(uncatSnap) });
+
+      await expect(deleteDeck('deck-uncat', 'Test Key'))
+        .rejects.toThrow('Cannot delete the "Uncategorized" deck');
+    });
+
     it('does not delete a deck whose id was reused by a different deck (name changed)', async () => {
       mockFlashcardCollectionRef.get.mockReset();
       mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
       const deckSnap = { exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) };
       const reusedSnap = { exists: true, data: () => ({ name: 'OTHER' }) };
-      mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue(deckSnap) });
+      // Use mockReturnValueOnce so beforeEach's mockImplementation handles findOrCreateDeckByName.
+      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
       mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
       mockFlashcardCollectionRef.get
         .mockResolvedValueOnce({ docs: [] }) // by deckId
@@ -1400,7 +1409,7 @@ describe('Deck Service', () => {
 
       const result = await deleteDeck('deck-1', 'Test Key');
 
-      expect(result).toEqual({ deleted: true, detachedCards: 0 });
+      expect(result).toEqual({ deleted: true, reassignedCards: 0 });
       expect(transaction.delete).not.toHaveBeenCalled();
     });
   });
@@ -1469,6 +1478,83 @@ describe('Deck Service', () => {
       expect(mockBatch.update).not.toHaveBeenCalledWith(migratedCards[0].ref, expect.anything());
       expect(mockBatch.update).toHaveBeenCalledWith(unmigratedCard.ref, expect.objectContaining({ deckId: 'deck-french' }));
       expect(mockFlashcardCollectionRef.startAfter).toHaveBeenCalled();
+    });
+  });
+
+  describe('assignDecklessToDefault', () => {
+    it('assigns deckless cards to Uncategorized and returns count', async () => {
+      mockFlashcardCollectionRef.get.mockReset();
+      // Page: one deckless card, one already-decked card.
+      const decklessCard = { id: 'c1', ref: { update: jest.fn() }, data: () => ({ front: 'A' }) };
+      const deckedCard = { id: 'c2', ref: { update: jest.fn() }, data: () => ({ front: 'B', deckId: 'd1', deck: 'Spanish' }) };
+      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [decklessCard, deckedCard], empty: false, size: 2 });
+
+      // findOrCreateDeckByName for Uncategorized: .where().limit().get() → empty, then .doc().set().
+      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
+      mockDeckCollectionRef.doc.mockReturnValue({ id: 'uncat-id', set: jest.fn().mockResolvedValue(undefined) });
+
+      // Mock batch for the assignment.
+      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
+      mockDb.batch.mockReturnValue(batch);
+
+      const result = await assignDecklessToDefault('Test Key');
+
+      expect(result).toEqual({ assigned: 1 });
+      expect(batch.update).toHaveBeenCalledTimes(1);
+      expect(batch.update).toHaveBeenCalledWith(decklessCard.ref, expect.objectContaining({
+        deckId: 'uncat-id',
+        deck: 'Uncategorized',
+      }));
+      expect(batch.commit).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns 0 when no deckless cards exist', async () => {
+      mockFlashcardCollectionRef.get.mockReset();
+      const deckedCard = { id: 'c1', ref: { update: jest.fn() }, data: () => ({ front: 'A', deckId: 'd1', deck: 'Spanish' }) };
+      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [deckedCard], empty: false, size: 1 });
+
+      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
+      mockDeckCollectionRef.doc.mockReturnValue({ id: 'uncat-id', set: jest.fn().mockResolvedValue(undefined) });
+
+      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
+      mockDb.batch.mockReturnValue(batch);
+
+      const result = await assignDecklessToDefault('Test Key');
+
+      expect(result).toEqual({ assigned: 0 });
+      expect(batch.update).not.toHaveBeenCalled();
+      expect(batch.commit).not.toHaveBeenCalled();
+    });
+
+    it('pages through results and assigns multiple deckless cards across batches', async () => {
+      mockFlashcardCollectionRef.get.mockReset();
+      const cards = Array.from({ length: 5 }, (_, i) => ({
+        id: `c${i}`,
+        ref: { update: jest.fn() },
+        data: () => ({ front: `F${i}` }), // no deckId, no deck
+      }));
+      // Page 1: 5 deckless cards (full page, so hasMore=true).
+      mockFlashcardCollectionRef.get.mockResolvedValueOnce({ docs: cards, empty: false, size: 5 });
+      // Page 2: empty → stop.
+      mockFlashcardCollectionRef.get.mockResolvedValueOnce({ docs: [], empty: true, size: 0 });
+
+      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
+      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
+      mockDeckCollectionRef.doc.mockReturnValue({ id: 'uncat-id', set: jest.fn().mockResolvedValue(undefined) });
+
+      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
+      mockDb.batch.mockReturnValue(batch);
+
+      const result = await assignDecklessToDefault('Test Key');
+
+      expect(result).toEqual({ assigned: 5 });
+      expect(batch.update).toHaveBeenCalledTimes(5);
+      expect(batch.commit).toHaveBeenCalledTimes(1);
     });
   });
 });

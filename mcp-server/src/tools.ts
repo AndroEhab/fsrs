@@ -82,7 +82,7 @@ export interface CardSummary {
   id: string;
   front: string;
   back: string;
-  /** Stable deck reference; absent when the card has no deck. */
+  /** Stable deck reference; every newly created card has one. Legacy documents may lack it. */
   deckId?: string;
   /** Denormalized deck name; kept for readable/legacy filtering. */
   deck?: string;
@@ -472,10 +472,10 @@ const flashcardObjectSchema = z.object(flashcardShape);
 const flashcardInputShape = {
   front: z.string().min(1, 'Front cannot be empty').max(10000, 'Front too long'),
   back: z.string().min(1, 'Back cannot be empty').max(10000, 'Back too long'),
-  /** Stable deck reference (decks collection). */
-  deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').nullable().optional(),
-  /** Legacy deck name (find-or-create). Kept for backward compatibility. */
-  deck: z.string().max(100, 'Deck name too long').nullable().optional(),
+  /** Stable deck reference. Omit to assign to the default "Uncategorized" deck. */
+  deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
+  /** Legacy deck name (find-or-create). Omit to assign to "Uncategorized". */
+  deck: z.string().max(100, 'Deck name too long').optional(),
   /** Optional topic label (subject-area grouping). null clears it. */
   topic: z.string().min(1, 'Topic cannot be empty').max(200, 'Topic too long').nullable().optional(),
   /** Suspends (true) / unsuspends (false) the card. */
@@ -674,7 +674,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Create a flashcard',
       description:
-        'Creates a flashcard with a front (question), a back (answer), and optional deck, tags, topic, and suspended state. Assign the card to a deck with deckId (the stable deck id from create_deck/list_decks) — the recommended way — or with a legacy deck name (deck) which the backend finds-or-creates. topic is an optional free-form subject label (searchable via search_cards); suspended (boolean, default false) is a persisted attribute you can filter on with search_cards. The backend assigns a server-generated id and initial FSRS scheduling state (new cards are due immediately). Returns the created card including its id. Create one card per call.',
+        'Creates a flashcard with a front (question), a back (answer), and optional deck, tags, topic, and suspended state. When deckId and deck are both omitted, the card is assigned to the default "Uncategorized" deck. Assign the card to a specific deck with deckId (the stable deck id from create_deck/list_decks) — the recommended way — or with a legacy deck name (deck) which the backend finds-or-creates. topic is an optional free-form subject label (searchable via search_cards); suspended (boolean, default false) is a persisted attribute you can filter on with search_cards. The backend assigns a server-generated id and initial FSRS scheduling state (new cards are due immediately). Returns the created card including its id. Create one card per call.',
       inputSchema: flashcardInputShape,
       outputSchema: flashcardShape,
       annotations: {
@@ -684,7 +684,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
         openWorldHint: true,
       },
     },
-    async (args: { front: string; back: string; deckId?: string | null; deck?: string | null; topic?: string | null; suspended?: boolean; tags?: string[] }) => {
+    async (args: { front: string; back: string; deckId?: string; deck?: string; topic?: string | null; suspended?: boolean; tags?: string[] }) => {
       requireKey();
       const card = await bridge.createFlashcard({
         front: args.front,
@@ -1131,13 +1131,13 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Update a flashcard',
       description:
-        'Updates editable fields of an existing flashcard by id. Only the fields present in the arguments are changed; omitted fields keep their current values. Assign or move the card with deckId (stable deck id — preferred) or legacy deck name (deck); pass deckId: null (or deck: null) to detach the card from its deck. Pass tags to replace the full tag set; topic sets/updates the subject label (topic: null clears it); suspended toggles the persisted suspended attribute (queryable via search_cards). Changing front or back does not reset scheduling.',
+        'Updates editable fields of an existing flashcard by id. Only the fields present in the arguments are changed; omitted fields keep their current values. Assign or move the card with deckId (stable deck id — preferred) or legacy deck name (deck). Pass tags to replace the full tag set; topic sets/updates the subject label (topic: null clears it); suspended toggles the persisted suspended attribute (queryable via search_cards). Changing front or back does not reset scheduling.',
       inputSchema: {
         id: z.string().min(1, 'id is required'),
         front: z.string().min(1, 'Front cannot be empty').max(10000, 'Front too long').optional(),
         back: z.string().min(1, 'Back cannot be empty').max(10000, 'Back too long').optional(),
-        deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').nullable().optional(),
-        deck: z.string().max(100, 'Deck name too long').nullable().optional(),
+        deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
+        deck: z.string().max(100, 'Deck name too long').optional(),
         topic: z.string().min(1, 'Topic cannot be empty').max(200, 'Topic too long').nullable().optional(),
         suspended: z.boolean().optional(),
         tags: z.array(z.string().min(1, 'Tags cannot be empty').max(50, 'Tag too long')).max(20, 'Too many tags').optional(),
@@ -1150,7 +1150,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
         openWorldHint: true,
       },
     },
-    async (args: { id: string; front?: string; back?: string; deckId?: string | null; deck?: string | null; topic?: string | null; suspended?: boolean; tags?: string[] }) => {
+    async (args: { id: string; front?: string; back?: string; deckId?: string; deck?: string; topic?: string | null; suspended?: boolean; tags?: string[] }) => {
       requireKey();
       const { id, ...input } = args;
       const card = await bridge.updateFlashcard(id, input);
@@ -1194,7 +1194,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Create multiple flashcards',
       description:
-        'Atomically creates up to 100 flashcards in one request. Each item has a front (question), a back (answer), and optional deck (deckId — stable deck id preferred — or legacy deck name), tags, topic (free-form subject label), and suspended (boolean, default false). The backend validates every item (including that referenced deck ids exist) before writing and commits the whole batch in a single Firestore batch — either all cards are created or none are (no partial success). Returns every created card with its server-assigned id. Prefer this over calling create_flashcard repeatedly when the user asks for several cards at once.',
+        'Atomically creates up to 100 flashcards in one request. Each item has a front (question), a back (answer), and optional deck (deckId — stable deck id preferred — or legacy deck name), tags, topic (free-form subject label), and suspended (boolean, default false). When deckId and deck are both omitted, the card is assigned to the default "Uncategorized" deck. The backend validates every item (including that referenced deck ids exist) before writing and commits the whole batch in a single Firestore batch — either all cards are created or none are (no partial success). Returns every created card with its server-assigned id. Prefer this over calling create_flashcard repeatedly when the user asks for several cards at once.',
       inputSchema: {
         cards: z.array(z.object(flashcardInputShape)).min(1, 'At least one card is required').max(100, 'No more than 100 cards per request'),
       },
@@ -1208,7 +1208,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
         openWorldHint: true,
       },
     },
-    async (args: { cards: Array<{ front: string; back: string; deckId?: string | null; deck?: string | null; topic?: string | null; suspended?: boolean; tags?: string[] }> }) => {
+    async (args: { cards: Array<{ front: string; back: string; deckId?: string; deck?: string; topic?: string | null; suspended?: boolean; tags?: string[] }> }) => {
       requireKey();
       const result = await bridge.bulkCreateFlashcards({
         cards: args.cards.map((c) => ({
@@ -1237,14 +1237,14 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Update multiple flashcards',
       description:
-        'Atomically updates up to 100 existing flashcards in one request. Each item must include the card id plus any of front/back/deckId/deck/topic/suspended/tags to change (omitted fields keep their current values). Move cards between decks with deckId (stable deck id — preferred) or legacy deck name (deck); pass deckId: null (or deck: null) to detach a card from its deck; topic: null clears the topic; suspended sets the persisted suspended attribute (queryable via search_cards). The backend validates every item (including referenced deck ids), checks every id inside a single Firestore transaction, and commits atomically — either every update lands or none do. Returns the updated cards (ids that did not exist are omitted). Use this when several cards need the same fix (e.g. retagging or deck moves).',
+        'Atomically updates up to 100 existing flashcards in one request. Each item must include the card id plus any of front/back/deckId/deck/topic/suspended/tags to change (omitted fields keep their current values). Move cards between decks with deckId (stable deck id — preferred) or legacy deck name (deck); topic: null clears the topic; suspended sets the persisted suspended attribute (queryable via search_cards). The backend validates every item (including referenced deck ids), checks every id inside a single Firestore transaction, and commits atomically — either every update lands or none do. Returns the updated cards (ids that did not exist are omitted). Use this when several cards need the same fix (e.g. retagging or deck moves).',
       inputSchema: {
         cards: z.array(z.object({
           id: z.string().min(1, 'id is required'),
           front: z.string().min(1, 'Front cannot be empty').max(10000, 'Front too long').optional(),
           back: z.string().min(1, 'Back cannot be empty').max(10000, 'Back too long').optional(),
-          deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').nullable().optional(),
-          deck: z.string().max(100, 'Deck name too long').nullable().optional(),
+          deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
+          deck: z.string().max(100, 'Deck name too long').optional(),
           topic: z.string().min(1, 'Topic cannot be empty').max(200, 'Topic too long').nullable().optional(),
           suspended: z.boolean().optional(),
           tags: z.array(z.string().min(1, 'Tags cannot be empty').max(50, 'Tag too long')).max(20, 'Too many tags').optional(),
@@ -1260,7 +1260,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
         openWorldHint: true,
       },
     },
-    async (args: { cards: Array<{ id: string; front?: string; back?: string; deckId?: string | null; deck?: string | null; topic?: string | null; suspended?: boolean; tags?: string[] }> }) => {
+    async (args: { cards: Array<{ id: string; front?: string; back?: string; deckId?: string; deck?: string; topic?: string | null; suspended?: boolean; tags?: string[] }> }) => {
       requireKey();
       const result = await bridge.bulkUpdateFlashcards({
         cards: args.cards.map((c) => {
@@ -1284,7 +1284,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Delete multiple flashcards',
       description:
-        'Atomically deletes up to 100 flashcards by id in one request. The backend checks every id inside a single Firestore transaction and commits atomically — either every existing id is deleted or none are. Returns the ids actually deleted (ids that did not exist are omitted). Use this only when the user explicitly asks to delete several cards at once. To remove an entire deck, use delete_deck instead — it deletes the deck and detaches (does NOT delete) its cards.',
+        'Atomically deletes up to 100 flashcards by id in one request. The backend checks every id inside a single Firestore transaction and commits atomically — either every existing id is deleted or none are. Returns the ids actually deleted (ids that did not exist are omitted). Use this only when the user explicitly asks to delete several cards at once. To remove an entire deck, use delete_deck instead — it deletes the deck and reassigns (does NOT delete) its cards to Uncategorized.',
       inputSchema: {
         ids: z.array(z.string().min(1, 'id is required')).min(1, 'At least one id is required').max(100, 'No more than 100 ids per request'),
       },
@@ -1317,7 +1317,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Enroll large card sets safely',
       description:
-        'Enrolls a large set of flashcards (up to 10,000) in a resumable, idempotent workflow. The server chunks cards into ≤100-card groups stored in Firestore, each processed atomically via an onDocumentWritten trigger. Each card gets a deterministic document id derived from its full identity (front + back + tags + deckId + topic + suspended), so resending the same cards after a timeout resumes from the last completed chunk — never duplicates cards. Existing same-owner cards are skipped (scheduling state preserved). Returns the enrollment job id and progress. Use get_enrollment_status to poll progress. Prefer this over bulk_create_flashcards when the user wants to add more than 100 cards at once.',
+        'Enrolls a large set of flashcards (up to 10,000) in a resumable, idempotent workflow. The server chunks cards into ≤100-card groups stored in Firestore, each processed atomically via an onDocumentWritten trigger. Each card gets a deterministic document id derived from its full identity (front + back + tags + deckId + topic + suspended), so resending the same cards after a timeout resumes from the last completed chunk — never duplicates cards. When deckId and deck are both omitted, the card is assigned to the default "Uncategorized" deck. Existing same-owner cards are skipped (scheduling state preserved). Returns the enrollment job id and progress. Use get_enrollment_status to poll progress. Prefer this over bulk_create_flashcards when the user wants to add more than 100 cards at once.',
       inputSchema: {
         cards: z.array(z.object(flashcardInputShape))
           .min(1, 'At least one card is required')
@@ -1340,7 +1340,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
         openWorldHint: true,
       },
     },
-    async (args: { cards: Array<{ front: string; back: string; deckId?: string | null; deck?: string | null; topic?: string | null; suspended?: boolean; tags?: string[] }> }) => {
+    async (args: { cards: Array<{ front: string; back: string; deckId?: string; deck?: string; topic?: string | null; suspended?: boolean; tags?: string[] }> }) => {
       requireKey();
       const result = await bridge.bulkEnrollCards({
         cards: args.cards.map((c) => ({
@@ -1353,9 +1353,12 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
           ...(c.tags !== undefined ? { tags: c.tags } : {}),
         })),
       });
+      const retried = result.retriedChunkCount > 0
+        ? ` [retried ${result.retriedChunkCount} stuck chunk${result.retriedChunkCount === 1 ? '' : 's'}]`
+        : '';
       const text = result.status === 'completed'
         ? `Enrolled ${result.createdCount} flashcard${result.createdCount === 1 ? '' : 's'} across ${result.totalChunks} chunk${result.totalChunks === 1 ? '' : 's'} (job: ${result.jobId}).`
-        : `Enrollment ${result.status}: ${result.completedChunks}/${result.totalChunks} chunks processed, ${result.createdCount} created, ${result.failedCount} failed (job: ${result.jobId}). Poll get_enrollment_status for progress.`;
+        : `Enrollment ${result.status}: ${result.completedChunks}/${result.totalChunks} chunks processed, ${result.createdCount} created, ${result.failedCount} failed${retried} (job: ${result.jobId}). Poll get_enrollment_status for progress.`;
       return {
         content: [{ type: 'text' as const, text }],
         structuredContent: result,
@@ -1540,11 +1543,11 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Delete a deck',
       description:
-        'Deletes a deck by its server-assigned id. This is destructive to the DECK but NOT to its cards: the deck is removed and every card that referenced it is DETACHED (its deckId/deck fields are removed), leaving the cards themselves intact with all FSRS scheduling preserved. Cards are detached in chunked batches, so decks of any size can be deleted; if a batch fails partway, earlier detaches are already committed (the deck is not deleted) and retrying completes the rest. Returns { deleted: true, detachedCards: N }. Use this only when the user explicitly asks to delete a deck.',
+        'Deletes a deck by its server-assigned id. This is destructive to the DECK but NOT to its cards: the deck is removed and every card that referenced it is reassigned to Uncategorized, leaving the cards themselves intact with all FSRS scheduling preserved. Cards are reassigned in chunked batches, so decks of any size can be deleted; if a batch fails partway, earlier reassignments are already committed (the deck is not deleted) and retrying completes the rest. Returns { deleted: true, reassignedCards: N }. Use this only when the user explicitly asks to delete a deck.',
       inputSchema: { id: z.string().min(1, 'id is required') },
       outputSchema: z.object({
         deleted: z.boolean(),
-        detachedCards: z.number(),
+        reassignedCards: z.number(),
       }),
       annotations: {
         readOnlyHint: false,
@@ -1557,7 +1560,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
       requireKey();
       const result = await bridge.deleteDeck(args.id);
       return {
-        content: [{ type: 'text' as const, text: `Deleted deck ${args.id}. Detached ${result.detachedCards} card${result.detachedCards === 1 ? '' : 's'} (cards preserved).` }],
+        content: [{ type: 'text' as const, text: `Deleted deck ${args.id}. Reassigned ${result.reassignedCards} card${result.reassignedCards === 1 ? '' : 's'} to Uncategorized (cards preserved).` }],
         structuredContent: result,
       };
     },

@@ -226,10 +226,11 @@ describe('anki export service', () => {
     mockCardCollection.limit.mockReturnValue(mockCardCollection);
     mockCardCollection.orderBy.mockReturnValue(mockCardCollection);
     mockCardCollection.startAfter.mockReturnValue(mockCardCollection);
+    mockCardCollection.where.mockReturnValue(mockCardCollection);
   });
 
   function seedCards(count: number): void {
-    const docs = Array.from({ length: count }, (_, i) => ({
+    const allDocs = Array.from({ length: count }, (_, i) => ({
       id: `card-${String(i).padStart(3, '0')}`,
       exists: true,
       data: () => ({
@@ -239,8 +240,21 @@ describe('anki export service', () => {
         reps: 0, lapses: 0, reviewLog: [], images: [],
       }),
     }));
+    // Track where() calls to simulate deck filtering.
+    let deckFilter: string | null = null;
+    mockCardCollection.where.mockImplementation((_field: string, _op: string, value: unknown) => {
+      if (_field === 'deck') deckFilter = value as string;
+      return mockCardCollection;
+    });
     let calls = 0;
-    mockCardCollection.get.mockImplementation(() => { calls += 1; return Promise.resolve(calls === 1 ? { docs, empty: docs.length === 0 } : { docs: [], empty: true }); });
+    mockCardCollection.get.mockImplementation(() => {
+      calls += 1;
+      if (calls > 1) return Promise.resolve({ docs: [], empty: true });
+      const filtered = deckFilter !== null
+        ? allDocs.filter((d) => d.data().deck === deckFilter)
+        : allDocs;
+      return Promise.resolve({ docs: filtered, empty: filtered.length === 0 });
+    });
     mockCardCollection.limit.mockReturnValue(mockCardCollection);
     mockCardCollection.orderBy.mockReturnValue(mockCardCollection);
     mockCardCollection.startAfter.mockReturnValue(mockCardCollection);

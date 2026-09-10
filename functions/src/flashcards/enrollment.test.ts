@@ -29,10 +29,27 @@ function makeSnapshot(docId: string, data: Record<string, unknown> | undefined) 
   };
 }
 
-const mockBatch = {
-  set: jest.fn(),
-  commit: jest.fn().mockResolvedValue(undefined),
-};
+// Each batch() call gets its own isolated queue. Commit persists only
+// that batch's writes, then drains its queue. This prevents cross-batch
+// contamination (writeChunks leftovers bleeding into resume batches).
+function makeMockBatch() {
+  const sets: Array<{ ref: { id?: string; parent?: { id?: string } }; data: Record<string, unknown> }> = [];
+  return {
+    set: jest.fn((ref: { id?: string; parent?: { id?: string } }, data: Record<string, unknown>) => {
+      sets.push({ ref, data });
+    }),
+    commit: jest.fn(async () => {
+      for (const { ref, data } of sets) {
+        const docId = ref?.id ?? '';
+        const isChunk = ref?.parent?.id === 'chunks';
+        const store = isChunk ? chunkWrites : jobWrites;
+        store.set(docId, { ...data, id: docId });
+      }
+      sets.length = 0;
+    }),
+  };
+}
+let mockBatch = makeMockBatch();
 
 const mockFlashcardCollection = {
   _queryFilters: [] as Array<{ field: string; value: unknown }>,
@@ -112,6 +129,7 @@ const mockJobCollection = {
       update: jest.fn().mockImplementation((data: Record<string, unknown>) => {
         const prev = jobWrites.get(docId) || {};
         jobWrites.set(docId, { ...prev, ...data, id: docId });
+        return Promise.resolve();
       }),
       get: jest.fn().mockImplementation(() => {
         const d = jobWrites.get(docId);
@@ -133,6 +151,7 @@ const mockJobCollection = {
                 update: jest.fn().mockImplementation((data: Record<string, unknown>) => {
                   const prev = chunkWrites.get(cid) || {};
                   chunkWrites.set(cid, { ...prev, ...data });
+                  return Promise.resolve();
                 }),
                 get: jest.fn().mockImplementation(() => {
                   const d = chunkWrites.get(cid);
@@ -161,7 +180,7 @@ const mockDbInstance = {
     if (name === 'bulkEnrollmentJobs') return mockJobCollection;
     return mockFlashcardCollection;
   }),
-  batch: jest.fn(() => mockBatch),
+  batch: jest.fn(() => { mockBatch = makeMockBatch(); return mockBatch; }),
   runTransaction: jest.fn(async (fn: (t: { get: jest.Mock; update: jest.Mock }) => Promise<void>) => {
     // FieldValue.increment() is atomic server-side — it operates on the
     // LATEST state, not the snapshot value. We simulate this by applying
@@ -294,9 +313,6 @@ describe('bulkEnrollCards', () => {
     jobWrites.clear();
     chunkWrites.clear();
     flashcardWrites.clear();
-    mockBatch.set.mockClear();
-    mockBatch.commit.mockClear();
-    mockBatch.commit.mockResolvedValue(undefined);
   });
 
   it('returns immediately with status=processing', async () => {
@@ -369,9 +385,6 @@ describe('onEnrollmentChunkWritten (trigger)', () => {
     chunkWrites.clear();
     flashcardWrites.clear();
     mockFlashcardCollection._queryFilters = [];
-    mockBatch.set.mockClear();
-    mockBatch.commit.mockClear();
-    mockBatch.commit.mockResolvedValue(undefined);
   });
 
   it('processes a chunk and updates job progress', async () => {
@@ -439,14 +452,10 @@ describe('onEnrollmentChunkWritten (trigger)', () => {
 
     // Second event with STALE snapshot (still says 'pending')
     // The transaction reads CURRENT state → sees 'completed' → no-op
-    mockBatch.set.mockClear();
-    mockBatch.commit.mockClear();
     await onEnrollmentChunkWritten(makeChunkEvent(jobId, chunkId, {
       chunkIndex: 0, cards, cardCount: 1, status: 'pending', ownerId: OWNER,
     }));
-    expect(mockBatch.set).not.toHaveBeenCalled();
-    expect(mockBatch.commit).not.toHaveBeenCalled();
-    // Job counters unchanged
+    // Job counters unchanged — trigger short-circuited
     expect(jobWrites.get(jobId)?.createdCount).toBe(1);
   });
 
@@ -500,12 +509,10 @@ describe('onEnrollmentChunkWritten (trigger)', () => {
     // Mark chunk as completed (simulating trigger's update)
     chunkWrites.set(chunkId, { ...chunkWrites.get(chunkId)!, status: 'completed' });
 
-    // Second trigger on same chunk — should short-circuit
-    mockBatch.set.mockClear();
-    mockBatch.commit.mockClear();
+    // Second trigger on same chunk — should short-circuit (no duplicate writes)
     await onEnrollmentChunkWritten(makeChunkEvent(jobId, chunkId, chunkWrites.get(chunkId)!));
-    expect(mockBatch.set).not.toHaveBeenCalled();
-    expect(mockBatch.commit).not.toHaveBeenCalled();
+    // Job counters unchanged — idempotent
+    expect(jobWrites.get(jobId)?.createdCount).toBe(1);
   });
 
   it('TWO CHUNKS processed in sequence: progress accumulates correctly via FieldValue.increment()', async () => {
@@ -780,5 +787,390 @@ describe('getEnrollmentStatus', () => {
       createdAt: now, updatedAt: now,
     });
     expect(await getEnrollmentStatus('j2', OWNER)).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Self-healing / reliability tests                                    */
+/* ------------------------------------------------------------------ */
+
+describe('resume self-healing', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jobWrites.clear();
+    chunkWrites.clear();
+    flashcardWrites.clear();
+    mockFlashcardCollection._queryFilters = [];
+  });
+
+  it('RESUME FROM FAILED JOB: failed → processing, non-completed chunks rewritten', async () => {
+    // 250 cards → 3 chunks (100+100+50)
+    const cards = Array.from({ length: 250 }, (_, i) => makeCard(`Q${i}`, `A${i}`, []));
+    const r = await bulkEnrollCards({ cards }, OWNER);
+    expect(r.totalChunks).toBe(3);
+
+    // Simulate: chunk 0 completed, chunks 1-2 pending, job marked failed.
+    jobWrites.set(r.jobId, {
+      ...jobWrites.get(r.jobId),
+      status: 'failed',
+      completedChunks: 1, createdCount: 100, failedCount: 0, skippedCount: 0,
+    });
+    chunkWrites.set('00000', {
+      chunkIndex: 0, cards: cards.slice(0, 100), cardCount: 100,
+      status: 'completed', createdCount: 100, skippedCount: 0,
+      failedCount: 0, ownerId: OWNER,
+    });
+    chunkWrites.set('00001', {
+      chunkIndex: 1, cards: cards.slice(100, 200), cardCount: 100,
+      status: 'pending', ownerId: OWNER,
+    });
+    // Chunk 2 missing (partial batch write failure).
+
+    const r2 = await bulkEnrollCards({ cards }, OWNER);
+    expect(r2.status).toBe('processing');
+    expect(jobWrites.get(r2.jobId)?.status).toBe('processing');
+    // 2 chunks retried: chunk 1 (pending) + chunk 2 (missing)
+    expect(r2.retriedChunkCount).toBe(2);
+    // Chunk 0 untouched
+    expect(chunkWrites.get('00000')?.status).toBe('completed');
+    // Missing chunk 2 recreated from input.cards
+    expect(chunkWrites.get('00002')?.cardCount).toBe(50);
+  });
+
+  it('RESUME WITH MISSING CHUNKS: chunks never written are recreated from input.cards', async () => {
+    const cards = Array.from({ length: 250 }, (_, i) => makeCard(`Q${i}`, `A${i}`, []));
+    const r = await bulkEnrollCards({ cards }, OWNER);
+    expect(r.totalChunks).toBe(3);
+
+    // Simulate: chunk 0 completed, chunks 1-2 never written.
+    jobWrites.set(r.jobId, {
+      ...jobWrites.get(r.jobId),
+      status: 'processing',
+      completedChunks: 1, createdCount: 100,
+    });
+    chunkWrites.set('00000', {
+      chunkIndex: 0, cards: cards.slice(0, 100), cardCount: 100,
+      status: 'completed', createdCount: 100, skippedCount: 0,
+      failedCount: 0, ownerId: OWNER,
+    });
+    // Chunks 1 and 2 not in chunkWrites (missing).
+
+    const r2 = await bulkEnrollCards({ cards }, OWNER);
+    expect(r2.retriedChunkCount).toBe(2);
+    // Missing chunks reconstructed from input.cards
+    expect(chunkWrites.get('00001')?.status).toBe('pending');
+    expect(chunkWrites.get('00001')?.cardCount).toBe(100);
+    expect(chunkWrites.get('00002')?.status).toBe('pending');
+    expect(chunkWrites.get('00002')?.cardCount).toBe(50);
+    // Chunk 0 untouched
+    expect(chunkWrites.get('00000')?.status).toBe('completed');
+  });
+
+  it('RESUME STUCK PROCESSING CHUNK: chunk in processing state is rewritten', async () => {
+    const cards = Array.from({ length: 250 }, (_, i) => makeCard(`Q${i}`, `A${i}`, []));
+    const r = await bulkEnrollCards({ cards }, OWNER);
+    expect(r.totalChunks).toBe(3);
+
+    // Simulate: chunk 0 stuck in 'processing' (tx failed after card writes).
+    // Chunks 1-2 pending.
+    jobWrites.set(r.jobId, {
+      ...jobWrites.get(r.jobId),
+      status: 'processing',
+      completedChunks: 0,
+    });
+    chunkWrites.set('00000', {
+      chunkIndex: 0, cards: cards.slice(0, 100), cardCount: 100,
+      status: 'processing', ownerId: OWNER,
+    });
+    chunkWrites.set('00001', {
+      chunkIndex: 1, cards: cards.slice(100, 200), cardCount: 100,
+      status: 'pending', ownerId: OWNER,
+    });
+    // Chunk 2 missing.
+
+    const r2 = await bulkEnrollCards({ cards }, OWNER);
+    // All 3 chunks retried (none completed)
+    expect(r2.retriedChunkCount).toBe(3);
+    expect(chunkWrites.get('00000')?.status).toBe('pending');
+    expect(chunkWrites.get('00001')?.status).toBe('pending');
+    expect(chunkWrites.get('00002')?.status).toBe('pending');
+  });
+
+  it('SCHEDULING PRESERVED after resume: retried chunks don\'t reset existing cards', async () => {
+    const cards = Array.from({ length: 250 }, (_, i) => makeCard(`Q${i}`, `A${i}`, []));
+    const r = await bulkEnrollCards({ cards }, OWNER);
+
+    // Pre-seed card 0 with mature scheduling state
+    const cardKey = expectedCardKey(OWNER, 'Q0', 'A0', []);
+    flashcardWrites.set(cardKey, {
+      ownerId: OWNER, front: 'Q0', back: 'A0', tags: [],
+      state: 2, stability: 15.5, difficulty: 0.3, reps: 10, lapses: 2,
+      reviewLog: [{ rating: 3, reviewedAt: '2026-01-01' }],
+      images: [{ url: 'img.png' }],
+      createdAt: { toDate: () => new Date('2026-01-01') },
+    });
+
+    // Simulate failed job
+    jobWrites.set(r.jobId, {
+      ...jobWrites.get(r.jobId), status: 'failed', completedChunks: 0,
+    });
+    chunkWrites.set('00000', {
+      chunkIndex: 0, cards: cards.slice(0, 100), cardCount: 100,
+      status: 'pending', ownerId: OWNER,
+    });
+
+    // Resume → triggers chunk reprocessing
+    const r2 = await bulkEnrollCards({ cards }, OWNER);
+    expect(r2.retriedChunkCount).toBeGreaterThan(0);
+
+    // Simulate trigger reprocessing chunk 0
+    await onEnrollmentChunkWritten(makeChunkEvent(r2.jobId, '00000', chunkWrites.get('00000')!));
+
+    // Card already exists with mature scheduling — trigger sees
+    // deterministic key hit (same owner) → SKIPS, preserving scheduling.
+    expect(flashcardWrites.get(cardKey)?.stability).toBe(15.5);
+    expect(flashcardWrites.get(cardKey)?.reps).toBe(10);
+  });
+});
+
+describe('trigger error observability', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jobWrites.clear();
+    chunkWrites.clear();
+    flashcardWrites.clear();
+    mockFlashcardCollection._queryFilters = [];
+  });
+
+  it('processChunk failure: parent job marked failed with error, chunk remains requeueable', async () => {
+    const jobId = 'err-job';
+    const chunkId = '00000';
+    const cards = [makeCard('Q1', 'A1', [])];
+    jobWrites.set(jobId, {
+      id: jobId, ownerId: OWNER, status: 'processing',
+      totalCards: 1, totalChunks: 1, completedChunks: 0,
+      createdCount: 0, skippedCount: 0, failedCount: 0,
+      createdAt: { toDate: () => new Date() }, updatedAt: { toDate: () => new Date() },
+    });
+    chunkWrites.set(chunkId, {
+      chunkIndex: 0, cards, cardCount: 1, status: 'pending', ownerId: OWNER,
+    });
+
+    // Make processChunk throw (batch.commit fails).
+    // Intercept batch AFTER processChunk creates it.
+    const origBatchFn = mockDbInstance.batch;
+    mockDbInstance.batch = jest.fn(() => {
+      const b = makeMockBatch();
+      b.commit = jest.fn(async () => { throw new Error('Firestore timeout'); }) as jest.Mock;
+      return b;
+    });
+
+    await expect(
+      onEnrollmentChunkWritten(makeChunkEvent(jobId, chunkId, chunkWrites.get(chunkId)!)),
+    ).rejects.toThrow('Firestore timeout');
+
+    mockDbInstance.batch = origBatchFn;
+
+    // Chunk: error recorded, status unchanged (requeueable)
+    expect(chunkWrites.get(chunkId)?.lastError).toBe('Firestore timeout');
+    expect(chunkWrites.get(chunkId)?.lastErrorAt).toBeDefined();
+    expect(chunkWrites.get(chunkId)?.status).toBe('pending');
+    // Parent job: marked failed with actionable error
+    expect(jobWrites.get(jobId)?.status).toBe('failed');
+    expect(jobWrites.get(jobId)?.error).toContain('Firestore timeout');
+
+    // getEnrollmentStatus surfaces the failure
+    const status = await getEnrollmentStatus(jobId, OWNER);
+    expect(status).not.toBeNull();
+    expect(status!.status).toBe('failed');
+    expect(status!.error).toContain('Firestore timeout');
+  });
+
+  it('transaction failure: parent job marked failed, chunk remains requeueable', async () => {
+    const jobId = 'tx-err-job';
+    const chunkId = '00000';
+    const cards = [makeCard('Q1', 'A1', [])];
+    jobWrites.set(jobId, {
+      id: jobId, ownerId: OWNER, status: 'processing',
+      totalCards: 1, totalChunks: 1, completedChunks: 0,
+      createdCount: 0, skippedCount: 0, failedCount: 0,
+      createdAt: { toDate: () => new Date() }, updatedAt: { toDate: () => new Date() },
+    });
+    chunkWrites.set(chunkId, {
+      chunkIndex: 0, cards, cardCount: 1, status: 'pending', ownerId: OWNER,
+    });
+
+    // processChunk succeeds, but transaction fails
+    const origRunTx = mockDbInstance.runTransaction;
+    mockDbInstance.runTransaction = jest.fn().mockRejectedValue(
+      new Error('transaction conflict'),
+    );
+
+    await expect(
+      onEnrollmentChunkWritten(makeChunkEvent(jobId, chunkId, chunkWrites.get(chunkId)!)),
+    ).rejects.toThrow('transaction conflict');
+
+    // Chunk: error recorded, status unchanged (requeueable)
+    expect(chunkWrites.get(chunkId)?.lastError).toBe('transaction conflict');
+    expect(chunkWrites.get(chunkId)?.lastErrorAt).toBeDefined();
+    expect(chunkWrites.get(chunkId)?.status).toBe('pending');
+    // Parent job: marked failed with actionable error
+    expect(jobWrites.get(jobId)?.status).toBe('failed');
+    expect(jobWrites.get(jobId)?.error).toContain('transaction conflict');
+
+    // getEnrollmentStatus surfaces the failure
+    const status = await getEnrollmentStatus(jobId, OWNER);
+    expect(status).not.toBeNull();
+    expect(status!.status).toBe('failed');
+    expect(status!.error).toContain('transaction conflict');
+
+    mockDbInstance.runTransaction = origRunTx;
+  });
+
+  it('full recovery cycle: failed job → exact re-submit → processing → trigger → completed, preserving schedule', async () => {
+    const cards = [makeCard('Q1', 'A1', [])];
+    const cardKey = expectedCardKey(OWNER, 'Q1', 'A1', []);
+
+    // First submission creates the job with real computed jobId
+    const r0 = await bulkEnrollCards({ cards }, OWNER);
+    const jobId = r0.jobId;
+    const chunkId = '00000';
+
+    // Make processChunk throw (batch.commit fails) via batch intercept
+    const origBatchFn = mockDbInstance.batch;
+    mockDbInstance.batch = jest.fn(() => {
+      const b = makeMockBatch();
+      b.commit = jest.fn(async () => { throw new Error('write failed'); }) as jest.Mock;
+      return b;
+    });
+
+    // Step 1: Trigger fires, processChunk fails, error handler marks job failed
+    await onEnrollmentChunkWritten(makeChunkEvent(jobId, chunkId, chunkWrites.get(chunkId)!)).catch(() => {});
+    mockDbInstance.batch = origBatchFn;
+    expect(jobWrites.get(jobId)?.status).toBe('failed');
+    expect(chunkWrites.get(chunkId)?.status).toBe('pending');
+
+    // Step 2: getEnrollmentStatus observes the failure
+    const failedStatus = await getEnrollmentStatus(jobId, OWNER);
+    expect(failedStatus!.status).toBe('failed');
+    expect(failedStatus!.error).toContain('write failed');
+
+    // Step 3: Pre-seed card with mature scheduling (user reviewed it
+    // between the failure and the re-submit).
+    flashcardWrites.set(cardKey, {
+      ownerId: OWNER, front: 'Q1', back: 'A1', tags: [],
+      state: 2, stability: 20.0, difficulty: 0.5, reps: 15, lapses: 1,
+      reviewLog: [{ rating: 4, reviewedAt: '2026-06-01' }],
+      createdAt: { toDate: () => new Date('2026-01-01') },
+    });
+
+    // Step 4: Exact re-submit transitions failed → processing
+    const r = await bulkEnrollCards({ cards }, OWNER);
+    expect(r.jobId).toBe(jobId);
+    expect(r.status).toBe('processing');
+    expect(jobWrites.get(jobId)?.status).toBe('processing');
+    expect(r.retriedChunkCount).toBe(1);
+
+    // Step 5: Trigger fires again — sees existing card, skips write,
+    // scheduling preserved. Job completed.
+    await onEnrollmentChunkWritten(makeChunkEvent(jobId, chunkId, chunkWrites.get(chunkId)!));
+    expect(jobWrites.get(jobId)?.status).toBe('completed');
+    expect(jobWrites.get(jobId)?.completedChunks).toBe(1);
+    expect(flashcardWrites.get(cardKey)?.stability).toBe(20.0);
+    expect(flashcardWrites.get(cardKey)?.reps).toBe(15);
+  });
+});
+
+describe('1000+ card bulk enrollment', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jobWrites.clear();
+    chunkWrites.clear();
+    flashcardWrites.clear();
+    mockFlashcardCollection._queryFilters = [];
+  });
+
+  it('1200 cards: resume self-heals stuck + missing chunks, trigger completes', async () => {
+    const cards = Array.from({ length: 1200 }, (_, i) => makeCard(`Q${i}`, `A${i}`, []));
+    const r = await bulkEnrollCards({ cards }, OWNER);
+    expect(r.totalChunks).toBe(12);
+
+    // Simulate: chunks 0-8 completed, chunk 9 stuck, chunks 10-11 missing.
+    jobWrites.set(r.jobId, {
+      ...jobWrites.get(r.jobId),
+      status: 'processing',
+      completedChunks: 9, createdCount: 900,
+    });
+    for (let i = 0; i < 9; i++) {
+      const padded = String(i).padStart(5, '0');
+      chunkWrites.set(padded, {
+        chunkIndex: i, cards: cards.slice(i * 100, (i + 1) * 100), cardCount: 100,
+        status: 'completed', createdCount: 100, skippedCount: 0,
+        failedCount: 0, ownerId: OWNER,
+      });
+    }
+    chunkWrites.set('00009', {
+      chunkIndex: 9, cards: cards.slice(900, 1000), cardCount: 100,
+      status: 'processing', ownerId: OWNER,
+    });
+
+    const r2 = await bulkEnrollCards({ cards }, OWNER);
+    expect(r2.retriedChunkCount).toBe(3);
+    expect(chunkWrites.get('00008')?.status).toBe('completed');
+    expect(chunkWrites.get('00009')?.status).toBe('pending');
+    expect(chunkWrites.get('00010')?.cardCount).toBe(100);
+    expect(chunkWrites.get('00011')?.cardCount).toBe(100);
+
+    // Complete all retried chunks via trigger
+    for (const cid of ['00009', '00010', '00011']) {
+      await onEnrollmentChunkWritten(makeChunkEvent(r2.jobId, cid, chunkWrites.get(cid)!));
+    }
+    expect(jobWrites.get(r2.jobId)?.completedChunks).toBe(12);
+    expect(jobWrites.get(r2.jobId)?.status).toBe('completed');
+  });
+
+  it('1000 cards: all new cards get fresh scheduling via trigger', async () => {
+    const cards = Array.from({ length: 1000 }, (_, i) => makeCard(`Q${i}`, `A${i}`, []));
+    const r = await bulkEnrollCards({ cards }, OWNER);
+    expect(r.totalChunks).toBe(10);
+
+    for (let i = 0; i < 10; i++) {
+      const padded = String(i).padStart(5, '0');
+      await onEnrollmentChunkWritten(makeChunkEvent(r.jobId, padded, chunkWrites.get(padded)!));
+    }
+    expect(jobWrites.get(r.jobId)?.status).toBe('completed');
+    expect(jobWrites.get(r.jobId)?.createdCount).toBe(1000);
+  });
+
+  it('1500 cards: failed job → resume → all chunks complete', async () => {
+    const cards = Array.from({ length: 1500 }, (_, i) => makeCard(`Q${i}`, `A${i}`, []));
+    const r = await bulkEnrollCards({ cards }, OWNER);
+    expect(r.totalChunks).toBe(15);
+
+    // Simulate: chunks 0-4 completed, job failed, chunks 5-14 missing.
+    jobWrites.set(r.jobId, {
+      ...jobWrites.get(r.jobId),
+      status: 'failed',
+      completedChunks: 5, createdCount: 500,
+    });
+    for (let i = 0; i < 5; i++) {
+      const padded = String(i).padStart(5, '0');
+      chunkWrites.set(padded, {
+        chunkIndex: i, cards: cards.slice(i * 100, (i + 1) * 100), cardCount: 100,
+        status: 'completed', createdCount: 100, skippedCount: 0,
+        failedCount: 0, ownerId: OWNER,
+      });
+    }
+
+    const r2 = await bulkEnrollCards({ cards }, OWNER);
+    expect(r2.status).toBe('processing');
+    expect(r2.retriedChunkCount).toBe(10);
+
+    for (let i = 5; i < 15; i++) {
+      const padded = String(i).padStart(5, '0');
+      await onEnrollmentChunkWritten(makeChunkEvent(r2.jobId, padded, chunkWrites.get(padded)!));
+    }
+    expect(jobWrites.get(r2.jobId)?.status).toBe('completed');
+    expect(jobWrites.get(r2.jobId)?.createdCount).toBe(1500);
   });
 });

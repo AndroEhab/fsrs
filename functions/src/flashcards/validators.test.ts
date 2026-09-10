@@ -99,15 +99,17 @@ describe('Validators', () => {
       expect(() => validateCreateFlashcard({ front: 'F', back: 'B', tags: ['a'.repeat(51)] })).toThrow(ValidationError);
     });
 
-    it('accepts deckId and nullable deck fields', () => {
-      const result = validateCreateFlashcard({ front: 'F', back: 'B', deckId: 'deck-1', deck: null });
-      expect(result.deckId).toBe('deck-1');
-      expect(result.deck).toBeNull();
+    it('rejects null deckId (every card must belong to a deck)', () => {
+      expect(() => validateCreateFlashcard({ front: 'F', back: 'B', deckId: null })).toThrow(ValidationError);
     });
 
-    it('accepts deckId null to explicitly mean no deck', () => {
-      const result = validateCreateFlashcard({ front: 'F', back: 'B', deckId: null });
-      expect(result.deckId).toBeNull();
+    it('rejects null deck (every card must belong to a deck)', () => {
+      expect(() => validateCreateFlashcard({ front: 'F', back: 'B', deck: null })).toThrow(ValidationError);
+    });
+
+    it('accepts deckId without deck', () => {
+      const result = validateCreateFlashcard({ front: 'F', back: 'B', deckId: 'deck-1' });
+      expect(result.deckId).toBe('deck-1');
     });
 
     it('rejects empty deckId', () => {

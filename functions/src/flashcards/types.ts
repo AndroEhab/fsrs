@@ -19,7 +19,15 @@ export const CARD_TYPE_LABELS: Record<CardType, string> = {
 };
 
 /**
- * A cloze deletion marker embedded in `front` text, e.g. `[Berlin]` in
+/**
+ * Name of the placeholder deck assigned to cards created without an explicit
+ * deck.  Used by `createFlashcard`, `bulkCreateFlashcards`, and the
+ * enrollment pipeline when the input omits both `deckId` and `deck`.
+ * The deck is lazily created per-owner on first use (find-or-create).
+ */
+export const DEFAULT_DECK_NAME = 'Uncategorized';
+
+/** A cloze deletion marker embedded in `front` text, e.g. `[Berlin]` in
  * "The capital of Germany is [Berlin]". Canonical form: exactly one
  * `[answer]` token; all other brackets are treated as literal text.
  */
@@ -166,16 +174,19 @@ export interface Flashcard {
   ownerId?: string;
   /**
    * Stable deck reference: the id of a document in the `decks` collection.
-   * Absent when the card has no deck. Legacy cards carry a `deck` name string
-   * instead (see `deck`); newly written cards always use `deckId` and also
-   * store the deck name on `deck` for readable/legacy filtering.
+   * Every newly created card is assigned a deck. Legacy documents written
+   * before deck entities existed may lack this field; the
+   * `assignDecklessToDefault` migration (POST /assignDecklessHandler)
+   * backfills them to the owner's `Uncategorized` deck.
    */
   deckId?: string;
   /**
    * Deck name. Kept on the card for backward compatibility and readable
    * filtering: `listFlashcards?deck=<name>` continues to match cards whose
    * stored `deck` string equals the name, even before migration backfills
-   * `deckId`.
+   * `deckId`. Every newly created card carries both `deckId` and `deck`.
+   * Legacy documents written before the `deck` field existed may lack it;
+   * the `assignDecklessToDefault` migration backfills them.
    */
   deck?: string;
   tags: string[];
@@ -223,14 +234,18 @@ export interface Flashcard {
 export interface CreateFlashcardInput {
   front: string;
   back: string;
-  /** Stable deck reference (id of a document in the `decks` collection). `null` explicitly means "no deck". */
-  deckId?: string | null;
+  /**
+   * Stable deck reference (id of a document in the `decks` collection).
+   * Absent → card is assigned to the default `Uncategorized` deck.
+   */
+  deckId?: string;
   /**
    * Legacy deck name. Kept for backward compatibility: when `deckId` is absent
    * and `deck` is provided, a deck with that name is found-or-created and the
    * card is assigned to it. `deckId` takes precedence when both are present.
+   * Absent (along with `deckId`) → card is assigned to `Uncategorized`.
    */
-  deck?: string | null;
+  deck?: string;
   /** Optional free-form topic label (subject-area grouping), e.g. "geography". */
   topic?: string | null;
   /** Sets the persisted suspended attribute (boolean, default false); queryable via search_cards. */
@@ -241,10 +256,16 @@ export interface CreateFlashcardInput {
 export interface UpdateFlashcardInput {
   front?: string;
   back?: string;
-  /** Stable deck reference. `null` detaches the card from its deck (fields removed). */
-  deckId?: string | null;
-  /** Legacy deck name (same find-or-create semantics as create). `null` detaches. */
-  deck?: string | null;
+  /**
+   * Stable deck reference. Moves the card to the specified deck.
+   * Omitting keeps the card in its current deck.
+   */
+  deckId?: string;
+  /**
+   * Legacy deck name (same find-or-create semantics as create).
+   * Omitting keeps the card in its current deck.
+   */
+  deck?: string;
   /** Optional free-form topic label. `null` removes the topic (field removed). */
   topic?: string | null;
   /** Sets/clears the persisted suspended attribute; queryable via search_cards. */
@@ -609,11 +630,11 @@ export interface ListDecksResponse {
   nextPageToken: string | null;
 }
 
-/** Result of deleting a deck: the deck is removed and its cards are detached. */
+/** Result of deleting a deck: the deck is removed and its cards are reassigned to Uncategorized. */
 export interface DeleteDeckResult {
   deleted: boolean;
-  /** Number of cards that were detached from the deck (their `deckId`/`deck` fields removed). */
-  detachedCards: number;
+  /** Number of cards reassigned from the deleted deck to the Uncategorized deck. */
+  reassignedCards: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1544,7 +1565,8 @@ export const CARD_KEY_MAX_LENGTH = 64;
  *  - `pending`:   accepted and chunked; not yet processing.
  *  - `processing`: chunks are being committed to Firestore.
  *  - `completed`:  every chunk has been committed (card count = totalCards).
- *  - `failed`:     an unrecoverable error stopped processing (see `error`).
+ *  - `failed`:     an observed execution error on a chunk (see `error`/`chunkErrors`);
+ *                   exact re-submission retriggers non-completed chunks.
  */
 export const ENROLLMENT_STATUSES = ['pending', 'processing', 'completed', 'failed'] as const;
 export type EnrollmentStatus = (typeof ENROLLMENT_STATUSES)[number];
@@ -1581,7 +1603,7 @@ export interface BulkEnrollCardsResponse {
   totalChunks: number;
   /** Number of chunks fully committed (0..totalChunks). */
   completedChunks: number;
-  /** Initial job status ('pending' on first submission). */
+  /** Job status (new submissions return 'processing'). */
   status: EnrollmentStatus;
   /** Number of cards successfully created across committed chunks. */
   createdCount: number;
@@ -1589,6 +1611,8 @@ export interface BulkEnrollCardsResponse {
   skippedCount: number;
   /** Number of cards that failed validation or creation. */
   failedCount: number;
+  /** Number of chunks rewritten as pending during resume (self-healing). 0 on first submission. */
+  retriedChunkCount: number;
 }
 
 /**
@@ -1621,7 +1645,7 @@ export interface BulkEnrollmentJob {
   createdAt: Timestamp;
   /** When the job was last updated (any chunk committed). */
   updatedAt: Timestamp;
-  /** When the job completed or failed (absent while pending/processing). */
+  /** When the job completed (absent while pending/processing/failed). */
   completedAt?: Timestamp;
   /** Error message when status = 'failed'. */
   error?: string;
@@ -1653,8 +1677,10 @@ export interface BulkEnrollStatusResponse {
   createdAt: string;
   /** ISO 8601 of when the job was last updated. */
   updatedAt: string;
-  /** ISO 8601 of when the job completed or failed (absent while pending/processing). */
+  /** ISO 8601 of when the job completed (absent while pending/processing/failed). */
   completedAt?: string;
   /** Error message when status = 'failed' (absent otherwise). */
   error?: string;
+  /** Per-chunk errors observed during processing (absent when all chunks are clean). */
+  chunkErrors?: Array<{ chunkIndex: number; error: string }>;
 }

@@ -84,9 +84,11 @@ paths:
       operationId: createFlashcard
       summary: Create a new flashcard
       description: >
-        Creates a flashcard with front/back, optional deck/tags. New cards are
-        due immediately and start in the New state; each later review advances
-        the due time through the FSRS scheduler. Returns card id and due.
+        Creates a flashcard with front/back, optional deck/tags. When deckId
+        and deck are both omitted, the card is assigned to the default
+        "Uncategorized" deck. New cards are due immediately and start in the
+        New state; each later review advances the due time through the FSRS
+        scheduler. Returns card id and due.
       requestBody:
         required: true
         content:
@@ -510,7 +512,9 @@ paths:
       description: >
         Updates editable fields of an existing card. Only the fields present in
         the request body are changed; omitted fields keep their current values.
-        Changing front or back does not reset FSRS scheduling state.
+        Setting deckId or deck to null is rejected — every card must always
+        belong to a deck. Changing front or back does not reset FSRS
+        scheduling state.
       parameters:
         - name: id
           in: path
@@ -653,8 +657,8 @@ paths:
         partial success). Returns the ids actually deleted; ids that did not
         exist are omitted. Use this only when the user explicitly asks to
         delete several cards at once. To remove an entire deck, use
-        deleteDeck instead — it deletes the deck and detaches (does NOT
-        delete) its cards.
+        deleteDeck instead — it deletes the deck and reassigns its cards
+        to the "Uncategorized" placeholder deck (does NOT delete cards).
       requestBody:
         required: true
         content:
@@ -888,17 +892,19 @@ paths:
   /deleteDeckHandler/{id}:
     delete:
       operationId: deleteDeck
-      summary: Delete a deck (cards are detached, not deleted)
+      summary: Delete a deck (cards are reassigned to Uncategorized)
       description: >
         Deletes a deck by id. This is destructive to the DECK but NOT to its
         cards: the deck is removed and every card that referenced it is
-        DETACHED (deckId/deck fields removed), leaving the cards themselves
-        intact with all FSRS scheduling preserved. Returns
-        { deleted: true, detachedCards: N }. Cards are detached in chunked
-        batches (≤500 writes each), so decks of any size can be deleted; the
-        deck document is deleted only after every detach batch succeeds. This
-        is NOT a single atomic transaction: if a batch fails partway, earlier
-        detaches remain committed (cards stay detached, the deck is not
+        reassigned to the owner's "Uncategorized" placeholder deck (created on
+        demand if needed), leaving the cards themselves intact with all FSRS
+        scheduling preserved. Returns
+        { deleted: true, reassignedCards: N }. The system-protected
+        "Uncategorized" deck cannot be deleted (400). Cards are reassigned in
+        chunked batches (≤500 writes each), so decks of any size can be
+        deleted; the deck document is deleted only after every reassignment
+        batch succeeds. This is NOT a single atomic transaction: if a batch
+        fails partway, earlier reassignments remain committed (the deck is not
         deleted) and retrying the delete is safe and completes the rest.
       parameters:
         - name: id
@@ -909,7 +915,7 @@ paths:
           description: Server-assigned deck id, appended to the function URL.
       responses:
         "200":
-          description: Deck deleted with cards detached
+          description: Deck deleted with cards reassigned to Uncategorized
           content:
             application/json:
               schema:
@@ -926,6 +932,46 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid API key (production only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "400":
+          description: Cannot delete the system-protected "Uncategorized" deck
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /assignDecklessHandler:
+    post:
+      operationId: assignDeckless
+      summary: Assign owner's deckless cards to Uncategorized
+      description: >
+        Assigns the caller's completely deckless cards (documents with neither
+        `deckId` nor `deck`) to their owner-scoped "Uncategorized" placeholder
+        deck.  These are the oldest legacy documents, written before the `deck`
+        field existed.  Idempotent and paged (up to 100 cards per call);
+        returns { assigned: N } — call repeatedly until 0.
+      responses:
+        "200":
+          description: Assignment ran
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assigned]
+                properties:
+                  assigned:
+                    type: integer
+                    description: Number of cards assigned in this call.
         "401":
           description: Missing or invalid API key (production only)
           content:
@@ -1667,19 +1713,20 @@ components:
           maxLength: 10000
           description: The answer side of the card.
         deckId:
-          type: [string, "null"]
+          type: string
           maxLength: 100
           description: >
             Stable deck reference (id of a deck from listDecks/createDeck).
-            The recommended way to assign a card to a deck. null explicitly
-            means no deck. When both deckId and deck are present, deckId wins.
+            When absent, the card is assigned to the default "Uncategorized"
+            deck. When both deckId and deck are present, deckId wins.
         deck:
-          type: [string, "null"]
+          type: string
           maxLength: 100
           description: >
             Legacy deck name. When deckId is absent, the backend finds-or-
-            creates a deck with this name and assigns the card to it. null
-            explicitly means no deck. Kept for backward compatibility.
+            creates a deck with this name and assigns the card to it.
+            When both are absent, the card is assigned to "Uncategorized".
+            Kept for backward compatibility.
         tags:
           type: array
           maxItems: 20
@@ -1703,18 +1750,19 @@ components:
           maxLength: 10000
           description: New answer side of the card.
         deckId:
-          type: [string, "null"]
+          type: string
           maxLength: 100
           description: >
-            Stable deck reference. null detaches the card from its deck
-            (deckId and deck fields are removed). When both deckId and deck are
-            present, deckId wins.
+            Stable deck reference. Moves the card to the specified deck.
+            Omitting keeps the card in its current deck. Explicit null is
+            rejected (every card must belong to a deck).
         deck:
-          type: [string, "null"]
+          type: string
           maxLength: 100
           description: >
-            Legacy deck name (find-or-create). null detaches the card from its
-            deck. Kept for backward compatibility.
+            Legacy deck name (find-or-create). Moves the card to the resolved
+            deck. Omitting keeps the card in its current deck. Explicit null
+            is rejected. Kept for backward compatibility.
         tags:
           type: array
           maxItems: 20
@@ -1771,13 +1819,17 @@ components:
           maxLength: 10000
           description: New answer side of the card.
         deckId:
-          type: [string, "null"]
+          type: string
           maxLength: 100
-          description: Stable deck reference; null detaches the card from its deck.
+          description: >
+            Stable deck reference. Moves the card to the specified deck.
+            Omitting keeps the card in its current deck.
         deck:
-          type: [string, "null"]
+          type: string
           maxLength: 100
-          description: Legacy deck name (find-or-create); null detaches.
+          description: >
+            Legacy deck name (find-or-create). Moves the card to the resolved
+            deck. Omitting keeps the card in its current deck.
         tags:
           type: array
           maxItems: 20
@@ -1969,14 +2021,14 @@ components:
               type: integer
     DeleteDeckResult:
       type: object
-      required: [deleted, detachedCards]
+      required: [deleted, reassignedCards]
       properties:
         deleted:
           type: boolean
           description: Always true on success.
-        detachedCards:
+        reassignedCards:
           type: integer
-          description: Number of cards detached from the deck (cards are preserved, never deleted).
+          description: Number of cards reassigned from the deleted deck to the "Uncategorized" deck (cards are preserved, never deleted).
     Flashcard:
       type: object
       required: [id, front, back, tags, createdAt, updatedAt, due]

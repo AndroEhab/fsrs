@@ -19,6 +19,7 @@ import {
   MAX_CARD_IMAGES, MAX_IMAGE_URL_LENGTH, MAX_IMAGE_UPLOAD_BYTES, MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_FILE_NAME_LENGTH,
   CARD_STATES, BULK_LIMIT,
   SchedulingActionResponse,
+  DEFAULT_DECK_NAME,
 } from './types';
 import { applyReview, initialScheduling, legacyScheduling, resolveReviewTime } from './scheduler';
 import { buildEventBody, trimEmbeddedReviewLog, sessionEventId, legacySessionEventId } from './reviewHistory';
@@ -166,6 +167,31 @@ export class DeckNotFoundError extends Error {
 }
 
 /**
+ * Thrown when an update attempts to explicitly set deckId or deck to null
+ * (detaching the card). Every card must always belong to a deck; explicit
+ * null is rejected with a client-visible 400.
+ */
+export class CardDeckRequiredError extends Error {
+  constructor() {
+    super('Cannot detach a card from its deck; every card must belong to a deck');
+    this.name = 'CardDeckRequiredError';
+  }
+}
+
+/**
+ * Thrown when attempting to delete a protected deck (e.g. the
+ * `Uncategorized` placeholder). Every card must always belong to a deck;
+ * deleting the fallback deck would break that invariant for all cards
+ * reassigned to it.
+ */
+export class ProtectedDeckError extends Error {
+  constructor(deckName: string) {
+    super(`Cannot delete the "${deckName}" deck; it is a system-protected placeholder`);
+    this.name = 'ProtectedDeckError';
+  }
+}
+
+/**
  * Finds a deck by exact name, or creates it when missing (case-sensitive
  * match). Used by the legacy `deck` name path on create/update so cards can
  * keep referencing decks by name while the deck entity itself gets a stable
@@ -199,7 +225,8 @@ async function findDeckIdByName(name: string, ownerId?: string): Promise<string 
  * Resolves the deck a card input refers to, honoring the new `deckId`
  * reference first and falling back to the legacy `deck` name
  * (find-or-create). Returns the stable deck id and its name, or null when the
- * input carries neither (or explicitly nulls the deck).
+ * input carries neither — callers that must never return null (create paths)
+ * should fall back to the `Uncategorized` default deck.
  *
  * Throws when a referenced `deckId` does not exist.
  */
@@ -233,6 +260,13 @@ function applyDeckRef(target: Record<string, unknown>, ref: { deckId?: string; d
   if (!ref) return;
   if (ref.deckId !== undefined) target.deckId = ref.deckId;
   if (ref.deck !== undefined) target.deck = ref.deck;
+}
+
+/** Lazily resolves the default `Uncategorized` deck for an owner. Used by create
+ *  paths when `resolveDeckRef` returns null (no deck specified in input). */
+async function resolveDefaultDeck(ownerId: string): Promise<{ deckId: string; deck: string }> {
+  const deckId = await findOrCreateDeckByName(DEFAULT_DECK_NAME, ownerId);
+  return { deckId, deck: DEFAULT_DECK_NAME };
 }
 
 /** Throws when any referenced deck id does not exist (used by bulk create/update).
@@ -375,27 +409,28 @@ async function updateCardsChunked(
 
 /**
  * Deletes a deck. Cards are NOT deleted — the deck is independent of its
- * cards. Deleting a deck detaches every referencing card (removes its
- * `deckId` and matching `deck` name fields) so no card keeps pointing at the
- * deleted deck, and the cards themselves (including all FSRS scheduling
- * state) are preserved.
+ * cards. Deleting a deck reassigns every referencing card to the owner's
+ * `Uncategorized` deck (a placeholder that is created on demand) so no card
+ * is left without a deck, and the cards themselves (including all FSRS
+ * scheduling state) are preserved.
  *
  * Firestore transactions/batches are limited to 500 writes, so a deck with an
  * arbitrary number of cards is processed in **chunked WriteBatches** (≤500
- * detach writes each), not a single transaction. Semantics:
- *   1. Detach cards referencing by `deckId` (chunked).
- *   2. Detach legacy name-only cards (no deckId) carrying the deck name
+ * reassign writes each), not a single transaction. Semantics:
+ *   1. Reassign cards referencing by `deckId` (chunked).
+ *   2. Reassign legacy name-only cards (no deckId) carrying the deck name
  *      (chunked, deduped against step 1).
- *   3. Only after all detach batches succeed is the deck document deleted.
- *   4. A final sweep re-detaches any card that raced into the deck between
+ *   3. Only after all reassignment batches succeed is the deck document
+ *      deleted.
+ *   4. A final sweep reassigns any card that raced into the deck between
  *      step 2 and the deck delete (guarded so it never deletes a deck that a
  *      concurrent createDeck reused — the deck is deleted inside this final
  *      transaction after re-verifying the document still has the same name
  *      it started with).
- * If any detach chunk fails, the error propagates with explicit partial
+ * If any reassignment chunk fails, the error propagates with explicit partial
  * progress (earlier chunks committed): the deck is NOT deleted, and retrying
- * the operation completes the remaining detaches. Returns the number of cards
- * detached.
+ * the operation completes the remaining reassignments. Returns the number of
+ * cards reassigned.
  */
 export async function deleteDeck(id: string, ownerId: string): Promise<DeleteDeckResult | null> {
   const deckRef = getDb().collection(DECKS_COLLECTION).doc(id);
@@ -406,32 +441,38 @@ export async function deleteDeck(id: string, ownerId: string): Promise<DeleteDec
   if (preDeck.data()?.ownerId !== ownerId) return null;
   const deckName = preDeck.data()?.name as string | undefined;
 
-  let detachedCards = 0;
+  // Protect the system placeholder deck — deleting it would break the
+  // invariant that every card belongs to a deck for all cards currently
+  // assigned to it.
+  if (deckName === DEFAULT_DECK_NAME) {
+    throw new ProtectedDeckError(DEFAULT_DECK_NAME);
+  }
 
-  // 1. Detach by stable reference (chunked), scoped to the owner's cards.
+  // Resolve the placeholder deck that receives the reassigned cards.
+  const defaultDeck = await resolveDefaultDeck(ownerId);
+
+  let reassignedCards = 0;
+
+  // 1. Reassign by stable reference (chunked), scoped to the owner's cards.
   const byIdQuery = getDb().collection(COLLECTION).where('deckId', '==', id);
   const byId = await byIdQuery.where('ownerId', '==', ownerId).get();
-  detachedCards += await updateCardsChunked(byId.docs, (cardData) => {
-    const patch: Record<string, unknown> = { deckId: FieldValue.delete() };
-    if (deckName !== undefined && cardData?.deck === deckName) {
-      patch.deck = FieldValue.delete();
-    }
-    return patch;
+  reassignedCards += await updateCardsChunked(byId.docs, () => {
+    return { deckId: defaultDeck.deckId, deck: defaultDeck.deck };
   });
 
-  // 2. Detach legacy name-only cards (no deckId) carrying the deck name.
+  // 2. Reassign legacy name-only cards (no deckId) carrying the deck name.
   if (deckName !== undefined) {
     const byNameQuery = getDb().collection(COLLECTION).where('deck', '==', deckName);
     const byName = await byNameQuery.where('ownerId', '==', ownerId).get();
-    detachedCards += await updateCardsChunked(
+    reassignedCards += await updateCardsChunked(
       byName.docs.filter((doc) => doc.data().deckId !== id),
-      () => ({ deck: FieldValue.delete() }),
+      () => ({ deckId: defaultDeck.deckId, deck: defaultDeck.deck }),
     );
   }
 
-  // 3. Delete the deck only after all detaches committed.
+  // 3. Delete the deck only after all reassignment batches committed.
   // 4. Final race sweep: inside one small transaction, re-verify the deck doc
-  //    still exists with the SAME name (guards against a reused id), detach
+  //    still exists with the SAME name (guards against a reused id), reassign
   //    any card that slipped in since step 2 (bounded — the sweep must fit
   //    the 500-op transaction budget), then delete the deck.
   await getDb().runTransaction(async (t) => {
@@ -446,26 +487,22 @@ export async function deleteDeck(id: string, ownerId: string): Promise<DeleteDec
     const sweepByIdQuery = getDb().collection(COLLECTION).where('deckId', '==', id);
     const sweepById = await t.get(sweepByIdQuery.where('ownerId', '==', ownerId));
     for (const doc of sweepById.docs) {
-      const patch: Record<string, unknown> = { deckId: FieldValue.delete(), updatedAt: Timestamp.now() };
-      if (txnName !== undefined && doc.data().deck === txnName) {
-        patch.deck = FieldValue.delete();
-      }
-      t.update(doc.ref, patch);
-      detachedCards += 1;
+      t.update(doc.ref, { deckId: defaultDeck.deckId, deck: defaultDeck.deck, updatedAt: Timestamp.now() });
+      reassignedCards += 1;
     }
     if (txnName !== undefined) {
       const sweepByNameQuery = getDb().collection(COLLECTION).where('deck', '==', txnName);
       const sweepByName = await t.get(sweepByNameQuery.where('ownerId', '==', ownerId));
       for (const doc of sweepByName.docs) {
         if (doc.data().deckId === id) continue;
-        t.update(doc.ref, { deck: FieldValue.delete(), updatedAt: Timestamp.now() });
-        detachedCards += 1;
+        t.update(doc.ref, { deckId: defaultDeck.deckId, deck: defaultDeck.deck, updatedAt: Timestamp.now() });
+        reassignedCards += 1;
       }
     }
     t.delete(deckRef);
   });
 
-  return { deleted: true, detachedCards };
+  return { deleted: true, reassignedCards };
 }
 
 /**
@@ -532,6 +569,69 @@ export async function migrateLegacyDeckNames(pageSize = BULK_LIMIT): Promise<{ m
   }
 
   return { migrated };
+}
+
+/**
+ * Assigns owner-scoped completely deckless cards (documents with NEITHER
+ * `deckId` NOR `deck`) to the owner's `Uncategorized` placeholder deck.
+ *
+ * These are the oldest legacy documents, written before the `deck` field
+ * existed.  The existing `migrateLegacyDeckNames` handles cards that carry
+ * a legacy `deck` name but no `deckId`; this function handles the remaining
+ * subset that has neither field.
+ *
+ * Firestore cannot query "field does not exist", so this function queries
+ * all owner cards (paged by `__name__`) and filters in memory for
+ * `deckId === undefined && deck === undefined`.  Pages are iterated until
+ * exhausted or `pageSize` cards are assigned.  Returns the number of cards
+ * assigned; repeated calls complete the rest.
+ */
+export async function assignDecklessToDefault(
+  ownerId: string,
+  pageSize = BULK_LIMIT,
+): Promise<{ assigned: number }> {
+  let lastDoc: QueryDocumentSnapshot<DocumentData> | null = null;
+  let assigned = 0;
+  let hasMore = true;
+
+  const defaultDeck = await resolveDefaultDeck(ownerId);
+
+  while (hasMore) {
+    let q = getDb().collection(COLLECTION)
+      .where('ownerId', '==', ownerId)
+      .orderBy('__name__')
+      .limit(pageSize);
+    if (lastDoc) {
+      q = q.startAfter(lastDoc);
+    }
+    const page = await q.get();
+    if (page.empty) break;
+
+    const deckless = page.docs.filter(
+      (doc) => doc.data().deckId === undefined && doc.data().deck === undefined,
+    );
+
+    if (deckless.length > 0) {
+      const batch = getDb().batch();
+      const now = Timestamp.now();
+      for (const doc of deckless) {
+        batch.update(doc.ref, {
+          deckId: defaultDeck.deckId,
+          deck: defaultDeck.deck,
+          updatedAt: now,
+        });
+      }
+      await batch.commit();
+      assigned += deckless.length;
+    }
+
+    lastDoc = page.docs[page.docs.length - 1];
+    if (page.docs.length < pageSize) {
+      hasMore = false;
+    }
+  }
+
+  return { assigned };
 }
 
 export async function listDecks(query: ListDecksQuery, ownerId: string): Promise<ListDecksResponse> {
@@ -742,7 +842,9 @@ export async function mergeTags(input: MergeTagsInput, ownerId: string): Promise
 export async function createFlashcard(input: CreateFlashcardInput, ownerId: string): Promise<Flashcard> {
   const now = Timestamp.now();
   const scheduling = initialScheduling(now);
-  const deckRef = await resolveDeckRef(input, ownerId);
+  // Resolve deck reference; fall back to Uncategorized when input omits both
+  // deckId and deck — every newly created card must belong to a deck.
+  const deckRef = await resolveDeckRef(input, ownerId) ?? await resolveDefaultDeck(ownerId);
 
   const docRef = getDb().collection(COLLECTION).doc();
   const flashcard: Omit<Flashcard, 'id'> = {
@@ -794,12 +896,12 @@ export async function updateFlashcard(id: string, input: UpdateFlashcardInput, o
   if (input.suspended !== undefined) updateData.suspended = input.suspended;
   if (input.tags !== undefined) updateData.tags = input.tags;
 
-  // Deck reference handling: null detaches (removes both fields), a value
-  // resolves to a stable deck id + name.
+  // Deck reference handling: explicit null is rejected (every card must
+  // belong to a deck). A value resolves to a stable deck id + name.
   if (input.deckId === null || input.deck === null) {
-    updateData.deckId = FieldValue.delete() as unknown as string;
-    updateData.deck = FieldValue.delete() as unknown as string;
-  } else if (input.deckId !== undefined || input.deck !== undefined) {
+    throw new CardDeckRequiredError();
+  }
+  if (input.deckId !== undefined || input.deck !== undefined) {
     const deckRef = await resolveDeckRef({ deckId: input.deckId, deck: input.deck }, ownerId);
     if (deckRef) {
       if (deckRef.deckId !== undefined) updateData.deckId = deckRef.deckId;
@@ -1046,8 +1148,9 @@ async function countBuckets(base: FirebaseFirestore.Query, now: Timestamp): Prom
  * unique). The remainder — whole-library counts minus the sum of every
  * deck-entity's counts, per bucket — is derived arithmetically (never
  * scanned) and reported as a final `{ deckId: null, deck: null }` entry when
- * non-zero: cards with no deck at all, plus legacy cards whose `deck` string
- * has no deck entity (unmigrated pre-entity documents).
+ * non-zero: legacy unmigrated cards whose `deck` string has no corresponding
+ * deck entity (pre-entity documents). All newly created cards belong to a
+ * deck, so this remainder shrinks over time as legacy cards are migrated.
  *
  * groupBy is mutually exclusive with the deck/tag filters (validator
  * enforced): a filtered breakdown is not expressible as count() aggregates,
@@ -1484,7 +1587,9 @@ export async function bulkCreateFlashcards(input: BulkCreateFlashcardsInput, own
             reviewLog: [],
             images: [],
         };
-        applyDeckRef(flashcard, await resolveDeckRef(item, ownerId));
+        // Every newly created card must belong to a deck; fall back to Uncategorized.
+        const deckRef = await resolveDeckRef(item, ownerId) ?? await resolveDefaultDeck(ownerId);
+        applyDeckRef(flashcard, deckRef);
         batch.set(docRef, flashcard);
         cards.push({ id: docRef.id, ...flashcard });
     }
@@ -1501,14 +1606,18 @@ export async function bulkCreateFlashcards(input: BulkCreateFlashcardsInput, own
  */
 export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, ownerId: string): Promise<BulkUpdateFlashcardsResponse> {
     await validateDeckIds(input.cards.map(c => c.deckId), ownerId);
-    // Resolve deck references up front: resolution may create legacy-name decks
-    // (a standalone write) which is not allowed inside a transaction callback.
-    const resolvedRefs = new Map();
+    // Reject any attempt to explicitly null-out a deck reference (every card
+    // must always belong to a deck).  Resolve remaining references up front:
+    // resolution may create legacy-name decks (a standalone write) which is
+    // not allowed inside a transaction callback.
     for (const item of input.cards) {
         if (item.deckId === null || item.deck === null) {
-            resolvedRefs.set(item.id, null); // explicit detach handled in-transaction
+            throw new CardDeckRequiredError();
         }
-        else if (item.deckId !== undefined || item.deck !== undefined) {
+    }
+    const resolvedRefs = new Map();
+    for (const item of input.cards) {
+        if (item.deckId !== undefined || item.deck !== undefined) {
             resolvedRefs.set(item.id, await resolveDeckRef({ deckId: item.deckId, deck: item.deck }, ownerId));
         }
     }
@@ -1551,18 +1660,12 @@ export async function bulkUpdateFlashcards(input: BulkUpdateFlashcardsInput, own
                 updateData.suspended = item.suspended;
             if (item.tags !== undefined)
                 updateData.tags = item.tags;
-            if (item.deckId === null || item.deck === null) {
-                updateData.deckId = FieldValue.delete();
-                updateData.deck = FieldValue.delete();
-            }
-            else {
-                const deckRef = resolvedRefs.get(item.id) ?? undefined;
-                if (deckRef) {
-                    if (deckRef.deckId !== undefined)
-                        updateData.deckId = deckRef.deckId;
-                    if (deckRef.deck !== undefined)
-                        updateData.deck = deckRef.deck;
-                }
+            const deckRef = resolvedRefs.get(item.id) ?? undefined;
+            if (deckRef) {
+                if (deckRef.deckId !== undefined)
+                    updateData.deckId = deckRef.deckId;
+                if (deckRef.deck !== undefined)
+                    updateData.deck = deckRef.deck;
             }
             t.update(docRef, updateData);
             results.push(mergeCardForResponse(snap, updateData));

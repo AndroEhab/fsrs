@@ -124,7 +124,7 @@ describe('registerFlashcardTools', () => {
 
     const deleteDeck = tools.tools.find((t) => t.name === 'delete_deck');
     expect(deleteDeck?.description).toContain('NOT to its cards');
-    expect(deleteDeck?.description).toContain('DETACHED');
+    expect(deleteDeck?.description).toContain('reassigned to Uncategorized');
 
     // Tag tools exist with the right shapes and annotations.
     const listTags = tools.tools.find((t) => t.name === 'list_tags');

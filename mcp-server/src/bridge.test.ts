@@ -334,16 +334,16 @@ describe('FirebaseBridge', () => {
       expect(deck.name).toBe('Spanish II');
     });
 
-    it('deleteDeck DELETEs /deleteDeckHandler/{id} and returns {deleted,detachedCards}', async () => {
+    it('deleteDeck DELETEs /deleteDeckHandler/{id} and returns {deleted,reassignedCards}', async () => {
       const fetchMock = makeFetchMock((url, init) => {
         expect(url).toBe(`${BASE}/deleteDeckHandler/d1`);
         expect(init.method).toBe('DELETE');
-        return jsonResponse({ deleted: true, detachedCards: 3 });
+        return jsonResponse({ deleted: true, reassignedCards: 3 });
       });
       const bridge = new FirebaseBridge({ apiKey: 'k', baseUrl: BASE, fetchFn: fetchMock });
 
       const result = await bridge.deleteDeck('d1');
-      expect(result).toEqual({ deleted: true, detachedCards: 3 });
+      expect(result).toEqual({ deleted: true, reassignedCards: 3 });
     });
 
     it('attachImage POSTs {url,alt?,mimeType?} to /attachImageHandler/{id}', async () => {
@@ -731,16 +731,17 @@ describe('input schemas (mirror backend validators)', () => {
     expect(bulkDeleteFlashcardsInputSchema.safeParse({ ids: Array(101).fill('a') }).success).toBe(false);
   });
 
-  it('card create schema accepts deckId (nullable) alongside legacy deck name', () => {
+  it('card create schema rejects null deckId/deck (deck required)', () => {
     expect(createFlashcardInputSchema.safeParse({ front: 'F', back: 'B', deckId: 'd1' }).success).toBe(true);
-    expect(createFlashcardInputSchema.safeParse({ front: 'F', back: 'B', deckId: null }).success).toBe(true);
+    expect(createFlashcardInputSchema.safeParse({ front: 'F', back: 'B', deckId: null }).success).toBe(false);
+    expect(createFlashcardInputSchema.safeParse({ front: 'F', back: 'B', deck: null }).success).toBe(false);
     expect(createFlashcardInputSchema.safeParse({ front: 'F', back: 'B', deckId: '' }).success).toBe(false);
     expect(createFlashcardInputSchema.safeParse({ front: 'F', back: 'B', deckId: 'd1', deck: 'Old' }).success).toBe(true);
   });
 
-  it('card update schema accepts deckId null (detach)', () => {
-    expect(updateFlashcardInputSchema.safeParse({ deckId: null }).success).toBe(true);
-    expect(updateFlashcardInputSchema.safeParse({ deck: null }).success).toBe(true);
+  it('card update schema rejects null deckId/deck', () => {
+    expect(updateFlashcardInputSchema.safeParse({ deckId: null }).success).toBe(false);
+    expect(updateFlashcardInputSchema.safeParse({ deck: null }).success).toBe(false);
     expect(updateFlashcardInputSchema.safeParse({ deckId: '' }).success).toBe(false);
   });
 
@@ -769,8 +770,8 @@ describe('input schemas (mirror backend validators)', () => {
     expect(listDecksQuerySchema.safeParse({ pageSize: 101 }).success).toBe(false);
   });
 
-  it('delete deck result schema validates {deleted,detachedCards}', () => {
-    expect(deleteDeckResultSchema.safeParse({ deleted: true, detachedCards: 3 }).success).toBe(true);
+  it('delete deck result schema validates {deleted,reassignedCards}', () => {
+    expect(deleteDeckResultSchema.safeParse({ deleted: true, reassignedCards: 3 }).success).toBe(true);
     expect(deleteDeckResultSchema.safeParse({ deleted: true }).success).toBe(false);
   });
 

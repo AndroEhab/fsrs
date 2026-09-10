@@ -122,32 +122,23 @@ describe('buildReviewWidgetHtml', () => {
     expect(html).toContain('backface-visibility:hidden');
     expect(html).toContain('rotateY(180deg)');
     expect(html).toContain('prefers-reduced-motion: reduce');
-    expect(html).toContain('class="tag-pill"');
+    expect(html).toContain('id="sessionTypeLabel"');
     expect(html).toContain('id="progressFill"');
-    expect(html).toContain('id="cardLabel"');
+    expect(html).toContain('id="deckName"');
     expect(html).toContain('.card-face.back-face');
-    // Airy white canvas + deck + progress chrome (approved design).
+    // Airy white canvas + progress chrome (approved design).
     expect(html).toContain('--bg:#f8fafc');
-    expect(html).toContain('class="counters"');
-    expect(html).toContain('class="deck-row"');
-    expect(html).toContain('class="deck-label"');
-    expect(html).toContain('class="top-row"');
-    // Counters render uppercase with an understated divider (reference).
-    expect(html).toContain('.counters { font-size:11.5px; font-weight:600; color:var(--muted); font-variant-numeric:tabular-nums;');
-    expect(html).toContain('text-transform:uppercase; letter-spacing:.06em;');
+    expect(html).toContain('class="session-info"');
     expect(html).toContain('progress-bar');
     expect(html).toContain('background:linear-gradient(90deg,#60a5fa,#2563eb)');
     // Intentional top inset: ~24px above the first row at desktop (wrap
     // top padding; margin no longer creates the gap), reduced to 16px on
-    // the narrowest iframes. The first row (status pill) must never sit
-    // flush against the sandbox surface.
+    // the narrowest iframes.
     expect(html).toContain('.wrap { max-width:680px; margin:0 auto; padding:24px 18px 40px; min-width:0; }');
     expect(html).toContain('.wrap { padding:16px 14px 32px; }');
-    // Restrained status pill: near-white fill, blue border, blue dot/text
-    // (NOT solid blue).
-    expect(html).toContain('background:#f5f8ff; color:var(--accent);');
-    expect(html).toContain('border:1px solid #c7d6f5');
-    expect(html).toContain('.tag-pill .dot { width:6px; height:6px; border-radius:50%; background:var(--accent);');
+    // Session info: separate session-type (accent) and mode (muted) labels.
+    expect(html).toContain('.session-type { color:var(--accent); }');
+    expect(html).toContain('id="modeLabel"');
     // Status text (#progress) sits ABOVE the progress bar.
     expect(html).toContain('<div class="progress" id="progress"></div>\n  <div class="progress-bar"><i id="progressFill"></i></div>');
     expect(html).toContain('.progress { font-size:11.5px; color:var(--muted); margin-bottom:6px;');
@@ -599,16 +590,14 @@ describe('optimistic progress behavior (script contract)', () => {
     expect(rateFn).not.toContain('ratingCounts: {');
     // Progress bar/label derive from the projected (authoritative + delta).
     expect(h).toContain("progressFill.style.width = pct + '%';");
-    // Counter presentation is the reference format: "N reviewed | M left"
-    // (CSS uppercases it to "N REVIEWED | M LEFT" with the pipe divider).
-    expect(h).toContain("reviewed + ' reviewed | ' + remaining + ' left'");
-    expect(h).not.toContain("' reviewed \u00b7 ' + s.remainingCount + ' left'");
-    // Pill label presentation: the raw bracketed modeTag is reduced to the
-    // plain mode name (no brackets, no "· N cards due" suffix); the raw
-    // session modeTag itself is never mutated.
-    expect(h).toContain("modeTag.textContent = pill || 'Spaced repetition review';");
-    expect(h).toContain("var pill = rawTag.replace(/^\\[/, '').replace(/\\]\\s*$/, '').replace(/\\s*·\\s*\\d+\\s+cards?\\s+due\\s*$/, '').replace(/\\s*·\\s*\\d+\\s+cards?\\s*·\\s*[^·\\]]*\\s*$/, '').trim();");
-    expect(h).not.toContain("modeTag.textContent = s.modeTag || ('[Spaced repetition review");
+    // Counter presentation is consolidated in the progress line (reviewed +
+    // remaining), not in a separate cardLabel element.
+    expect(h).toContain("reviewed + ' reviewed, ' + (remaining != null ? remaining : '?') + ' remaining'");
+    expect(h).not.toContain("' reviewed | ' + remaining + ' left'");
+    // Session type and mode shown as separate labeled lines — never a deck name.
+    expect(h).toContain("sessionTypeLabel.textContent = 'Session type: Spaced repetition';");
+    expect(h).toContain("modeLabel.textContent = 'Mode: ' + modeText;");
+    expect(h).toContain("var modeText = src && src.type === 'custom' ? 'Custom' : 'Due cards';");
   });
 
   it('each rating captures the DISPLAYED card id and sends it as expectedCardId (never a stale id)', () => {
@@ -796,15 +785,14 @@ describe('deck/session label fallback (script contract)', () => {
     });
   }
 
-  it('renders the CURRENT CARD deck || s.name || a visible Review session fallback, plus the source label', () => {
+  it('renders the CURRENT CARD deck name inside the card face above the content', () => {
     const h = html();
-    expect(h).toContain("deckLabel.textContent = (card && card.deck ? card.deck : '') || s.name || 'Review session';");
-    // The fallback label is visible in the DOM (not empty).
-    expect(h).toContain('id="deckLabel"');
-    expect(h).toContain('Review session');
-    // The source label renders the session provenance ("Due cards" default).
-    expect(h).toContain('id="sourceLabel"');
-    expect(h).toContain("var sourceText = src && src.type === 'deck'");
+    // Deck name is shown inside the card face, falling back to session name.
+    expect(h).toContain('deckName.textContent = (card.deck || s.name || \'\')');
+    expect(h).toContain('id="deckName"');
+    // Session type and mode shown as separate labeled lines (never a deck name).
+    expect(h).toContain("sessionTypeLabel.textContent = 'Session type: Spaced repetition';");
+    expect(h).toContain("modeLabel.textContent = 'Mode: ' + modeText;");
     expect(h).toContain("'Due cards'");
   });
 });

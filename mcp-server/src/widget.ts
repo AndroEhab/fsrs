@@ -121,6 +121,10 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>FSRS Review</title>
 <style>
+  /* Inter — locally vendored from Google Fonts (woff2, variable weight
+     400–700). No runtime network dependency. */
+  @font-face { font-family:'Inter'; font-style:normal; font-weight:400 700; font-display:swap;
+               src:url('./fonts/Inter-latin.woff2') format('woff2'); }
   :root {
     --bg:#f8fafc; --card:#fff; --ink:#16213a; --muted:#5d6b82; --line:#e5eaf2;
     --accent:#2563eb; --accent-strong:#1d4ed8; --accent-ink:#fff;
@@ -130,23 +134,12 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   }
   * { box-sizing:border-box; }
   html { -webkit-text-size-adjust:100%; }
-  body { margin:0; font:16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  body { margin:0; font:16px/1.5 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
   .wrap { max-width:680px; margin:0 auto; padding:24px 18px 40px; min-width:0; }
-  .top-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; min-width:0; }
-  .tag-pill { display:inline-flex; align-items:center; gap:7px; background:#f5f8ff; color:var(--accent);
-              border:1px solid #c7d6f5; border-radius:999px; padding:4px 12px 4px 9px; font-size:12px; font-weight:600; letter-spacing:.01em;
-              min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .tag-pill .dot { width:6px; height:6px; border-radius:50%; background:var(--accent); flex:none; }
-  .counters { font-size:11.5px; font-weight:600; color:var(--muted); font-variant-numeric:tabular-nums;
-              text-transform:uppercase; letter-spacing:.06em;
-              min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .deck-row { text-align:center; margin-bottom:12px; }
-  .deck-label { display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-                font-size:12px; font-weight:600; color:var(--muted); background:var(--card);
-                border:1px solid var(--line); border-radius:999px; padding:4px 14px; box-shadow:var(--shadow-sm); }
-  .source-label { display:inline-block; margin-left:8px; max-width:60%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-                  font-size:11px; font-weight:600; color:var(--accent); background:#f5f8ff;
-                  border:1px solid #c7d6f5; border-radius:999px; padding:3px 10px; }
+  .session-info { margin-bottom:14px; display:flex; flex-direction:column; gap:2px; }
+  .session-info span { font-size:11.5px; font-weight:600; color:var(--muted); letter-spacing:.01em; }
+  .session-info .session-type { color:var(--accent); }
+  .deck-name { font-size:11px; font-weight:600; color:var(--muted); }
   .progress { font-size:11.5px; color:var(--muted); margin-bottom:6px; font-variant-numeric:tabular-nums; }
   .progress-bar { height:4px; border-radius:999px; background:#e8edf5; overflow:hidden; margin-bottom:18px; }
   .progress-bar > i { display:block; height:100%; border-radius:999px; background:linear-gradient(90deg,#60a5fa,#2563eb); transition:width .25s ease; }
@@ -166,6 +159,9 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
                display:flex; align-items:center; justify-content:center; text-align:center; padding:36px 30px;
                background:var(--card); border:1.5px solid var(--line); border-radius:var(--radius);
                box-shadow:var(--shadow); overflow-wrap:anywhere; min-width:0; }
+  .card-face.front-face { flex-direction:column; align-items:stretch; justify-content:center; }
+  .card-face.front-face .deck-name { flex-shrink:0; text-align:left; margin-bottom:8px; }
+  .card-face.front-face #frontInner { flex:1 1 0; display:flex; align-items:center; justify-content:center; }
   .card-face.back-face { transform:rotateY(180deg); background:#fbfdff; border-color:#dbe4f1; }
   #frontInner, #backInner { font-size:clamp(22px,4.5vw,30px); font-weight:650; line-height:1.3; }
   .cloze-blank { border-bottom:2px dotted var(--accent); letter-spacing:.12em; color:var(--accent); }
@@ -215,9 +211,6 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     .ratings button { padding:10px 0 9px; }
     #frontInner, #backInner { font-size:20px; }
     .wrap { padding:16px 14px 32px; }
-    /* On the narrowest iframes the long mode tag wraps instead of truncating */
-    .tag-pill { white-space:normal; overflow:visible; text-overflow:clip; height:auto; }
-    .counters { white-space:normal; overflow:visible; text-overflow:clip; height:auto; text-align:right; }
   }
   @media (prefers-reduced-motion: reduce) {
     .card-inner { transition:none; }
@@ -228,19 +221,15 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
 </head>
 <body>
 <div class="wrap" id="app">
-  <div class="top-row">
-    <span class="tag-pill"><span class="dot"></span><span id="modeTag">Spaced repetition</span></span>
-    <span class="counters" id="cardLabel"></span>
-  </div>
-  <div class="deck-row">
-    <span class="deck-label" id="deckLabel">Review session</span>
-    <span class="source-label" id="sourceLabel"></span>
+  <div class="session-info">
+    <span class="session-type" id="sessionTypeLabel">Session type: Spaced repetition</span>
+    <span id="modeLabel">Mode: Due cards</span>
   </div>
   <div class="progress" id="progress"></div>
   <div class="progress-bar"><i id="progressFill"></i></div>
   <div class="card-shell" id="cardShell" role="button" tabindex="0" aria-label="Flip card">
     <div class="card-inner" id="cardInner">
-      <div class="card-face front-face" id="front"><div id="frontInner"></div></div>
+      <div class="card-face front-face" id="front"><div class="deck-name" id="deckName"></div><div id="frontInner"></div></div>
       <div class="card-face back-face" id="back"><div id="backInner"></div></div>
     </div>
   </div>
@@ -286,7 +275,8 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   'use strict';
   var data = JSON.parse(document.getElementById('bootstrap').textContent);
   var app = document.getElementById('app');
-  var modeTag = document.getElementById('modeTag');
+  var sessionTypeLabel = document.getElementById('sessionTypeLabel');
+  var modeLabel = document.getElementById('modeLabel');
   var progress = document.getElementById('progress');
   var cardShell = document.getElementById('cardShell');
   var cardInner = document.getElementById('cardInner');
@@ -294,7 +284,6 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   var back = document.getElementById('back');
   var frontInner = document.getElementById('frontInner');
   var backInner = document.getElementById('backInner');
-  var cardLabel = document.getElementById('cardLabel');
   var progressFill = document.getElementById('progressFill');
   var hint = document.getElementById('hint');
   var ratings = document.getElementById('ratings');
@@ -308,8 +297,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   var answerInput = document.getElementById('answerInput');
   var checkBtn = document.getElementById('checkBtn');
   var revealBtn = document.getElementById('revealBtn');
-  var deckLabel = document.getElementById('deckLabel');
-  var sourceLabel = document.getElementById('sourceLabel');
+  var deckName = document.getElementById('deckName');
   var endRow = document.getElementById('endRow');
   var endSessionBtn = document.getElementById('endSessionBtn');
 
@@ -781,13 +769,12 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
 
   function render() {
     var s = data.session || {};
-    // Presentation-only pill label: the raw session modeTag ("[Spaced
-    // repetition review · N cards due]") is reduced to its plain mode name —
-    // the brackets and the due-count suffix are chrome and never shown; the
-    // session state itself is untouched.
-    var rawTag = String(s.modeTag || '');
-    var pill = rawTag.replace(/^\\[/, '').replace(/\\]\\s*$/, '').replace(/\\s*·\\s*\\d+\\s+cards?\\s+due\\s*$/, '').replace(/\\s*·\\s*\\d+\\s+cards?\\s*·\\s*[^·\\]]*\\s*$/, '').trim();
-    modeTag.textContent = pill || 'Spaced repetition review';
+    // Presentation: session type and mode shown as separate labeled lines —
+    // never a deck name in the mode slot.
+    var src = s.source;
+    var modeText = src && src.type === 'custom' ? 'Custom' : 'Due cards';
+    sessionTypeLabel.textContent = 'Session type: Spaced repetition';
+    modeLabel.textContent = 'Mode: ' + modeText;
     // Projected counters: authoritative session counts plus the optimistic
     // delta for in-flight ratings the server has not yet acknowledged
     // (processedRequestIds/reviewedCardIds). A rating bumps the display
@@ -806,11 +793,6 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     var total = (s.totalCount != null ? s.totalCount : ((s.cardIds && s.cardIds.length) ? s.cardIds.length : (s.limit || (s.queueWindow && s.queueWindow.cardIds ? s.queueWindow.cardIds.length : 100))));
     var pct = total > 0 ? Math.max(0, Math.min(100, Math.round((reviewed / total) * 100))) : 0;
     progressFill.style.width = pct + '%';
-    // Counter presentation: "N reviewed | M left" — CSS uppercases it to the
-    // reference's "N REVIEWED | M LEFT" with an understated pipe divider.
-    cardLabel.textContent = remaining != null
-      ? reviewed + ' reviewed | ' + remaining + ' left'
-      : reviewed + ' reviewed';
     var card = data.card;
     // OPTIMISTIC completion: the last locally-known card of a hydrated
     // session was rated while submits are still in flight — show the clean
@@ -827,21 +809,6 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     // Active End Session control: shown only while a session is in progress
     // (hidden on the completed panel, where Finish/Continue apply).
     endRow.classList.toggle('hidden', !activeSession);
-    // The deck label ALWAYS shows the CURRENT CARD's own deck name (falling
-    // back to the session display name, then a neutral label) — a session
-    // name or source can never hide which deck the card belongs to, even in
-    // mixed-deck custom/tag sessions.
-    deckLabel.textContent = (card && card.deck ? card.deck : '') || s.name || 'Review session';
-    // The source label shows WHAT defined the session: "Due cards" (no
-    // selectors), the deck name (deck-only selection), or "Custom" (any
-    // tags/card-ids/mixed selection) — separate from the card's own deck.
-    var src = s.source;
-    var sourceText = src && src.type === 'deck'
-      ? (src.deckName || s.name || 'Deck')
-      : src && src.type === 'custom'
-        ? 'Custom'
-        : 'Due cards';
-    sourceLabel.textContent = sourceText;
     if (card) {
       // PERSISTENT reset state, applied BEFORE any content write: a different
       // card's content must never be installed into a subtree that is
@@ -856,6 +823,10 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         cardShell.classList.remove('flipped');
         cardShell.classList.add('resetting');
       }
+      // Deck name shown inside the card face above the word/content. Falls
+      // back to the session name, then hidden (empty) during transition when
+      // the card has no deck property.
+      deckName.textContent = (card.deck || s.name || '');
       // Same-card re-renders preserve the user's flip state (async session
       // updates must not flip the card back on its own); content is written
       // for both branches only AFTER the reset state above is established.

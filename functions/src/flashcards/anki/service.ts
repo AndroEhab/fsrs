@@ -281,6 +281,69 @@ async function scanExportCards(limit: number, ownerId?: string): Promise<ExportC
 }
 
 /**
+ * Deck-filtered export scan: uses the Firestore composite index
+ * (ownerId, deck, createdAt DESC) to read ONLY cards in the target deck,
+ * avoiding a full-collection scan. Handles both exact deck-path and
+ * leaf-name matching by collecting candidates from both the exact query
+ * and the leaf-name query, deduplicating by document id.
+ */
+async function scanExportCardsByDeck(
+  deck: string,
+  limit: number,
+  ownerId?: string,
+): Promise<ExportCard[]> {
+  const seen = new Set<string>();
+  const out: ExportCard[] = [];
+  const collect = (docs: FirebaseFirestore.QueryDocumentSnapshot[]) => {
+    for (const doc of docs) {
+      if (seen.has(doc.id)) continue;
+      seen.add(doc.id);
+      out.push(docToExportCard(doc));
+      if (out.length >= limit) break;
+    }
+  };
+
+  // Pass 1: exact deck-path match (uses the composite index
+  // (ownerId, deck, createdAt DESC) directly — no __name__ tiebreaker
+  // needed because startAfter on a document snapshot is sufficient for
+  // stable pagination within the same deck).
+  let q1: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = getDb().collection(COLLECTION);
+  if (ownerId !== undefined) q1 = q1.where('ownerId', '==', ownerId);
+  q1 = q1.where('deck', '==', deck)
+    .orderBy('createdAt', 'desc');
+  let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | null = null;
+  for (;;) {
+    if (out.length >= limit) break;
+    const base: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = lastDoc ? q1.startAfter(lastDoc) : q1;
+    const snap = await base.limit(SCAN_PAGE).get();
+    if (snap.docs.length === 0) break;
+    collect(snap.docs);
+    lastDoc = snap.docs[snap.docs.length - 1];
+  }
+
+  // Pass 2: leaf-name match (e.g. user passes "Verbs" but stored path is
+  // "Spanish::Verbs"). Only needed when the leaf differs from the full path.
+  const leaf = deck.split('::').pop()?.trim();
+  if (leaf !== undefined && leaf !== deck && out.length < limit) {
+    let q2: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = getDb().collection(COLLECTION);
+    if (ownerId !== undefined) q2 = q2.where('ownerId', '==', ownerId);
+    q2 = q2.where('deck', '==', leaf)
+      .orderBy('createdAt', 'desc');
+    lastDoc = null;
+    for (;;) {
+      if (out.length >= limit) break;
+      const base: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = lastDoc ? q2.startAfter(lastDoc) : q2;
+      const snap = await base.limit(SCAN_PAGE).get();
+      if (snap.docs.length === 0) break;
+      collect(snap.docs);
+      lastDoc = snap.docs[snap.docs.length - 1];
+    }
+  }
+
+  return out;
+}
+
+/**
  * Selects export cards by deck / explicit ids. With no filters, exports the
  * newest ANKI_EXPORT_CARD_LIMIT cards. With `deck`, exports every card whose
  * stored deck path equals it (or whose leaf matches). With `cardIds`,
@@ -313,15 +376,19 @@ export async function selectExportCards(
     return { selected, filtered: missing.length, total: selected.length + missing.length };
   }
 
+  // Deck-filtered export: use the composite index to read only the target
+  // deck's cards, avoiding a full-collection scan (the previous path scanned
+  // ANKI_EXPORT_CARD_LIMIT+1 docs and filtered in memory — expensive when
+  // the collection has thousands of cards in other decks).
+  if (deck !== undefined) {
+    const selected = await scanExportCardsByDeck(deck, ANKI_EXPORT_CARD_LIMIT, ownerId);
+    return { selected, filtered: 0, total: selected.length };
+  }
+
   const scanned = await scanExportCards(ANKI_EXPORT_CARD_LIMIT + 1, ownerId);
   const over = scanned.length > ANKI_EXPORT_CARD_LIMIT;
   const within = scanned.slice(0, ANKI_EXPORT_CARD_LIMIT);
-  const matches = deck !== undefined
-    ? within.filter((c) => c.deckPath === deck || (c.deckPath?.split('::').pop() ?? null) === deck)
-    : within;
-  const excludedByFilter = within.length - matches.length;
-  const filtered = over ? 1 + excludedByFilter : excludedByFilter;
-  return { selected: matches, filtered, total: scanned.length };
+  return { selected: within, filtered: over ? 1 : 0, total: scanned.length };
 }
 
 /** Fetches image URLs of a card (best-effort; never throws). */

@@ -444,6 +444,20 @@ npm run inspect    # npx @modelcontextprotocol/inspector@latest
 # connect to http://localhost:8787/mcp (Streamable HTTP)
 ```
 
+### Widget preview
+
+Edit CSS in `src/widget.ts` and see the result live in a browser:
+
+```bash
+npm run preview         # build + serve at http://localhost:3333
+npm run preview:watch   # tsc --watch + serve + live-reload (single terminal)
+```
+
+`preview:watch` spawns `tsc --watch` itself — no second terminal needed.
+Edit `src/widget.ts`, save, and the browser auto-refreshes.
+
+Override the port: `PREVIEW_PORT=4000 npm run preview`.
+
 ## Connecting to ChatGPT desktop
 
 ### STDIO
