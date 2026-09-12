@@ -89,25 +89,23 @@ async function main() {
   if (errors.length > 0) {
     throw new Error(`widget boot errors: ${JSON.stringify(errors)}`);
   }
-  // 1b. OBSERVABLE VISUAL STRUCTURE (approved redesign): the static chrome
-  //     must render the airy-white composition — compact blue status pill
-  //     top-left, reviewed/left counters top-right, centered deck pill, slim
-  //     progress bar, large outlined flashcard with subtle shadow, flip hint
-  //     with an icon, full-width answer input, two equal action buttons with
-  //     icons, four equal numbered tinted rating tiles, centered quiet End
-  //     Session, and the polite inline feedback row.
+  // 1b. OBSERVABLE VISUAL STRUCTURE (approved design): the static chrome
+  //     renders the airy-white composition — session-info section (accent
+  //     session-type label + muted mode label), slim progress bar, large
+  //     outlined flashcard with subtle shadow, flip hint with an icon,
+  //     full-width answer input, two equal action buttons with icons, four
+  //     equal numbered tinted rating tiles, centered quiet End Session, and
+  //     the polite inline feedback row.
   {
     const d = dom.window.document;
     const wrap = d.getElementById('app');
     if (!wrap) throw new Error('app root missing');
-    const pill = wrap.querySelector('.tag-pill');
-    if (!pill) throw new Error('status pill (.tag-pill) missing');
-    const pillDot = pill.querySelector('.dot');
-    if (!pillDot) throw new Error('status pill dot missing');
-    if (!d.querySelector('.top-row')) throw new Error('top row (.top-row) missing');
-    if (!d.querySelector('.top-row .counters')) throw new Error('counters (.counters) missing in top row');
-    const deckRow = d.querySelector('.deck-row');
-    if (!deckRow || !deckRow.querySelector('.deck-label')) throw new Error('centered deck pill missing');
+    const sessionInfo = wrap.querySelector('.session-info');
+    if (!sessionInfo) throw new Error('session info (.session-info) missing');
+    const sessionType = sessionInfo.querySelector('.session-type');
+    if (!sessionType) throw new Error('session type label (.session-type) missing');
+    const modeLabel = d.getElementById('modeLabel');
+    if (!modeLabel) throw new Error('mode label (#modeLabel) missing');
     if (!d.querySelector('.progress-bar')) throw new Error('progress bar missing');
     if (!d.querySelector('.progress-bar > i#progressFill')) throw new Error('progress fill (i#progressFill) missing');
     // Status text (#progress) must sit ABOVE the progress bar (reference order).
@@ -165,11 +163,9 @@ async function main() {
     if (!css.includes('clamp(22px,4.5vw,30px)')) throw new Error('fluid large card text missing');
     if (!css.includes('prefers-reduced-motion: reduce')) throw new Error('reduced-motion guard missing');
     if (!css.includes('@media (max-width:380px)')) throw new Error('narrow-iframe responsive step missing');
-    // Restrained status pill: near-white fill, blue border, blue dot/text.
-    if (!css.includes('background:#f5f8ff; color:var(--accent);')) throw new Error('status pill near-white fill missing');
-    if (!css.includes('border:1px solid #c7d6f5')) throw new Error('status pill blue border missing');
-    if (!css.includes('.tag-pill .dot { width:6px; height:6px; border-radius:50%; background:var(--accent);')) throw new Error('status pill blue dot missing');
-    console.log('PASS observable visual structure: pill/counters/deck/progress/card/hint/input/actions/tiles/end/feedback');
+    // Session info section: accent session-type label, muted mode label.
+    if (!css.includes('.session-info .session-type { color:var(--accent); }')) throw new Error('session type accent color missing');
+    console.log('PASS observable visual structure: session-info/progress/card/hint/input/actions/tiles/end/feedback');
   }
 
   // 2. Unsolicited initial tool-result seeds the empty bootstrap.
@@ -196,24 +192,26 @@ async function main() {
       },
     },
   }));
-  // Presentation-only label formatting: the pill shows the plain mode name
-  // (no brackets, no "· N cards due" suffix) and the counters read
-  // "N reviewed | M left" (uppercased by CSS) — the raw session modeTag is
-  // untouched.
-  const pillText = dom.window.document.getElementById('modeTag')?.textContent;
-  if (pillText !== 'Spaced repetition review') {
-    throw new Error(`pill should read "Spaced repetition review" (no brackets/due suffix), got ${JSON.stringify(pillText)}`);
+  // Presentation-only label formatting: the session-type label shows the
+  // session type, the mode label shows "Due cards" or "Custom", and the
+  // progress text shows "status · N reviewed, M remaining".
+  const sessionTypeText = dom.window.document.getElementById('sessionTypeLabel')?.textContent;
+  if (!sessionTypeText || !sessionTypeText.includes('Spaced repetition')) {
+    throw new Error(`session type should include "Spaced repetition", got ${JSON.stringify(sessionTypeText)}`);
   }
-  const countersText = dom.window.document.getElementById('cardLabel')?.textContent;
-  if (countersText !== '0 reviewed | 2 left') {
-    throw new Error(`counters should read "0 reviewed | 2 left", got ${JSON.stringify(countersText)}`);
+  const modeText = dom.window.document.getElementById('modeLabel')?.textContent;
+  if (modeText !== 'Mode: Due cards') {
+    throw new Error(`mode label should read "Mode: Due cards", got ${JSON.stringify(modeText)}`);
   }
-  // Source + per-card deck labels: a custom/tag session shows the source
-  // pill ("Custom") and the CURRENT CARD's own deck name in the deck label.
+  const progressText = dom.window.document.getElementById('progress')?.textContent;
+  if (!progressText || !progressText.includes('0 reviewed')) {
+    throw new Error(`progress should include "0 reviewed", got ${JSON.stringify(progressText)}`);
+  }
+  // Source + per-card deck labels: a custom/tag session shows "Mode: Custom"
+  // in the mode label and the CURRENT CARD's own deck name in the card face.
   const domSrc = new JSDOM(buildReviewWidgetHtml({
     session: {
       id: 's-src', status: 'active', cardType: 'qa',
-      modeTag: '[Spaced repetition review · 2 cards · Custom]',
       cardIds: ['c1', 'c2'], currentIndex: 0, reviewedCount: 0, remainingCount: 2, limit: 100,
       source: { type: 'custom', tags: ['vocab'], cardIds: ['c1', 'c2'] },
     },
@@ -222,19 +220,18 @@ async function main() {
     endTool: 'end_review_session', getTool: 'get_review_session',
   }), { runScripts: 'dangerously', pretendToBeVisual: true, url: 'https://cuelingua-mcp-767542644824.us-central1.run.app/' });
   await sleep(20);
-  const srcPill = domSrc.window.document.getElementById('sourceLabel')?.textContent;
-  if (srcPill !== 'Custom') {
-    throw new Error(`custom session source pill should read "Custom", got ${JSON.stringify(srcPill)}`);
+  const srcMode = domSrc.window.document.getElementById('modeLabel')?.textContent;
+  if (srcMode !== 'Mode: Custom') {
+    throw new Error(`custom session mode label should read "Mode: Custom", got ${JSON.stringify(srcMode)}`);
   }
-  const deckPill = domSrc.window.document.getElementById('deckLabel')?.textContent;
-  if (deckPill !== 'Spanish') {
-    throw new Error(`current-card deck label should read "Spanish", got ${JSON.stringify(deckPill)}`);
+  const deckLabel = domSrc.window.document.getElementById('deckName')?.textContent;
+  if (deckLabel !== 'Spanish') {
+    throw new Error(`current-card deck label should read "Spanish", got ${JSON.stringify(deckLabel)}`);
   }
-  // Deck-only session: source pill shows the deck name.
+  // Deck-only session: mode label shows "Mode: Due cards".
   const domDeck = new JSDOM(buildReviewWidgetHtml({
     session: {
       id: 's-deck', status: 'active', cardType: 'qa',
-      modeTag: '[Spaced repetition review · 2 cards · Spanish]',
       cardIds: ['c1', 'c2'], currentIndex: 0, reviewedCount: 0, remainingCount: 2, limit: 100,
       source: { type: 'deck', deckId: 'deck-1', deckName: 'Spanish' },
     },
@@ -243,15 +240,14 @@ async function main() {
     endTool: 'end_review_session', getTool: 'get_review_session',
   }), { runScripts: 'dangerously', pretendToBeVisual: true, url: 'https://cuelingua-mcp-767542644824.us-central1.run.app/' });
   await sleep(20);
-  const srcPillDeck = domDeck.window.document.getElementById('sourceLabel')?.textContent;
-  if (srcPillDeck !== 'Spanish') {
-    throw new Error(`deck-only source pill should read "Spanish", got ${JSON.stringify(srcPillDeck)}`);
+  const deckMode = domDeck.window.document.getElementById('modeLabel')?.textContent;
+  if (deckMode !== 'Mode: Due cards') {
+    throw new Error(`deck-only session mode label should read "Mode: Due cards", got ${JSON.stringify(deckMode)}`);
   }
-  // Due-only session (no selectors): source pill reads "Due cards".
+  // Due-only session (no selectors): mode label reads "Mode: Due cards".
   const domDue = new JSDOM(buildReviewWidgetHtml({
     session: {
       id: 's-due', status: 'active', cardType: 'qa',
-      modeTag: '[Spaced repetition review · 1 cards · Due cards]',
       cardIds: ['c1'], currentIndex: 0, reviewedCount: 0, remainingCount: 1, limit: 100,
       source: { type: 'due' },
     },
@@ -260,13 +256,13 @@ async function main() {
     endTool: 'end_review_session', getTool: 'get_review_session',
   }), { runScripts: 'dangerously', pretendToBeVisual: true, url: 'https://cuelingua-mcp-767542644824.us-central1.run.app/' });
   await sleep(20);
-  const srcPillDue = domDue.window.document.getElementById('sourceLabel')?.textContent;
-  if (srcPillDue !== 'Due cards') {
-    throw new Error(`due source pill should read "Due cards", got ${JSON.stringify(srcPillDue)}`);
+  const dueMode = domDue.window.document.getElementById('modeLabel')?.textContent;
+  if (dueMode !== 'Mode: Due cards') {
+    throw new Error(`due session mode label should read "Mode: Due cards", got ${JSON.stringify(dueMode)}`);
   }
-  console.log('PASS source pill (Custom/deck-name/Due cards) + per-card deck label (mixed-deck safe)');
+  console.log('PASS mode label (Custom/Due cards) + per-card deck label (mixed-deck safe)');
 
-  console.log('PASS unsolicited tool-result seeded the session (front = Q1, ratings available; pill + counter labels formatted)');
+  console.log('PASS unsolicited tool-result seeded the session (front = Q1, ratings available; mode + progress labels formatted)');
 
   // 3. Async tools/call response resolves via the waiter path.
   const sent = post.filter((m) => m.method === 'tools/call');
@@ -598,8 +594,8 @@ async function main() {
 
 
   // 4d1b. DEFERRED-SUBMIT COUNTER REGRESSION: the submit promise is HELD
-  //       unresolved while we assert that the counters (cardLabel + progress)
-  //       optimistically project reviewed +1 / remaining -1 IMMEDIATELY after
+  //       unresolved while we assert that the progress counters
+  //       optimistically project remaining -1 IMMEDIATELY after
   //       clicking Good — before any server response. Resolving the held
   //       submit with an authoritative response (which ACKS the request via
   //       processedRequestIds + reviewedCardIds) must NOT double-count.
@@ -638,31 +634,23 @@ async function main() {
       throw new Error(`deferred-submit counter errors (pre-resolve): ${JSON.stringify(errsD)}`);
     }
     // IMMEDIATELY (submit unresolved): the click alone must project
-    // reviewed +1 / remaining -1 in BOTH the counter label and the status.
-    const labelD = domD.window.document.getElementById('cardLabel').textContent;
-    if (labelD !== '1 reviewed | 1 left') {
-      throw new Error(`optimistic counter missing pre-resolve: cardLabel=${JSON.stringify(labelD)}, expected '1 reviewed | 1 left'`);
-    }
+    // remaining -1 in the status (reviewed stays server-authoritative).
     const progressD = domD.window.document.getElementById('progress').textContent;
-    if (!progressD.includes('1 reviewed') || !progressD.includes('1 remaining')) {
+    if (!progressD.includes('0 reviewed') || !progressD.includes('1 remaining')) {
       throw new Error(`optimistic progress missing pre-resolve: ${JSON.stringify(progressD)}`);
     }
     // Resolve the held submit: the authoritative response ACKS this requestId
-    // (processedRequestIds + reviewedCardIds) — counters must NOT double-count.
+    // — counters must NOT double-count.
     resolveSubmitD();
     await sleep(80);
     if (errsD.length > 0) {
       throw new Error(`deferred-submit counter errors (post-resolve): ${JSON.stringify(errsD)}`);
     }
-    const labelD2 = domD.window.document.getElementById('cardLabel').textContent;
-    if (labelD2 !== '1 reviewed | 1 left') {
-      throw new Error(`authoritative response double-counted: cardLabel=${JSON.stringify(labelD2)}, expected '1 reviewed | 1 left'`);
-    }
     const progressD2 = domD.window.document.getElementById('progress').textContent;
     if (!progressD2.includes('1 reviewed') || !progressD2.includes('1 remaining')) {
       throw new Error(`authoritative progress double-counted: ${JSON.stringify(progressD2)}`);
     }
-    console.log('PASS deferred submit: counters project reviewed +1 / remaining -1 immediately; no double count after the authoritative ack');
+    console.log('PASS deferred submit: counters project remaining -1 immediately; no double count after the authoritative ack');
   }
 
 
@@ -1725,8 +1713,8 @@ async function main() {
       throw new Error(`v2 setup: expected V1? front, got ${JSON.stringify(docV.getElementById('frontInner').textContent)}`);
     }
     // Progress denominator is the v2 limit (3), not a cardIds array.
-    const labelV = docV.getElementById('cardLabel').textContent;
-    if (!/0 reviewed \| 3 left/.test(labelV)) {
+    const labelV = docV.getElementById('progress').textContent;
+    if (!labelV.includes('0 reviewed') || !labelV.includes('3 remaining')) {
       throw new Error(`v2: progress label wrong: ${JSON.stringify(labelV)}`);
     }
     // Rate card 1: the submit must carry expectedPosition 0 (the v2 claim

@@ -403,6 +403,13 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // correlation + staleness).
   var inflightByCard = {};         // expectedCardId -> item { rating, requestId, expectedCardId }
   var inflightByRequest = {};      // requestId -> item
+  // Count-based optimistic delta: tracks how many ratings this widget
+  // session has submitted minus how many the server has acknowledged via
+  // session.reviewedCount.  This avoids the stale-visibleStatus trap where
+  // the pre-computed server string doesn't reflect in-flight ratings.
+  var totalRatedCount = 0;         // ratings submitted since session adopt
+  var baselineReviewedCount = 0;   // session.reviewedCount at session start (never advanced)
+  var adoptedIndex = (data.session && typeof data.session.currentIndex === 'number') ? data.session.currentIndex : 0;  // highest currentIndex seen (adopted or optimistically set)
 
   // True when a card object is MINIMAL — only an id (no renderable content).
   // Some hosts strip the hidden _meta and return { session, card: { id } }.
@@ -493,7 +500,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
       if (s.status === 'completed' || s.status === 'ended') return true;
       var idsV2 = sessionQueueIds(s);
       var remainV2 = s.remainingQueueCount != null ? s.remainingQueueCount : (s.remainingCount != null ? s.remainingCount : (idsV2.length || 0));
-      if (remainV2 - optimisticPending() <= 0) return true;
+      if (remainV2 - optimisticReviewDelta() <= 0) return true;
       return false;
     }
     var ids = sessionQueueIds(s);
@@ -632,7 +639,51 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   //    next-card state — a stale response for an already-rated card keeps
   //    the done panel (no blank/disabled card).
   function adoptServerState(session, card, preloaded) {
+    // Monotonic session reconciliation: NEVER regress authoritative session
+    // counters. A stale or out-of-order snapshot that arrives after the
+    // widget has advanced (via optimistic rating or a newer response) must
+    // not overwrite reviewedCount, remainingCount, or position with lower
+    // values. Only strictly-advancing snapshots are adopted.
+    var prev = data.session || {};
+    var prevSessionId = prev.id;
+    var prevReviewed = prev.reviewedCount || 0;
+    var prevRemaining = prev.remainingCount != null ? prev.remainingCount : Infinity;
+    var prevIndex = prev.currentIndex || 0;
+    var newReviewed = session.reviewedCount || 0;
+    var newRemaining = session.remainingCount != null ? session.remainingCount : Infinity;
+    var newIndex = session.currentIndex || 0;
+    // A new session (id changed) is always adopted (counters reset to 0).
+    var isNewSession = session.id && session.id !== prevSessionId;
+    // Stale-snapshot guard: a response whose currentIndex is strictly less
+    // than the highest adopted/optimistic index is stale — it predates a
+    // newer state the widget has already advanced past.  Skip session adopt
+    // to prevent seedQueueFromSession from rebuilding the queue from stale
+    // cardIds (the rapid-click freeze).  Equal-index responses are ALLOWED
+    // through: they carry the authoritative counters + next card for the
+    // current position and must reconcile even if the index matches an
+    // optimistic advance.  Only merge additive preloads (never shrink).
+    if (!isNewSession && prev.id && session.id === prev.id) {
+      if (newIndex < adoptedIndex) {
+        if (Array.isArray(preloaded)) mergeQueueCards(preloaded);
+        return;
+      }
+      // Also block regressions in reviewedCount/remainingCount.
+      if (newReviewed < prevReviewed || newRemaining > prevRemaining) {
+        if (Array.isArray(preloaded)) mergeQueueCards(preloaded);
+        return;
+      }
+    }
     data.session = session;
+    adoptedIndex = newIndex;
+    // baselineReviewedCount: set ONCE at session start to the session's
+    // reviewedCount. Never advanced by same-session adoptions — the delta
+    // formula totalRatedCount - max(0, curReviewed - baseline) naturally
+    // drops to 0 as curReviewed rises. Only reset on session ID change.
+    if (isNewSession) {
+      baselineReviewedCount = newReviewed;
+      totalRatedCount = 0;
+      adoptedIndex = newIndex;
+    }
     // v2: track the current card's stable queue position from the adopted
     // session (currentPosition) or its bounded queueWindow; the widget never
     // holds the full queue, so this position is the claim target for submits.
@@ -662,12 +713,22 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     // order is exact). This is a merge, never a shrink-to-response.
     seedQueueFromSession();
     if (card && card.id && (rated[card.id] || reviewed.indexOf(card.id) !== -1)) {
-      // A stale/older response for a card that was already rated (or whose
-      // rating is in flight): keep the displayed card, apply only the
-      // authoritative session counters. Never regress. When an optimistic
-      // completion is showing, this stale response cannot resurrect the
-      // last card — the done panel stays until a real terminal/next state.
-      if (!optimisticDone) render();
+      // The response card was already rated (or its rating is in flight).
+      // Clear any premature optimistic completion — the server has
+      // acknowledged this card, so the done panel is no longer valid.
+      optimisticDone = false;
+      // If the DISPLAYED card is also rated, advance from the rebuilt queue
+      // so the user is not stuck.  Otherwise keep the displayed card — it
+      // is still valid and the response only carries counter updates.
+      if (data.card && data.card.id && (rated[data.card.id] || reviewed.indexOf(data.card.id) !== -1)) {
+        while (queue.length && queue[0].id && (rated[queue[0].id] || reviewed.indexOf(queue[0].id) !== -1)) queue.shift();
+        if (queue.length) {
+          var nextFromQueue = queue.shift();
+          cacheFullCard(nextFromQueue);
+          data.card = nextFromQueue;
+        }
+      }
+      render();
       return;
     }
     // A REAL authoritative state: clear the optimistic completion — the
@@ -728,6 +789,11 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     var sc = res.structuredContent || (res.content && res.content[0] && res.content[0].structuredContent);
     if (sc && sc.id && (sc.status === 'ended' || sc.status === 'completed')) {
       data.session = sc;
+      adoptedIndex = -1;
+      // Only advance baseline upward — never regress.
+      if ((sc.reviewedCount || 0) > (baselineReviewedCount || 0)) {
+        baselineReviewedCount = sc.reviewedCount || 0;
+      }
       data.card = null;
       queue = [];
       optimisticDone = false;
@@ -738,34 +804,24 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     }
   }
 
-  // Optimistic counter projection: authoritative session counts plus the
-  // in-flight rating deltas the server has NOT already acknowledged. A
-  // rating is acknowledged when its requestId appears in the authoritative
-  // session.processedRequestIds (v1) / lastRequestId (v2) or its card id in
-  // session.reviewedCardIds (v1) — those ratings are already inside the
-  // authoritative counts. v2 roots are BOUNDED (no processedRequestIds /
-  // reviewedCardIds arrays), so acknowledgement is the echo of lastRequestId
-  // on the adopted session. Synchronous: called from render, so a rating
-  // bumps the counters immediately, before any submit resolves. Never
-  // mutates the authoritative session.
-  function optimisticReviewDelta(sess) {
-    if (!sess) return 0;
-    var v2 = isV2SessionState(sess);
-    var processed = v2 ? [] : (Array.isArray(sess.processedRequestIds) ? sess.processedRequestIds : []);
-    var reviewedCards = v2 ? [] : (Array.isArray(sess.reviewedCardIds) ? sess.reviewedCardIds : []);
-    var lastReq = sess.lastRequestId;
-    var pending = 0;
-    for (var key in inflightByCard) {
-      var item = inflightByCard[key];
-      if (!item) continue;
-      if (processed.indexOf(item.requestId) !== -1) continue;
-      if (reviewedCards.indexOf(item.expectedCardId) !== -1) continue;
-      if (v2 && lastReq === item.requestId) continue;
-      pending += 1;
-    }
-    return pending;
+  // Optimistic counter projection: ratings submitted by this widget session
+  // minus ratings acknowledged by the server via session.reviewedCount.
+  // The count-based approach works uniformly for both v1 and v2 sessions
+  // without needing per-item acknowledgment.  baselineReviewedCount is set
+  // ONCE at session start (= reviewedCount when the session began) and
+  // never advanced by same-session adoptions.  totalRatedCount is the
+  // widget's local submit count since that baseline; it is decremented on
+  // failed/empty responses so only acknowledged ratings inflate the delta.
+  // Synchronous: called from render, so a rating bumps the display
+  // immediately.  Never mutates the authoritative session.
+  function optimisticReviewDelta() {
+    // Server-acknowledged count since baseline: how many of the baseline's
+    // reviewedCount have been eaten by the current session's reviewedCount.
+    var cur = data.session || {};
+    var curReviewed = cur.reviewedCount || 0;
+    var serverAcked = Math.max(0, curReviewed - (baselineReviewedCount || 0));
+    return Math.max(0, totalRatedCount - serverAcked);
   }
-  function optimisticPending() { return optimisticReviewDelta(data.session || {}); }
 
   function render() {
     var s = data.session || {};
@@ -775,14 +831,22 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     var modeText = src && src.type === 'custom' ? 'Custom' : 'Due cards';
     sessionTypeLabel.textContent = 'Session type: Spaced repetition';
     modeLabel.textContent = 'Mode: ' + modeText;
-    // Projected counters: authoritative session counts plus the optimistic
-    // delta for in-flight ratings the server has not yet acknowledged
-    // (processedRequestIds/reviewedCardIds). A rating bumps the display
-    // synchronously; an acknowledged response never double-counts.
-    var optimistic = optimisticReviewDelta(s);
-    var reviewed = (s.reviewedCount || 0) + optimistic;
+    // Projected counters: the server-authoritative reviewed count (no
+    // inflation), with the optimistic delta applied only to remaining
+    // (widget-submitted minus server-acknowledged) for forward-progress
+    // display. A rating bumps remaining synchronously; an acknowledged
+    // response never double-counts.
+    var optimistic = optimisticReviewDelta();
+    // Apply the optimistic delta ONLY to remaining: reviewed is the
+    // server-authoritative count (never inflated by in-flight ratings).
+    // This keeps reviewed + remaining <= total at all times — the delta
+    // only shows forward progress on the remaining queue, not double-counts.
+    var reviewed = s.reviewedCount || 0;
     var remaining = s.remainingCount != null ? Math.max(0, s.remainingCount - optimistic) : s.remainingCount;
-    progress.textContent = (optimistic === 0 && s.visibleStatus) || (s.status + ' \u00b7 ' + reviewed + ' reviewed, ' + (remaining != null ? remaining : '?') + ' remaining');
+    // Always use computed counters — never stale visibleStatus (a pre-baked
+    // server string that doesn't account for optimistic deltas or monotonic
+    // session reconciliation).
+    progress.textContent = s.status + ' \u00b7 ' + reviewed + ' reviewed, ' + (remaining != null ? remaining : '?') + ' remaining';
     // Progress denominator: v1 sessions carry the full root cardIds; v2 roots
     // are BOUNDED so the total queue size is the persisted limit (or the
     // bounded window length as a fallback - never a fabricated number).
@@ -822,6 +886,12 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         renderedCardId = card.id;
         cardShell.classList.remove('flipped');
         cardShell.classList.add('resetting');
+        // Only reset the typed-answer input when the card ACTUALLY changes;
+        // an async session update that re-renders the same card must not
+        // wipe the user's in-progress answer text.
+        answerInput.value = '';
+        typedPrompt.textContent = text(card.selfTest) || (sessionCardType() === 'cloze' ? 'Type the answer for the blank' : 'Type your answer');
+        answerInput.focus();
       }
       // Deck name shown inside the card face above the word/content. Falls
       // back to the session name, then hidden (empty) during transition when
@@ -850,9 +920,6 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         revealBtn.disabled = false;
         endSessionBtn.disabled = false;
       }
-      answerInput.value = '';
-      typedPrompt.textContent = text(card.selfTest) || (sessionCardType() === 'cloze' ? 'Type the answer for the blank' : 'Type your answer');
-      answerInput.focus();
     }
     if (doneMode) {
       doneTitle.textContent = s.continuationAvailable
@@ -1264,6 +1331,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     // Cache the RATED card before it leaves the display (a late id-only
     // response for it still resolves full from the cache).
     cacheFullCard(data.card);
+    totalRatedCount += 1;
     requestSeq += 1;
     var item = { rating: rating, requestId: 'req-' + Date.now().toString(36) + '-' + requestSeq, expectedCardId: expectedCardId, expectedPosition: expectedPosition };
     inflightByCard[expectedCardId] = item;
@@ -1285,6 +1353,16 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
       // the adopted current position.
       if (typeof nextCard.position === 'number') data.currentPosition = nextCard.position;
       else if (typeof data.currentPosition === 'number') data.currentPosition += 1;
+      // Advance adoptedIndex so stale responses with a lower currentIndex
+      // cannot pass the guard and corrupt the queue via seedQueueFromSession.
+      // v2: data.currentPosition is the stable queue position.
+      // v1: no currentPosition; use session.currentIndex + 1 (the next
+      // position after this rated card, since currentIndex hasn't been
+      // updated by the server yet).
+      var pos = typeof data.currentPosition === 'number'
+        ? data.currentPosition
+        : ((data.session && typeof data.session.currentIndex === 'number') ? data.session.currentIndex + 1 : 0);
+      if (pos > adoptedIndex) adoptedIndex = pos;
       render();
       submitItem(item);
       return;
@@ -1336,23 +1414,26 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
           // displayed next card, the full displayed card is PRESERVED (never
           // blanked/regressed); an id-only response resolves from the cache.
           // The committed rating leaves the in-flight maps BEFORE adopting:
-          // the authoritative counts already include it, so the optimistic
-          // projection must not transiently add its delta back when the
-          // minimal submit response omits processedRequestIds/reviewedCardIds.
+          // the authoritative counts already include it, so the count-based
+          // optimistic delta (= totalRated - max(0, curReviewed - baseline))
+          // correctly drops as curReviewed rises.
           clearInflightItem(item);
           adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded);
         } else {
           // No usable state in the response (e.g. a host that strips _meta):
           // re-sync before re-enabling so the user rates the authoritative
-          // current card. The item's bookkeeping is cleared FIRST (see the
-          // catch path) so the sync can restore the still-current card.
+          // current card. The item's bookkeeping is cleared FIRST so the
+          // sync can restore the still-current card.  Decrement the local
+          // submit counter so the rating doesn't permanently inflate the
+          // optimistic delta (the server never acknowledged it).
           clearInflightItem(item, true);
+          totalRatedCount = Math.max(0, totalRatedCount - 1);
           syncAfterSubmit(gen);
         }
         // Success: the rating COMMITTED — keep ratedCardIds[cardId] true so a
         // late/out-of-order duplicate or unsolicited response for this card
-        // (MCP session summaries omit reviewedCardIds) can never regress the
-        // display. Only the in-flight maps are cleared.
+        // can never regress the display. Only the in-flight maps are cleared
+        // (totalRatedCount stays — the rating was accepted).
         clearInflightItem(item);
         render();
         statusEl.textContent = '';
@@ -1366,7 +1447,20 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         // item's maps AND its ratedCardIds flag are cleared BEFORE the sync —
         // otherwise adoptServerState would suppress the failed card (it is
         // still marked rated) and the user could never retry it.
+        // Decrement the local submit counter so the failed rating doesn't
+        // permanently inflate the optimistic delta.
         clearInflightItem(item, true);
+        totalRatedCount = Math.max(0, totalRatedCount - 1);
+        // RECOVERY: reset the optimistic queue state when this was the only
+        // in-flight item. The optimistic shift advanced adoptedIndex past the
+        // session's currentIndex; without resetting, the stale guard in
+        // adoptServerState blocks the authoritative recovery snapshot
+        // (currentIndex < adoptedIndex). Safe only when no other in-flight
+        // items depend on the advanced index — otherwise the stale guard is
+        // still needed for those items.
+        if (Object.keys(inflightByCard).length === 0) {
+          adoptedIndex = (data.session && typeof data.session.currentIndex === 'number') ? data.session.currentIndex : 0;
+        }
         syncAfterSubmit(gen);
       });
   }
@@ -1374,10 +1468,9 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // Removes an item from the in-flight maps (by card id and requestId). The
   // ratedCardIds flag is unmarked ONLY on FAILED/empty responses (unmark ===
   // true) so that card can be retried; a SUCCESSFUL submit keeps the card
-  // marked rated — MCP session summaries omit reviewedCardIds, so the local
-  // flag is the only guard that stops a late/out-of-order duplicate response
-  // for a committed card from regressing the display. Other in-flight items'
-  // cards stay marked (never double-rated).
+  // marked rated so the local flag stops a late duplicate from regressing
+  // the display. Other in-flight items' cards stay marked (never
+  // double-rated).
   function clearInflightItem(item, unmark) {
     if (!item) return;
     if (item.requestId && inflightByRequest[item.requestId] === item) {

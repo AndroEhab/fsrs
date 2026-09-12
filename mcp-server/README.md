@@ -540,8 +540,13 @@ CMD ["node", "dist/index.js"]
 gcloud builds submit --tag gcr.io/<project-id>/fsrs-mcp-server
 gcloud run deploy fsrs-mcp-server --image gcr.io/<project-id>/fsrs-mcp-server \
   --region us-central1 --allow-unauthenticated --port 8080 \
+  --cpu-throttling --max 5 \
   --set-secrets=CUELINGUA_API_KEY=cuelingua-api-key:latest
 ```
+
+Keep `--cpu-throttling` enabled unless always-allocated CPU is a deliberate
+requirement. The `--max 5` limit is a cost and runaway-scaling guard; adjust it
+only after reviewing expected connector traffic.
 
 ## Connecting to ChatGPT
 

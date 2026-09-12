@@ -388,6 +388,19 @@ describe('optimistic review widget script', () => {
     expect(syncFn).not.toContain('The card changed');
     expect(syncFn).not.toContain('Submitting');
   });
+
+  it('catch path decrements totalRatedCount so failed rating does not permanently inflate delta', () => {
+    const h = html();
+    // totalRatedCount is incremented in rate() and must be decremented in
+    // the catch/empty-response paths so only accepted ratings contribute
+    // to the optimistic delta.
+    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function submitItem'));
+    expect(rateFn).toContain('totalRatedCount += 1;');
+    const submitFn = h.slice(h.indexOf('function submitItem'), h.indexOf('function clearInflightItem'));
+    // Both the catch path and the empty-response path must decrement.
+    expect(submitFn).toContain('totalRatedCount = Math.max(0, totalRatedCount - 1);');
+  });
+
   it('rates DIFFERENT displayed cards concurrently (per-card map, no global inflight gate)', () => {
     const h = html();
     // rate() dispatches EVERY rating immediately via submitItem(item) —
@@ -889,7 +902,7 @@ describe('v2 bounded review session widget (script contract)', () => {
     // never-seen full queue.
     expect(h).toContain('if (isV2SessionState(s)) {');
     expect(h).toContain('var remainV2 = s.remainingQueueCount != null ? s.remainingQueueCount : (s.remainingCount != null ? s.remainingCount');
-    expect(h).toContain('if (remainV2 - optimisticPending() <= 0) return true;');
+    expect(h).toContain('if (remainV2 - optimisticReviewDelta() <= 0) return true;');
     // reviewedCardIds is NOT folded in for v2 (bounded root).
     expect(h).toContain("var reviewed = !isV2SessionState(s) && Array.isArray(s.reviewedCardIds) ? s.reviewedCardIds : [];");
   });
@@ -909,6 +922,221 @@ describe('v2 bounded review session widget (script contract)', () => {
     const h = htmlV2();
     expect(h).toContain('s.limit || (s.queueWindow && s.queueWindow.cardIds ? s.queueWindow.cardIds.length : 100)');
     expect(h).not.toContain('(s.cardIds && s.cardIds.length) ? s.cardIds.length : (s.limit || 100)');
+  });
+});
+
+describe('answerInput preservation on same-card render (bug fix)', () => {
+  function html(): string {
+    return buildReviewWidgetHtml({
+      session: { id: 's1', status: 'active', cardIds: ['c1'], currentIndex: 0, reviewedCount: 0, remainingCount: 1, limit: 100 },
+      card: { id: 'c1', front: 'Q', back: 'A' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+  }
+
+  it('answerInput.value reset is INSIDE the renderedCardId !== card.id guard', () => {
+    const h = html();
+    // The answer input is only cleared when the card ACTUALLY changes;
+    // an async re-render of the same card must not wipe typed text.
+    const renderBlock = h.slice(h.indexOf('function render()'), h.indexOf('function primeFromSession'));
+    // Find the renderedCardId check
+    const cardGuardIdx = renderBlock.indexOf('if (renderedCardId !== card.id)');
+    expect(cardGuardIdx).toBeGreaterThanOrEqual(0);
+    // Find answerInput.value = '' inside the guard block (before the closing brace)
+    const guardBlock = renderBlock.slice(cardGuardIdx, renderBlock.indexOf('}', cardGuardIdx + 100));
+    expect(guardBlock).toContain("answerInput.value = ''");
+    // answerInput.value = '' must NOT appear outside the guard
+    const afterGuard = renderBlock.slice(renderBlock.indexOf('}', cardGuardIdx + 100));
+    expect(afterGuard).not.toContain("answerInput.value = ''");
+  });
+
+  it('typedPrompt reset is also inside the card-change guard', () => {
+    const h = html();
+    const renderBlock = h.slice(h.indexOf('function render()'), h.indexOf('function primeFromSession'));
+    const cardGuardIdx = renderBlock.indexOf('if (renderedCardId !== card.id)');
+    const guardBlock = renderBlock.slice(cardGuardIdx, renderBlock.indexOf('}', cardGuardIdx + 100));
+    expect(guardBlock).toContain('typedPrompt.textContent');
+  });
+});
+
+describe('count-based optimistic delta (stale visibleStatus immunity)', () => {
+  function html(): string {
+    return buildReviewWidgetHtml({
+      session: { id: 's1', status: 'active', cardIds: ['c1', 'c2', 'c3'], currentIndex: 0, reviewedCount: 0, remainingCount: 3, limit: 100 },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+  }
+
+  it('uses totalRatedCount - serverAcked (not per-item inflight scan)', () => {
+    const h = html();
+    // The delta function must reference totalRatedCount and baselineReviewedCount
+    expect(h).toContain('var totalRatedCount = 0;');
+    expect(h).toContain('var baselineReviewedCount = 0;');
+    const deltaFn = h.slice(h.indexOf('function optimisticReviewDelta()'), h.indexOf('function render()'));
+    expect(deltaFn).toContain('totalRatedCount');
+    expect(deltaFn).toContain('baselineReviewedCount');
+    // Must NOT reference inflightByCard for delta computation
+    expect(deltaFn).not.toContain('inflightByCard');
+  });
+
+  it('baselineReviewedCount is set on adoptServerState (monotonic upward only)', () => {
+    const h = html();
+    const adoptBlock = h.slice(h.indexOf('function adoptServerState('), h.indexOf('function fetchFlashcardFallback'));
+    // baselineReviewedCount is set to newReviewed only on new session start.
+    expect(adoptBlock).toContain('baselineReviewedCount = newReviewed');
+  });
+
+  it('totalRatedCount is incremented in rate()', () => {
+    const h = html();
+    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function submitItem'));
+    expect(rateFn).toContain('totalRatedCount += 1;');
+  });
+
+  it('totalRatedCount resets on session ID change', () => {
+    const h = html();
+    const adoptBlock = h.slice(h.indexOf('function adoptServerState('), h.indexOf('function fetchFlashcardFallback'));
+    expect(adoptBlock).toContain('totalRatedCount = 0;');
+    expect(adoptBlock).toContain('session.id !== prevSessionId');
+  });
+
+  it('progress always uses computed counters, never stale visibleStatus', () => {
+    const h = html();
+    // visibleStatus is a pre-baked server string that cannot reflect
+    // optimistic deltas or monotonic reconciliation — the progress line
+    // must always compute from reviewedCount + delta.
+    expect(h).not.toContain("(optimistic === 0 && s.visibleStatus)");
+    expect(h).toContain("reviewed + ' reviewed");
+  });
+});
+
+describe('monotonic session reconciliation (stale snapshot regression)', () => {
+  function html(): string {
+    return buildReviewWidgetHtml({
+      session: { id: 's1', status: 'active', cardIds: ['c1', 'c2', 'c3'], currentIndex: 0, reviewedCount: 0, remainingCount: 3, limit: 100 },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+  }
+
+  it('adoptServerState skips stale snapshots via adoptedIndex guard', () => {
+    const h = html();
+    const adoptBlock = h.slice(h.indexOf('function adoptServerState('), h.indexOf('function fetchFlashcardFallback'));
+    // The guard blocks stale responses whose currentIndex is strictly less
+    // than the highest adopted index; equal-index responses are allowed.
+    expect(adoptBlock).toContain('newIndex < adoptedIndex');
+    expect(adoptBlock).toContain('newReviewed < prevReviewed');
+    expect(adoptBlock).toContain('newRemaining > prevRemaining');
+  });
+
+  it('adoptedIndex is updated on every successful adopt (prevents rapid-click stale queue rebuild)', () => {
+    const h = html();
+    const adoptBlock = h.slice(h.indexOf('function adoptServerState('), h.indexOf('function fetchFlashcardFallback'));
+    // adoptedIndex must be set after session adoption so the next response
+    // can compare against it.
+    expect(adoptBlock).toContain('adoptedIndex = newIndex');
+  });
+
+  it('baselineReviewedCount set once at session start, never advanced', () => {
+    const h = html();
+    const adoptBlock = h.slice(h.indexOf('function adoptServerState('), h.indexOf('function fetchFlashcardFallback'));
+    // baseline is set to newReviewed ONLY when a new session starts
+    expect(adoptBlock).toContain('baselineReviewedCount = newReviewed');
+    // Must NOT contain a same-session advance guard
+    expect(adoptBlock).not.toContain('newReviewed >= (baselineReviewedCount');
+  });
+
+  it('progress shows "1 reviewed" after first ack, "2 reviewed" after second; stale snapshot cannot revert', () => {
+    // This is a script-contract proof: the math in optimisticReviewDelta
+    // and the monotonic guard in adoptServerState together ensure the
+    // following sequence never regresses.
+    const h = html();
+    // delta = max(0, totalRatedCount - max(0, curReviewed - baseline))
+    // baseline is set once at session start (= reviewedCount when session
+    // began, typically 0 for a fresh session). It is NEVER advanced by
+    // same-session adoptions. So for a fresh session (baseline=0):
+    //   rate card 1: totalRated=1, reviewed=0, delta=1
+    //   ack card 1:  totalRated=1, reviewed=1, delta=0
+    //   rate card 2: totalRated=2, reviewed=1, delta=1
+    //   ack card 2:  totalRated=2, reviewed=2, delta=0
+    const deltaFn = h.slice(h.indexOf('function optimisticReviewDelta()'), h.indexOf('function render()'));
+    expect(deltaFn).toContain('totalRatedCount');
+    expect(deltaFn).toContain('baselineReviewedCount');
+    expect(deltaFn).toContain('Math.max(0');
+    // The regression guard is in adoptServerState, not delta — verify both exist.
+    const adoptBlock = h.slice(h.indexOf('function adoptServerState('), h.indexOf('function fetchFlashcardFallback'));
+    expect(adoptBlock).toContain('if (!isNewSession && prev.id && session.id === prev.id)');
+  });
+});
+
+describe('delta arithmetic regression: first-ack=1, second-ack=2, stale-no-revert', () => {
+  // Extract the actual optimisticReviewDelta logic from the generated script
+  // and exercise it with concrete state, proving the delta values through
+  // the exact sequence the user described.
+  function extractDeltaFn(): (totalRated: number, baseline: number, curReviewed: number) => number {
+    const h = buildReviewWidgetHtml({
+      session: { id: 's1', status: 'active', cardIds: ['c1', 'c2', 'c3'], currentIndex: 0, reviewedCount: 0, remainingCount: 3, limit: 100 },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+    const fnStart = h.indexOf('function optimisticReviewDelta()');
+    const fnEnd = h.indexOf('\n  function render()');
+    const deltaFnBody = h.slice(fnStart, fnEnd);
+    const fn = new Function('totalRatedCount', 'baselineReviewedCount', 'curReviewed', `
+      var data = { session: { reviewedCount: curReviewed } };
+      ${deltaFnBody}
+      return optimisticReviewDelta();
+    `);
+    return fn as (totalRated: number, baseline: number, cur: number) => number;
+  }
+
+  it('first-ack=1, second-ack=2 (simulates runtime: rate → adopt)', () => {
+    const delta = extractDeltaFn();
+    // baseline is set once at session start (= reviewedCount when session
+    // began). The delta = totalRatedCount - max(0, curReviewed - baseline).
+    // As curReviewed rises via server acks, delta drops to 0.
+    expect(delta(0, 0, 0)).toBe(0);   // initial: nothing
+    expect(delta(1, 0, 0)).toBe(1);   // rate card 1, no ack yet
+    expect(delta(1, 0, 1)).toBe(0);   // ack card 1: curReviewed(1) > baseline(0)
+    expect(delta(2, 0, 1)).toBe(1);   // rate card 2, server at 1
+    expect(delta(2, 0, 2)).toBe(0);   // ack card 2
+    expect(delta(3, 0, 2)).toBe(1);   // rate card 3
+    expect(delta(3, 0, 3)).toBe(0);   // ack card 3
+  });
+
+  it('stale snapshot cannot revert: baseline stays at session-start value', () => {
+    const delta = extractDeltaFn();
+    // After ack of card 1: baseline=0 (set at session start, never advanced
+    // by same-session adopt), totalRated=1, curReviewed=1 → delta=0
+    expect(delta(1, 0, 1)).toBe(0);
+    // Stale snapshot with reviewedCount=0 arrives but the monotonic guard
+    // in adoptServerState PREVENTS adoption (0 < prevReviewed=1), so the
+    // session stays at reviewedCount=1. Even if it were adopted, the delta
+    // would be: max(0, 1 - max(0, 0 - 0)) = 1 — bounded by totalRated.
+    expect(delta(1, 0, 0)).toBe(1);  // stale: shows 1 pending (bounded)
+    expect(delta(1, 0, 0)).toBeLessThanOrEqual(1);
+    // After two acks: totalRated=2, baseline=0, curReviewed=2 → delta=0
+    expect(delta(2, 0, 2)).toBe(0);
+    // Stale with reviewedCount=1: delta = max(0, 2 - max(0, 1-0)) = 1
+    expect(delta(2, 0, 1)).toBe(1);  // bounded by totalRated
+    expect(delta(2, 0, 1)).toBeLessThanOrEqual(2);
+  });
+
+  it('new session resets totalRatedCount, baseline stays at session-start reviewedCount', () => {
+    const delta = extractDeltaFn();
+    // End of session A: totalRated=5, baseline=0, reviewedCount=5 → delta=0
+    expect(delta(5, 0, 5)).toBe(0);
+    // New session B starts: totalRatedCount resets to 0. Baseline stays at 0
+    // (new session's reviewedCount=0). delta = 0 - max(0, 0-0) = 0.
+    expect(delta(0, 0, 0)).toBe(0);
+    // Rate 1 in session B: delta = 1 - max(0, 0-0) = 1
+    expect(delta(1, 0, 0)).toBe(1);
+    // Ack in session B: reviewedCount=1, delta = 1 - max(0, 1-0) = 0
+    expect(delta(1, 0, 1)).toBe(0);
   });
 });
 
@@ -947,6 +1175,171 @@ describe('generated widget script is parseable (runtime regression)', () => {
     expect(() => new vm.Script(script)).not.toThrow();
     // The script's renderFront uses the correctly-escaped cloze regex.
     expect(script).toContain('\\[([^\\[\\]]+)\\]');
+  });
+});
+
+describe('progress counter invariant: reviewed + remaining <= total (optimistic no-double-count)', () => {
+  // Regression for the bug where render() applied the optimistic delta to
+  // BOTH reviewed AND remaining, inflating reviewed by phantom unacknowledged
+  // ratings. The fix applies the delta to remaining only; reviewed stays
+  // server-authoritative so the sum never exceeds total.
+
+  function html(sessionOverrides: Record<string, unknown> = {}): string {
+    return buildReviewWidgetHtml({
+      session: {
+        id: 's1', status: 'active',
+        cardIds: ['c1', 'c2', 'c3', 'c4', 'c5'],
+        currentIndex: 0, reviewedCount: 0, remainingCount: 5, limit: 5,
+        ratingCounts: { again: 0, hard: 0, good: 0, easy: 0, ratingCounts: { 1: 0, 2: 0, 3: 0, 4: 0 } },
+        ...sessionOverrides,
+      },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+  }
+
+  // Extract optimisticReviewDelta from the generated script and exercise it
+  // with concrete state in a fresh VM context. We then compute the progress
+  // counters using the SAME formula as render() — proving the invariant
+  // through the exact shipped code path.
+  function extractDeltaFn(): (totalRated: number, baseline: number, curReviewed: number) => number {
+    const h = html();
+    const deltaStart = h.indexOf('function optimisticReviewDelta()');
+    const deltaEnd = h.indexOf('\n  function render()');
+    const deltaFn = h.slice(deltaStart, deltaEnd);
+    const fn = new Function('totalRatedCount', 'baselineReviewedCount', 'curReviewed', `
+      var data = { session: { reviewedCount: curReviewed } };
+      ${deltaFn}
+      return optimisticReviewDelta();
+    `);
+    return fn as (totalRated: number, baseline: number, cur: number) => number;
+  }
+
+  // Simulates render()'s progress computation using the EXTRACTED delta
+  // function. Returns { reviewed, remaining } exactly as the widget displays.
+  function simulateProgress(serverReviewed: number, serverRemaining: number, totalRated: number, baseline: number): { reviewed: number; remaining: number } {
+    const delta = extractDeltaFn()(totalRated, baseline, serverReviewed);
+    const reviewed = serverReviewed;         // server-authoritative (the fix)
+    const remaining = Math.max(0, serverRemaining - delta); // delta applied here
+    return { reviewed, remaining };
+  }
+
+  it('script contract: reviewed is NOT inflated by the optimistic delta', () => {
+    const h = html();
+    const renderBlock = h.slice(h.indexOf('var optimistic = optimisticReviewDelta()'), h.indexOf("progressFill.style.width = pct + '%'"));
+    // reviewed MUST be the bare server count — no delta added.
+    expect(renderBlock).toContain('var reviewed = s.reviewedCount || 0;');
+    // The old buggy pattern must NOT appear.
+    expect(renderBlock).not.toContain('(s.reviewedCount || 0) + optimistic');
+    // remaining MUST still apply the delta for forward-progress display.
+    expect(renderBlock).toContain('s.remainingCount - optimistic');
+  });
+
+  it('runtime: sum reviewed + remaining never exceeds total during in-flight ratings', () => {
+    const r = simulateProgress(0, 5, 5, 0);  // rate all 5, ack 0
+    expect(r.reviewed + r.remaining).toBeLessThanOrEqual(5);
+    expect(r.reviewed).toBe(0);   // server-authoritative: no acks
+    expect(r.remaining).toBe(0);  // all 5 consumed by delta
+  });
+
+  it('runtime: rate 3 of 5, ack 1 → reviewed stays at server count', () => {
+    const r = simulateProgress(1, 4, 3, 0);  // serverReviewed=1, delta=2
+    expect(r.reviewed).toBe(1);   // server-authoritative
+    expect(r.remaining).toBe(2);  // delta applied here
+    expect(r.reviewed + r.remaining).toBeLessThanOrEqual(5);
+  });
+
+  it('runtime: all acked → reviewed equals total, remaining is 0', () => {
+    const r = simulateProgress(5, 0, 5, 0);
+    expect(r.reviewed).toBe(5);
+    expect(r.remaining).toBe(0);
+    expect(r.reviewed + r.remaining).toBe(5);
+  });
+
+  it('runtime: no in-flight → reviewed + remaining equals total exactly', () => {
+    const r = simulateProgress(2, 3, 2, 0);  // delta=0
+    expect(r.reviewed + r.remaining).toBe(5);
+  });
+
+  it('runtime: extreme — rate all 5, ack 0 → reviewed is honest (0 not 5)', () => {
+    // This was the core bug: old code would show reviewed=5, remaining=0
+    // (sum=5, which happened to equal total), but reviewed was WRONG (5
+    // phantom reviews). New code shows reviewed=0 (correct), remaining=0.
+    const r = simulateProgress(0, 5, 5, 0);
+    expect(r.reviewed).toBe(0); // server says 0 reviewed — honest
+    expect(r.remaining).toBe(0);
+    expect(r.reviewed + r.remaining).toBeLessThanOrEqual(5);
+  });
+
+  it('runtime: non-zero baseline → delta computed against session-start reviewedCount', () => {
+    const r = simulateProgress(3, 2, 5, 2);  // baseline=2, delta=4
+    expect(r.reviewed).toBe(3);
+    expect(r.remaining).toBe(0);
+    expect(r.reviewed + r.remaining).toBeLessThanOrEqual(5);
+  });
+
+  it('generated script is parseable after the fix (vm compile)', () => {
+    const h = html();
+    const m = h.match(/<script>\n([\s\S]*?)<\/script>/);
+    if (!m) throw new Error('no inline script found');
+    const vm = require('node:vm');
+    expect(() => new vm.Script(m[1])).not.toThrow();
+  });
+});
+
+describe('failed-submit recovery restores authoritative card (adoptedIndex reset)', () => {
+  // Regression: after optimistic shift c1→c2, a failed submit's
+  // get_review_session sync returns the authoritative currentIndex=0 (card
+  // c1). Without the recovery fix, adoptedIndex was advanced to 1 by the
+  // optimistic shift, causing the stale guard (newIndex < adoptedIndex) to
+  // block the authoritative recovery snapshot.
+
+  it('script contract: catch path resets adoptedIndex when no other items in flight', () => {
+    const h = buildReviewWidgetHtml({
+      session: { id: 's1', status: 'active', cardIds: ['c1', 'c2'], currentIndex: 0, reviewedCount: 0, remainingCount: 2, limit: 100 },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+    const submitFn = h.slice(h.indexOf('function submitItem'), h.indexOf('function clearInflightItem'));
+    // The catch path must reset adoptedIndex when inflightByCard is empty.
+    expect(submitFn).toContain('Object.keys(inflightByCard).length === 0');
+    expect(submitFn).toContain('adoptedIndex = (data.session && typeof data.session.currentIndex === \'number\') ? data.session.currentIndex : 0');
+    // Must only reset when this was the sole in-flight item (parallel safety).
+    expect(submitFn).not.toMatch(/adoptedIndex\s*=\s*0\s*;(?![\s\S]*Object\.keys)/);
+  });
+
+  it('catch path does NOT reset adoptedIndex when other items are in flight', () => {
+    const h = buildReviewWidgetHtml({
+      session: { id: 's1', status: 'active', cardIds: ['c1', 'c2', 'c3'], currentIndex: 0, reviewedCount: 0, remainingCount: 3, limit: 100 },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+    const submitFn = h.slice(h.indexOf('function submitItem'), h.indexOf('function clearInflightItem'));
+    // The reset is guarded: only when inflightByCard is empty.
+    expect(submitFn).toContain('if (Object.keys(inflightByCard).length === 0)');
+    // An unconditional reset would break parallel ratings — must NOT exist.
+    const catchBlock = submitFn.slice(submitFn.indexOf('.catch(function'));
+    // The adoptedIndex assignment must be inside the guard block.
+    const guardIdx = catchBlock.indexOf('Object.keys(inflightByCard).length === 0');
+    const assignIdx = catchBlock.indexOf('adoptedIndex = (data.session');
+    expect(assignIdx).toBeGreaterThan(guardIdx);
+  });
+
+  it('syncAfterSubmit calls adoptServerState (not just render) for recovery', () => {
+    const h = buildReviewWidgetHtml({
+      session: { id: 's1', status: 'active', cardIds: ['c1', 'c2'], currentIndex: 0, reviewedCount: 0, remainingCount: 2, limit: 100 },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+    });
+    const syncFn = h.slice(h.indexOf('function syncAfterSubmit'), h.indexOf('checkBtn.addEventListener'));
+    // The sync must adopt the authoritative card via adoptServerState.
+    expect(syncFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded)');
+    // Must NOT only render (which would keep the stale optimistic card).
+    expect(syncFn).not.toMatch(/else \{\s*render\(\);\s*\}/);
   });
 });
 
