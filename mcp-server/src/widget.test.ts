@@ -321,18 +321,18 @@ describe('optimistic review widget script', () => {
     });
   }
 
-  it('submits ONE rating for the DISPLAYED card with controls disabled until the authoritative response lands', () => {
+  it('submits ONE rating for the DISPLAYED card via FIFO queue (controls stay enabled, per-card guard)', () => {
     const h = html();
     // rate() captures the DISPLAYED card id as expectedCardId, registers the
-    // item in the per-card/per-request maps, disables controls, and submits
-    // IMMEDIATELY via submitItem(item) — no single-flight gate.
-    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function submitItem'));
+    // item in the per-card/per-request maps, and enqueues via
+    // pendingSubmits + processNextSubmit — one submit at a time (FIFO).
+    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function processNextSubmit'));
     expect(rateFn).toContain('var expectedCardId = data.card.id;');
     expect(rateFn).toContain("var item = { rating: rating, requestId: 'req-' + Date.now().toString(36) + '-' + requestSeq, expectedCardId: expectedCardId, expectedPosition: expectedPosition };");
     expect(rateFn).toContain('inflightByCard[expectedCardId] = item;');
     expect(rateFn).toContain('inflightByRequest[item.requestId] = item;');
-    expect(rateFn).toContain('disableControls();');
-    expect(rateFn).toContain('submitItem(item);');
+    expect(rateFn).toContain('pendingSubmits.push(item);');
+    expect(rateFn).toContain('processNextSubmit();');
     // The stale-id mechanism is GONE: no optimistic card shift, no queue.
     expect(rateFn).not.toContain('optimisticallyRate');
     expect(rateFn).not.toContain('pendingRatings');
@@ -345,7 +345,7 @@ describe('optimistic review widget script', () => {
     // A rapid second click on the same card is a no-op — the per-card map
     // guards it (NOT a global inflight flag, so DIFFERENT cards can be rated
     // concurrently).
-    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function submitItem'));
+    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function processNextSubmit'));
     expect(rateFn).toContain('if (inflightByCard[expectedCardId]) return;');
     expect(rateFn).not.toContain('if (inflight) return;');
     expect(rateFn).not.toContain('pendingRatings.push');
@@ -357,7 +357,7 @@ describe('optimistic review widget script', () => {
     // The response path adopts the server's next card and re-renders (which
     // re-enables per-card controls since the card's item was cleared).
     const submitFn = h.slice(h.indexOf('function submitItem'), h.indexOf('function clearInflightItem'));
-    expect(submitFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded);');
+    expect(submitFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded');
     expect(submitFn).toContain('clearInflightItem(item, true);');
     expect(submitFn).toContain('render();');
     // No second optimistic shift after the response (no pump, no queue).
@@ -382,7 +382,7 @@ describe('optimistic review widget script', () => {
     expect(clearFn).toContain('delete ratedCardIds[item.expectedCardId]');
     // syncAfterSubmit adopts the authoritative session and re-renders.
     const syncFn = h.slice(h.indexOf('function syncAfterSubmit'), h.indexOf('checkBtn.addEventListener'));
-    expect(syncFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded);');
+    expect(syncFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded');
     expect(syncFn).toContain('render();');
     // No backend/request wording leaks to the user after a re-sync.
     expect(syncFn).not.toContain('The card changed');
@@ -401,22 +401,26 @@ describe('optimistic review widget script', () => {
     expect(submitFn).toContain('totalRatedCount = Math.max(0, totalRatedCount - 1);');
   });
 
-  it('rates DIFFERENT displayed cards concurrently (per-card map, no global inflight gate)', () => {
+  it('rates displayed cards via FIFO queue (per-card guard, serial drain)', () => {
     const h = html();
-    // rate() dispatches EVERY rating immediately via submitItem(item) —
-    // there is no global inflight gate. The per-card map only guards a
-    // second rating of the SAME card, so preloaded next cards can be rated
-    // while earlier cards' submits are still in flight.
-    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function submitItem'));
+    // rate() enqueues every rating via pendingSubmits + processNextSubmit().
+    // The per-card map guards a second rating of the SAME card; the FIFO
+    // queue serializes network submits (one at a time).
+    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function processNextSubmit'));
     expect(rateFn).not.toContain('if (inflight) return;');
     expect(rateFn).toContain('if (inflightByCard[expectedCardId]) return;');
     expect(rateFn).toContain('inflightByCard[expectedCardId] = item;');
     expect(rateFn).toContain('inflightByRequest[item.requestId] = item;');
-    expect(rateFn).toContain('submitItem(item);');
-    // The optimistic shift happens synchronously BEFORE the submit starts,
+    expect(rateFn).toContain('pendingSubmits.push(item);');
+    expect(rateFn).toContain('processNextSubmit();');
+    // The optimistic shift happens synchronously BEFORE the enqueue,
     // so the next card is displayable/rateable immediately.
     expect(rateFn).toContain('var nextCard = queue.shift();');
     expect(rateFn).toContain('data.card = nextCard;');
+    // processNextSubmit drains the FIFO queue (submitInFlight gate).
+    const drainFn = h.slice(h.indexOf('function processNextSubmit'), h.indexOf('function submitItem'));
+    expect(drainFn).toContain('submitInFlight');
+    expect(drainFn).toContain('pendingSubmits.shift()');
     // submitItem resolves INDEPENDENTLY per item: clearing only that item's
     // bookkeeping (other in-flight items untouched).
     const submitFn = h.slice(h.indexOf('function submitItem'), h.indexOf('function clearInflightItem'));
@@ -429,6 +433,9 @@ describe('optimistic review widget script', () => {
     // failed card can be retried.
     expect(submitFn).toContain('clearInflightItem(item);');
     expect(submitFn).toContain('clearInflightItem(item, true);');
+    // The FIFO drain fires after each submit completes.
+    expect(submitFn).toContain('submitInFlight = false;');
+    expect(submitFn).toContain('processNextSubmit();');
     // adoptServerState never regresses to an already-rated card (the
     // backend reviewedCardIds + local rated set guard out-of-order).
     expect(h).toContain("if (card && card.id && (rated[card.id] || reviewed.indexOf(card.id) !== -1)) {");
@@ -437,7 +444,7 @@ describe('optimistic review widget script', () => {
   it('uses the backend response as the authoritative queue (server next card always wins)', () => {
     const h = html();
     // adoptServerState applies the session + card from the response.
-    expect(h).toContain('function adoptServerState(session, card, preloaded)');
+    expect(h).toContain('function adoptServerState(session, card, preloaded');
     expect(h).toContain('data.session = session;');
     // The queue is MONOTONIC: preload arrays MERGE (add/update only) and the
     // queue is rebuilt in the authoritative session.cardIds order — a short
@@ -470,23 +477,23 @@ describe('optimistic review widget script', () => {
 
   it('shifts the next full card from the queue and renders BEFORE the submit starts (immediate display)', () => {
     const h = html();
-    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function submitItem'));
+    const rateFn = h.slice(h.indexOf('function rate(rating)'), h.indexOf('function processNextSubmit'));
     // The expectedCardId is captured from the DISPLAYED card BEFORE the shift.
     expect(rateFn).toContain('var expectedCardId = data.card.id;');
     expect(rateFn).toContain('cacheFullCard(data.card);');
     // The next full card is shifted from the preloaded queue and rendered
-    // synchronously inside rate() — BEFORE submitItem(item) starts the submit.
+    // synchronously inside rate() — BEFORE processNextSubmit starts the submit.
     expect(rateFn).toContain('var nextCard = queue.shift();');
     expect(rateFn).toContain('data.card = nextCard;');
     expect(rateFn).toContain('render();');
     const shiftIdx = rateFn.indexOf('var nextCard = queue.shift();');
-    const submitIdx = rateFn.indexOf('submitItem(item);');
+    const enqueueIdx = rateFn.indexOf('pendingSubmits.push(item);');
     expect(shiftIdx).toBeGreaterThan(rateFn.indexOf('var expectedCardId = data.card.id;'));
-    expect(submitIdx).toBeGreaterThan(shiftIdx);
-    expect(submitIdx).toBeGreaterThan(rateFn.indexOf('data.card = nextCard;'));
-    expect(submitIdx).toBeGreaterThan(rateFn.indexOf('render();'));
-    // Controls are disabled before the optimistic shift (per-card guard).
-    expect(rateFn.indexOf('disableControls();')).toBeLessThan(shiftIdx);
+    expect(enqueueIdx).toBeGreaterThan(shiftIdx);
+    expect(enqueueIdx).toBeGreaterThan(rateFn.indexOf('data.card = nextCard;'));
+    expect(enqueueIdx).toBeGreaterThan(rateFn.indexOf('render();'));
+    // Controls stay enabled (per-card guard handles double-click; FIFO queue
+    // serializes submits).  disableControls is NOT called from rate().
   });
 
 
@@ -749,7 +756,7 @@ describe('Apps SDK postMessage bridge (script contract)', () => {
     // applyToolResult calls adoptServerState for {session,...} shapes.
     expect(h).toContain('function applyToolResult(payload)');
     expect(h).toContain("if (sc && sc.session) {");
-    expect(h).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded);');
+    expect(h).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded');
   });
 
   it('INITIATES the MCP Apps lifecycle handshake (ui/initialize then ui/notifications/initialized)', () => {
@@ -1225,14 +1232,14 @@ describe('progress counter invariant: reviewed + remaining <= total (optimistic 
     return { reviewed, remaining };
   }
 
-  it('script contract: reviewed is NOT inflated by the optimistic delta', () => {
+  it('script contract: reviewed includes optimistic delta (FIFO one-at-a-time)', () => {
     const h = html();
     const renderBlock = h.slice(h.indexOf('var optimistic = optimisticReviewDelta()'), h.indexOf("progressFill.style.width = pct + '%'"));
-    // reviewed MUST be the bare server count — no delta added.
-    expect(renderBlock).toContain('var reviewed = s.reviewedCount || 0;');
-    // The old buggy pattern must NOT appear.
-    expect(renderBlock).not.toContain('(s.reviewedCount || 0) + optimistic');
-    // remaining MUST still apply the delta for forward-progress display.
+    // reviewed is the server count + optimistic delta, floored by
+    // maxOptimisticReviewed (monotonic guard against stale snapshots).
+    expect(renderBlock).toContain('(s.reviewedCount || 0) + optimistic');
+    expect(renderBlock).toContain('maxOptimisticReviewed');
+    // remaining still applies the delta for forward-progress display.
     expect(renderBlock).toContain('s.remainingCount - optimistic');
   });
 
@@ -1295,7 +1302,7 @@ describe('failed-submit recovery restores authoritative card (adoptedIndex reset
   // optimistic shift, causing the stale guard (newIndex < adoptedIndex) to
   // block the authoritative recovery snapshot.
 
-  it('script contract: catch path resets adoptedIndex when no other items in flight', () => {
+  it('script contract: catch path sets recovery flag for sync-after-failure', () => {
     const h = buildReviewWidgetHtml({
       session: { id: 's1', status: 'active', cardIds: ['c1', 'c2'], currentIndex: 0, reviewedCount: 0, remainingCount: 2, limit: 100 },
       card: { id: 'c1', front: 'Q1', back: 'A1' },
@@ -1303,14 +1310,17 @@ describe('failed-submit recovery restores authoritative card (adoptedIndex reset
       endTool: 'end_review_session', getTool: 'get_review_session',
     });
     const submitFn = h.slice(h.indexOf('function submitItem'), h.indexOf('function clearInflightItem'));
-    // The catch path must reset adoptedIndex when inflightByCard is empty.
-    expect(submitFn).toContain('Object.keys(inflightByCard).length === 0');
-    expect(submitFn).toContain('adoptedIndex = (data.session && typeof data.session.currentIndex === \'number\') ? data.session.currentIndex : 0');
-    // Must only reset when this was the sole in-flight item (parallel safety).
-    expect(submitFn).not.toMatch(/adoptedIndex\s*=\s*0\s*;(?![\s\S]*Object\.keys)/);
+    // The catch path must set item.recovery so the sync response bypasses
+    // the stale-snapshot guard in adoptServerState.
+    expect(submitFn).toContain('item.recovery = true');
+    expect(submitFn).toContain('syncAfterSubmit(gen, item.recovery');
+    // syncAfterSubmit passes the recovery flag to adoptServerState.
+    const syncFn = h.slice(h.indexOf('function syncAfterSubmit'), h.indexOf('checkBtn.addEventListener'));
+    expect(syncFn).toContain('recovery');
+    expect(syncFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded, recovery)');
   });
 
-  it('catch path does NOT reset adoptedIndex when other items are in flight', () => {
+  it('catch path decrements totalRatedCount and clears inflight maps before sync', () => {
     const h = buildReviewWidgetHtml({
       session: { id: 's1', status: 'active', cardIds: ['c1', 'c2', 'c3'], currentIndex: 0, reviewedCount: 0, remainingCount: 3, limit: 100 },
       card: { id: 'c1', front: 'Q1', back: 'A1' },
@@ -1318,14 +1328,12 @@ describe('failed-submit recovery restores authoritative card (adoptedIndex reset
       endTool: 'end_review_session', getTool: 'get_review_session',
     });
     const submitFn = h.slice(h.indexOf('function submitItem'), h.indexOf('function clearInflightItem'));
-    // The reset is guarded: only when inflightByCard is empty.
-    expect(submitFn).toContain('if (Object.keys(inflightByCard).length === 0)');
-    // An unconditional reset would break parallel ratings — must NOT exist.
-    const catchBlock = submitFn.slice(submitFn.indexOf('.catch(function'));
-    // The adoptedIndex assignment must be inside the guard block.
-    const guardIdx = catchBlock.indexOf('Object.keys(inflightByCard).length === 0');
-    const assignIdx = catchBlock.indexOf('adoptedIndex = (data.session');
-    expect(assignIdx).toBeGreaterThan(guardIdx);
+    // The recovery flag is always set (no guard needed — one submit at a time
+    // in FIFO).
+    expect(submitFn).toContain('item.recovery = true');
+    // totalRatedCount is decremented so the failed rating doesn't inflate
+    // the optimistic delta.
+    expect(submitFn).toContain('totalRatedCount = Math.max(0, totalRatedCount - 1)');
   });
 
   it('syncAfterSubmit calls adoptServerState (not just render) for recovery', () => {
@@ -1337,7 +1345,7 @@ describe('failed-submit recovery restores authoritative card (adoptedIndex reset
     });
     const syncFn = h.slice(h.indexOf('function syncAfterSubmit'), h.indexOf('checkBtn.addEventListener'));
     // The sync must adopt the authoritative card via adoptServerState.
-    expect(syncFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded)');
+    expect(syncFn).toContain('adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded');
     // Must NOT only render (which would keep the stale optimistic card).
     expect(syncFn).not.toMatch(/else \{\s*render\(\);\s*\}/);
   });

@@ -636,7 +636,7 @@ async function main() {
     // IMMEDIATELY (submit unresolved): the click alone must project
     // remaining -1 in the status (reviewed stays server-authoritative).
     const progressD = domD.window.document.getElementById('progress').textContent;
-    if (!progressD.includes('0 reviewed') || !progressD.includes('1 remaining')) {
+    if (!progressD.includes('1 reviewed') || !progressD.includes('1 remaining')) {
       throw new Error(`optimistic progress missing pre-resolve: ${JSON.stringify(progressD)}`);
     }
     // Resolve the held submit: the authoritative response ACKS this requestId
@@ -654,15 +654,12 @@ async function main() {
   }
 
 
-  // 4d2. PARALLEL RATINGS (held promises): two rapid clicks on the rating
-  //      button — the first while c1 is displayed, the second after the
-  //      optimistic shift to c2 — submit TWO ratings CONCURRENTLY (no
-  //      single-flight gate): each captures the DISPLAYED card id as
-  //      expectedCardId (c1 then c2), both submits are held in flight at
-  //      once, and the THIRD card (c3) is already visible. Resolving the
-  //      held submits with ID-ONLY responses must never blank the displayed
-  //      card (the cardCache resolves the same id full) and must not regress
-  //      out-of-order.
+  // 4d2. FIFO SERIAL RATINGS: three rapid clicks on the rating button —
+  //      c1 displayed, shift to c2, shift to c3 — queue THREE items but
+  //      fire only ONE initial submit (serial drain).  reviewed=3
+  //      optimistically before any ack.  Resolving each submit drains the
+  //      next in click order (c1→c2→c3).  Delayed/stale snapshots must
+  //      never decrease the displayed reviewed count.
   {
     const domR = new JSDOM(buildReviewWidgetHtml({
       session: { id: 'sR', status: 'active', cardType: 'qa', cardIds: ['c1', 'c2', 'c3'], currentIndex: 0, reviewedCount: 0, remainingCount: 3, limit: 100, preloaded: [{ id: 'c2', front: 'Q2', back: 'A2', tags: [] }, { id: 'c3', front: 'Q3', back: 'A3', tags: [] }] },
@@ -675,17 +672,14 @@ async function main() {
     let submitCalls = 0;
     const submittedIds = [];
     const resolveSubmits = [];
-    // Hold EVERY submit unresolved so both are provably in flight at once;
-    // resolve them only after the concurrency assertions.
+    // HOLD the first submit unresolved; the FIFO queue blocks subsequent
+    // submits until this one resolves.
     domR.window.openai = {
       callTool: async (name, args) => {
         if (name === 'submit_review') {
           submitCalls += 1;
           submittedIds.push(args.expectedCardId);
           await new Promise((r) => { resolveSubmits.push(r); });
-          // ID-ONLY authoritative result: the host strips _meta. Must
-          // resolve full from the cardCache (the card was preloaded) —
-          // never a white card.
           return {
             structuredContent: {
               session: { id: 'sR', status: 'active', cardType: 'qa', cardIds: ['c1', 'c2', 'c3'], currentIndex: submitCalls, reviewedCount: submitCalls, remainingCount: 3 - submitCalls, limit: 100 },
@@ -697,53 +691,96 @@ async function main() {
       },
     };
     await sleep(20);
-    const goodBtnR = domR.window.document.querySelector('button[data-rating="3"]');
-    goodBtnR.click(); // rate c1 (displayed) → optimistic shift to c2, submit held
+    // Click 1: rate c1 → optimistic shift to c2, submit1 fires (held).
+    domR.window.document.querySelector('button[data-rating="3"]').click();
     await sleep(30);
-    // The displayed card is now c2 (optimistic shift, submit still held).
     if (domR.window.document.getElementById('frontInner').textContent !== 'Q2') {
       throw new Error(`after first rating, displayed card should be c2, got ${JSON.stringify(domR.window.document.getElementById('frontInner').textContent)}`);
     }
-    // Rate c2 (the newly displayed card) IMMEDIATELY — must NOT be blocked.
-    const goodBtnR2 = domR.window.document.querySelector('button[data-rating="3"]');
-    goodBtnR2.click(); // rate c2 → optimistic shift to c3, submit held
+    // Click 2: rate c2 → optimistic shift to c3, submit queued (submitInFlight=true).
+    domR.window.document.querySelector('button[data-rating="3"]').click();
+    await sleep(20);
+    // Click 3: rate c3 → optimistic completion (all cards accounted for), submit queued.
+    domR.window.document.querySelector('button[data-rating="3"]').click();
     await sleep(40);
     if (errsR.length > 0) {
-      throw new Error(`parallel-rating widget errors: ${JSON.stringify(errsR)}`);
+      throw new Error(`fifo-rating widget errors: ${JSON.stringify(errsR)}`);
     }
-    // TWO submits are in flight CONCURRENTLY, for c1 then c2.
-    if (submitCalls !== 2) {
-      throw new Error(`parallel ratings: expected 2 concurrent submits, got ${submitCalls}`);
+    // FIFO: only ONE submit fired (serial drain), two are queued.
+    if (submitCalls !== 1) {
+      throw new Error(`fifo ratings: expected 1 initial submit, got ${submitCalls}`);
     }
-    if (submittedIds.length !== 2 || submittedIds[0] !== 'c1' || submittedIds[1] !== 'c2') {
-      throw new Error(`parallel ratings submitted wrong ids ${JSON.stringify(submittedIds)} — expected [c1, c2]`);
+    if (submittedIds.length !== 1 || submittedIds[0] !== 'c1') {
+      throw new Error(`fifo ratings: first submit should be c1, got ${JSON.stringify(submittedIds)}`);
     }
-    // The THIRD card (c3) is already visible while both submits are held.
+    // The THIRD card (c3) is already visible while only the first submit is held.
     const frontR = domR.window.document.getElementById('frontInner').textContent;
     const backR = domR.window.document.getElementById('backInner').textContent;
     if (frontR !== 'Q3' || backR !== 'A3') {
-      throw new Error(`third card not visible while both submits held: front=${JSON.stringify(frontR)} back=${JSON.stringify(backR)}`);
+      throw new Error(`third card not visible while first submit held: front=${JSON.stringify(frontR)} back=${JSON.stringify(backR)}`);
     }
-    // Both held submits resolve with ID-ONLY results — the displayed c3 must
-    // stay full (cardCache), never a white card, and out-of-order responses
-    // must not regress the display.
-    for (const r of resolveSubmits) r();
-    await sleep(120);
+    // reviewed=3 optimistically before any ack.
+    const reviewedRpre = domR.window.document.getElementById('progress').textContent;
+    if (!reviewedRpre.includes('3 reviewed') || !reviewedRpre.includes('0 remaining')) {
+      throw new Error(`fifo: optimistic reviewed=3 not shown pre-ack: ${JSON.stringify(reviewedRpre)}`);
+    }
+    // Delayed stale snapshot: must NOT regress reviewed below 3.
+    domR.window.dispatchEvent(new domR.window.MessageEvent('message', {
+      data: {
+        jsonrpc: '2.0',
+        method: 'ui/notifications/tool-result',
+        params: {
+          output: {
+            structuredContent: {
+              session: { id: 'sR', status: 'active', cardType: 'qa', cardIds: ['c1', 'c2', 'c3'], currentIndex: 0, reviewedCount: 0, remainingCount: 3, limit: 100 },
+              card: { id: 'c1', front: 'Q1', back: 'A1' },
+              preloaded: [{ id: 'c2', front: 'Q2', back: 'A2', tags: [] }],
+            },
+          },
+        },
+      },
+    }));
+    await sleep(30);
+    const reviewedRstale = domR.window.document.getElementById('progress').textContent;
+    if (!reviewedRstale.includes('3 reviewed')) {
+      throw new Error(`stale snapshot regressed optimistic reviewed: ${JSON.stringify(reviewedRstale)}`);
+    }
+    // Resolve submit1 → FIFO drain fires submit2.
+    resolveSubmits[0]();
+    await sleep(60);
+    if (submitCalls !== 2) {
+      throw new Error(`fifo: expected 2 submits after first resolve, got ${submitCalls}`);
+    }
+    if (submittedIds[1] !== 'c2') {
+      throw new Error(`fifo: second submit should be c2, got ${JSON.stringify(submittedIds[1])}`);
+    }
+    // Resolve submit2 → drain fires submit3.
+    resolveSubmits[1]();
+    await sleep(60);
+    if (submitCalls !== 3) {
+      throw new Error(`fifo: expected 3 submits after second resolve, got ${submitCalls}`);
+    }
+    if (submittedIds[2] !== 'c3') {
+      throw new Error(`fifo: third submit should be c3, got ${JSON.stringify(submittedIds[2])}`);
+    }
+    // Resolve submit3 → drain complete, done panel visible.
+    resolveSubmits[2]();
+    await sleep(100);
     if (errsR.length > 0) {
-      throw new Error(`parallel-rating post-resolve errors: ${JSON.stringify(errsR)}`);
+      throw new Error(`fifo-rating post-resolve errors: ${JSON.stringify(errsR)}`);
     }
     const frontR2 = domR.window.document.getElementById('frontInner').textContent;
     if (frontR2 !== 'Q3') {
       throw new Error(`id-only responses blanked/regressed the card: front=${JSON.stringify(frontR2)}`);
     }
     if (domR.window.document.getElementById('ratings').classList.contains('disabled')) {
-      throw new Error('rating controls not re-enabled after both submits resolved');
+      throw new Error('rating controls not re-enabled after all submits resolved');
     }
     const reviewedR = domR.window.document.getElementById('progress').textContent;
-    if (!reviewedR.includes('2 reviewed')) {
-      throw new Error(`authoritative counters not applied after both commits: ${JSON.stringify(reviewedR)}`);
+    if (!reviewedR.includes('3 reviewed')) {
+      throw new Error(`authoritative counters not applied after all commits: ${JSON.stringify(reviewedR)}`);
     }
-    console.log('PASS parallel ratings: two submits concurrently (c1 then c2), third card visible, id-only responses never blank/regress');
+    console.log('PASS fifo ratings: 3 rapid clicks → 1 initial submit, drain in click order (c1→c2→c3), reviewed=3 optimistic, stale snapshot cannot regress');
   }
 
   // 4d1c. LONG-SESSION HELD-PROMISE REGRESSION (the reported bug): a 12-card
@@ -776,7 +813,10 @@ async function main() {
     let submitCallsL = 0;
     const submittedIdsL = [];
     const resolveSubmitsL = [];
-    // HOLD every submit unresolved — the user can outrun the backend.
+    // HOLD the first submit unresolved — with FIFO, subsequent submits are
+    // queued until this one resolves.  The user can outrun the backend:
+    // every optimistic card advances correctly while only one submit is in
+    // flight.
     domL.window.openai = {
       callTool: async (name, args) => {
         if (name === 'submit_review') {
@@ -793,9 +833,9 @@ async function main() {
       throw new Error(`long-session setup: expected Q1, got ${JSON.stringify(domL.window.document.getElementById('frontInner').textContent)}`);
     }
     const rateGood = () => domL.window.document.querySelector('button[data-rating="3"]').click();
-    // Rate THROUGH card 6 (past the old SESSION_PRELOAD=5 boundary) with all
-    // submits held. Every next card must render full with ENABLED controls
-    // and NO request wording.
+    // Rate THROUGH card 6 (past the old SESSION_PRELOAD=5 boundary) with the
+    // first submit held. Every next card must render full with ENABLED
+    // controls and NO request wording.  Only 1 submit has fired (FIFO).
     for (let k = 1; k <= 6; k += 1) {
       rateGood();
       await sleep(25);
@@ -808,16 +848,14 @@ async function main() {
       if (frontL !== expectedFront || backL !== 'A' + (k + 1)) {
         throw new Error(`after rating card ${k}, expected ${expectedFront} full, got front=${JSON.stringify(frontL)} back=${JSON.stringify(backL)}`);
       }
-      if (domL.window.document.getElementById('ratings').classList.contains('disabled')) {
-        throw new Error(`rating controls DISABLED for card ${k + 1} (only earlier cards are in flight)`);
-      }
       const statusL = domL.window.document.getElementById('status').textContent;
       if (/Submitting|submitting|request|Request|loading|Loading|saving|Saving|sync|Sync/i.test(statusL)) {
         throw new Error(`request wording leaked at card ${k + 1}: ${JSON.stringify(statusL)}`);
       }
     }
-    if (submitCallsL !== 6) {
-      throw new Error(`long-session: expected 6 held submits past the boundary, got ${submitCallsL}`);
+    // FIFO: only 1 submit fired (serial drain).
+    if (submitCallsL !== 1) {
+      throw new Error(`long-session: expected 1 initial submit (FIFO), got ${submitCallsL}`);
     }
     // OUT-OF-ORDER SHORT-PRELOAD RESPONSE: a stale snapshot for an
     // ALREADY-RATED card (c2) carrying a SHORT preload (3 cards — the old
@@ -850,8 +888,8 @@ async function main() {
     if (domL.window.document.getElementById('frontInner').textContent !== 'Q7') {
       throw new Error('stale response for an already-rated card regressed the displayed card');
     }
-    // Continue rating c7 → c12 with submits held: the queue must NOT have
-    // been shrunk by the short preload.
+    // Continue rating c7 → c12 with the first submit still held: the queue
+    // must NOT have been shrunk by the short preload.
     for (let k = 7; k <= 12; k += 1) {
       rateGood();
       await sleep(25);
@@ -865,18 +903,15 @@ async function main() {
         if (frontL !== expectedFront || backL !== 'A' + (k + 1)) {
           throw new Error(`after short-preload response, rating card ${k} showed front=${JSON.stringify(frontL)} back=${JSON.stringify(backL)} — queue regressed`);
         }
-        if (domL.window.document.getElementById('ratings').classList.contains('disabled')) {
-          throw new Error(`rating controls DISABLED for card ${k + 1} after the short-preload response`);
-        }
         const statusL = domL.window.document.getElementById('status').textContent;
         if (/Submitting|submitting|request|Request|loading|Loading|saving|Saving|sync|Sync/i.test(statusL)) {
           throw new Error(`request wording leaked at card ${k + 1}: ${JSON.stringify(statusL)}`);
         }
       }
     }
-    // The LAST card (c12) was rated while ALL 12 submits are held: the widget
-    // shows a CLEAN optimistic completion — the done panel is visible, fully
-    // interactive, with NO request wording and NO blank/disabled card.
+    // The LAST card (c12) was rated while only the first submit is held: the
+    // widget shows a CLEAN optimistic completion — the done panel is visible,
+    // fully interactive, with NO request wording and NO blank/disabled card.
     const doneShownL = !domL.window.document.getElementById('done').classList.contains('hidden');
     if (!doneShownL) {
       throw new Error('long-session: last card rated with submits held did NOT show optimistic completion');
@@ -885,24 +920,35 @@ async function main() {
     if (/Submitting|submitting|request|Request|loading|Loading|saving|Saving|sync|Sync/i.test(statusLast)) {
       throw new Error(`optimistic completion leaked request wording: ${JSON.stringify(statusLast)}`);
     }
-    if (submitCallsL !== 12) {
-      throw new Error(`long-session: expected 12 held submits total, got ${submitCallsL}`);
+    if (submitCallsL !== 1) {
+      throw new Error(`long-session: expected 1 held submit, got ${submitCallsL}`);
     }
-    // Reconcile: release the held submits OUT OF ORDER with authoritative
-    // terminal results — the done panel stays (never a regression, never a
-    // blank card).
-    for (let r = resolveSubmitsL.length - 1; r >= 0; r -= 1) {
+    // FIFO DRAIN: release the held submits in ORDER — each resolve fires the
+    // next submit (serial drain).  The final resolve delivers the terminal
+    // completed state; the done panel stays.
+    for (let r = 0; r < resolveSubmitsL.length; r += 1) {
+      const isLast = r === resolveSubmitsL.length - 1;
       resolveSubmitsL[r]({
-        structuredContent: {
-          session: { id: 'sL', status: 'completed', cardType: 'qa', cardIds: ids, currentIndex: N, reviewedCount: N, remainingCount: 0, limit: 100, continuationAvailable: false },
-          card: null,
-          preloaded: [],
-        },
+        structuredContent: isLast
+          ? { session: { id: 'sL', status: 'completed', cardType: 'qa', cardIds: ids, currentIndex: N, reviewedCount: N, remainingCount: 0, limit: 100, continuationAvailable: false }, card: null, preloaded: [] }
+          : { structuredContent: { session: { id: 'sL', status: 'active', cardType: 'qa', cardIds: ids, currentIndex: r + 1, reviewedCount: r + 1, remainingCount: N - r - 1, limit: 100 }, card: { id: 'c' + (r + 2), front: 'Q' + (r + 2), back: 'A' + (r + 2) }, preloaded: [] } },
       });
+      await sleep(40);
     }
-    await sleep(120);
+    // Wait for the last submit to complete and drain.
+    await sleep(80);
     if (errsL.length > 0) {
       throw new Error(`long-session post-reconcile errors: ${JSON.stringify(errsL)}`);
+    }
+    if (submitCallsL !== 12) {
+      throw new Error(`long-session: expected 12 submits after FIFO drain, got ${submitCallsL}`);
+    }
+    // FIFO order: submitted ids must be c1..c12 in order.
+    const expectedIds = ids.slice(0, 12);
+    for (let i = 0; i < 12; i += 1) {
+      if (submittedIdsL[i] !== expectedIds[i]) {
+        throw new Error(`long-session FIFO order wrong: submit ${i} was ${submittedIdsL[i]}, expected ${expectedIds[i]}`);
+      }
     }
     const doneShownL2 = !domL.window.document.getElementById('done').classList.contains('hidden');
     if (!doneShownL2) {
@@ -914,7 +960,7 @@ async function main() {
     if (!shellHidden) {
       throw new Error('long-session: completed session still shows the card shell');
     }
-    console.log('PASS long session (12 cards): every next card full + enabled past the old boundary, short stale preload cannot regress the queue, clean optimistic completion with zero request wording');
+    console.log('PASS long session (12 cards): FIFO serial drain, every next card full + enabled, short stale preload cannot regress the queue, clean optimistic completion');
   }
 
   // 4d1d. ONE-CARD EMPTY-PRELOAD REGRESSION: a valid one-card session carries
@@ -1884,6 +1930,181 @@ async function main() {
         + ' status=' + JSON.stringify(docN.getElementById('status').textContent));
     }
     console.log('PASS v2 no-false-completion: empty local window with remainingCount>0 never shows the done panel — completion waits for the authoritative next card');
+  }
+
+  // 6. RAPID THREE-CARD BURST / STALE-RESPONSE REGRESSION: clicks 3
+  //    ratings on three optimistically displayed cards before resolving any
+  //    submit.  Verifies: (a) exactly one submit in flight initially;
+  //    (b) UI shows 3 reviewed / 0 remaining before any ack; (c) resolves
+  //    each held submit in original click order, confirming the next starts
+  //    only after the prior settles; (d) injects a delayed stale snapshot
+  //    and proves the counter and displayed card do not regress.
+  {
+    const dom6 = new JSDOM(buildReviewWidgetHtml({
+      session: {
+        id: 's6', status: 'active', cardType: 'qa',
+        cardIds: ['c1', 'c2', 'c3'], currentIndex: 0,
+        reviewedCount: 0, remainingCount: 3, limit: 100,
+        preloaded: [
+          { id: 'c2', front: 'Q2', back: 'A2', tags: [] },
+          { id: 'c3', front: 'Q3', back: 'A3', tags: [] },
+        ],
+      },
+      card: { id: 'c1', front: 'Q1', back: 'A1' },
+      submitTool: 'submit_review', startTool: 'start_review_session',
+      endTool: 'end_review_session', getTool: 'get_review_session',
+      flashcardTool: 'get_flashcard',
+    }), { runScripts: 'dangerously', pretendToBeVisual: true, url: 'https://cuelingua-mcp-767542644824.us-central1.run.app/' });
+    const errs6 = [];
+    dom6.window.addEventListener('error', (e) => errs6.push(e.message ?? String(e)));
+    let submitCalls6 = 0;
+    const submittedIds6 = [];
+    const resolveHeld6 = [];
+    dom6.window.openai = {
+      callTool: async (name, args) => {
+        if (name === 'submit_review') {
+          submitCalls6 += 1;
+          submittedIds6.push(args.expectedCardId);
+          await new Promise((r) => { resolveHeld6.push(r); });
+          return {
+            structuredContent: {
+              session: {
+                id: 's6', status: submitCalls6 >= 3 ? 'completed' : 'active', cardType: 'qa',
+                cardIds: ['c1', 'c2', 'c3'], currentIndex: submitCalls6,
+                reviewedCount: submitCalls6, remainingCount: 3 - submitCalls6,
+                limit: 100,
+              },
+              card: submitCalls6 >= 3 ? null : { id: 'c' + (submitCalls6 + 1) },
+              preloaded: [],
+            },
+          };
+        }
+        return { structuredContent: {} };
+      },
+    };
+    await sleep(20);
+    const doc6 = dom6.window.document;
+    if (doc6.getElementById('frontInner').textContent !== 'Q1') {
+      throw new Error(`burst setup: expected Q1, got ${JSON.stringify(doc6.getElementById('frontInner').textContent)}`);
+    }
+    const clickGood = () => doc6.querySelector('button[data-rating="3"]').click();
+    const shownFront = () => doc6.getElementById('frontInner').textContent;
+    const shownBack = () => doc6.getElementById('backInner').textContent;
+    const progressText = () => doc6.getElementById('progress').textContent;
+    const doneHidden = () => doc6.getElementById('done').classList.contains('hidden');
+
+    // (a) Click 3 ratings rapidly before any submit resolves.
+    clickGood(); // rate c1 → shift to c2, submit1 fires (held)
+    await sleep(20);
+    clickGood(); // rate c2 → shift to c3, submit2 queued
+    await sleep(20);
+    clickGood(); // rate c3 → optimistic completion, submit3 queued
+    await sleep(40);
+    if (errs6.length > 0) {
+      throw new Error(`burst widget errors: ${JSON.stringify(errs6)}`);
+    }
+    // Exactly ONE submit fired (serial FIFO).
+    if (submitCalls6 !== 1) {
+      throw new Error(`burst: expected 1 initial submit, got ${submitCalls6}`);
+    }
+    if (submittedIds6[0] !== 'c1') {
+      throw new Error(`burst: first submit should be c1, got ${JSON.stringify(submittedIds6[0])}`);
+    }
+
+    // (b) UI shows 3 reviewed, 0 remaining optimistically before any ack.
+    const prog6 = progressText();
+    if (!prog6.includes('3 reviewed') || !prog6.includes('0 remaining')) {
+      throw new Error(`burst: optimistic progress wrong: ${JSON.stringify(prog6)}`);
+    }
+    // c3 is displayed (the third card).
+    if (shownFront() !== 'Q3' || shownBack() !== 'A3') {
+      throw new Error(`burst: expected c3 displayed, got front=${JSON.stringify(shownFront())} back=${JSON.stringify(shownBack())}`);
+    }
+    // Done panel shown (all cards accounted for optimistically).
+    if (doneHidden()) {
+      throw new Error('burst: done panel not shown optimistically');
+    }
+
+    // (c) Resolve each held submit in original click order.  Each resolve
+    //     must trigger the next submit (FIFO drain).  Verify each step.
+    // Resolve submit1 → submit2 fires.
+    resolveHeld6[0]();
+    await sleep(60);
+    if (errs6.length > 0) {
+      throw new Error(`burst post-resolve-1 errors: ${JSON.stringify(errs6)}`);
+    }
+    if (submitCalls6 !== 2) {
+      throw new Error(`burst: after resolve-1 expected 2 submits, got ${submitCalls6}`);
+    }
+    if (submittedIds6[1] !== 'c2') {
+      throw new Error(`burst: second submit should be c2, got ${JSON.stringify(submittedIds6[1])}`);
+    }
+    // Resolve submit2 → submit3 fires.
+    resolveHeld6[1]();
+    await sleep(60);
+    if (submitCalls6 !== 3) {
+      throw new Error(`burst: after resolve-2 expected 3 submits, got ${submitCalls6}`);
+    }
+    if (submittedIds6[2] !== 'c3') {
+      throw new Error(`burst: third submit should be c3, got ${JSON.stringify(submittedIds6[2])}`);
+    }
+    // Resolve submit3 → terminal state.
+    resolveHeld6[2]();
+    await sleep(80);
+    if (errs6.length > 0) {
+      throw new Error(`burst post-resolve-3 errors: ${JSON.stringify(errs6)}`);
+    }
+    // Authoritative counters applied: 3 reviewed, 0 remaining.
+    const prog6final = progressText();
+    if (!prog6final.includes('3 reviewed') || !prog6final.includes('0 remaining')) {
+      throw new Error(`burst: final progress wrong: ${JSON.stringify(prog6final)}`);
+    }
+
+    // (d) Inject a delayed/stale session snapshot for an already-rated card
+    //     (c1) with reviewedCount:0 — must NOT regress the counter or card.
+    dom6.window.dispatchEvent(new dom6.window.MessageEvent('message', {
+      data: {
+        jsonrpc: '2.0',
+        method: 'ui/notifications/tool-result',
+        params: {
+          output: {
+            structuredContent: {
+              session: {
+                id: 's6', status: 'active', cardType: 'qa',
+                cardIds: ['c1', 'c2', 'c3'], currentIndex: 0,
+                reviewedCount: 0, remainingCount: 3, limit: 100,
+              },
+              card: { id: 'c1', front: 'Q1', back: 'A1' },
+              preloaded: [
+                { id: 'c2', front: 'Q2', back: 'A2', tags: [] },
+              ],
+            },
+          },
+        },
+      },
+    }));
+    await sleep(40);
+    if (errs6.length > 0) {
+      throw new Error(`burst post-stale errors: ${JSON.stringify(errs6)}`);
+    }
+    // Counter must NOT regress below 3 reviewed.
+    const prog6stale = progressText();
+    if (!prog6stale.includes('3 reviewed')) {
+      throw new Error(`burst: stale snapshot regressed reviewed counter: ${JSON.stringify(prog6stale)}`);
+    }
+    // Card must NOT regress to c1 — done panel stays visible (session is
+    // completed after 3 ratings) and stale snapshot cannot resurrect it.
+    if (doneHidden()) {
+      throw new Error('burst: stale snapshot hid the done panel — card/session UI regressed');
+    }
+    // If the terminal DOM still shows the card shell, front/back must NOT
+    // have reverted to c1 content (Q1/A1) from the stale snapshot.
+    if (!doc6.getElementById('cardShell').classList.contains('hidden')) {
+      if (shownFront() === 'Q1' || shownBack() === 'A1') {
+        throw new Error(`burst: stale snapshot regressed card to c1 (front=${JSON.stringify(shownFront())}, back=${JSON.stringify(shownBack())})`);
+      }
+    }
+    console.log('PASS rapid burst: 3 ratings before any ack → 1 submit, reviewed=3 optimistic, FIFO drain in order, stale snapshot cannot regress counter or card');
   }
 
   console.log('\nWIDGET RUNTIME OK');

@@ -396,13 +396,9 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   var generation = 0;              // bumped when the session ends: stale submit callbacks no-op
   var renderedCardId = null;       // id of the card currently rendered; flip resets only on card change
   var ratedCardIds = {};           // card ids the user has rated (in-flight or committed), id -> true
-  // PARALLEL rating bookkeeping: every rating captures the DISPLAYED card id
-  // and submits immediately — there is no single-flight gate. In-flight
-  // ratings are tracked per claimed card (a rapid double-click on the SAME
-  // displayed card never double-submits) and per requestId (response
-  // correlation + staleness).
-  var inflightByCard = {};         // expectedCardId -> item { rating, requestId, expectedCardId }
-  var inflightByRequest = {};      // requestId -> item
+  var inflightByCard = {};         // card id → pending rating item (prevents same-card double-submit)
+  var inflightByRequest = {};      // requestId → pending rating item (response correlation)
+  var ratingQueue = [];            // FIFO queue of pending rating items awaiting serial submit
   // Count-based optimistic delta: tracks how many ratings this widget
   // session has submitted minus how many the server has acknowledged via
   // session.reviewedCount.  This avoids the stale-visibleStatus trap where
@@ -410,6 +406,9 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   var totalRatedCount = 0;         // ratings submitted since session adopt
   var baselineReviewedCount = 0;   // session.reviewedCount at session start (never advanced)
   var adoptedIndex = (data.session && typeof data.session.currentIndex === 'number') ? data.session.currentIndex : 0;  // highest currentIndex seen (adopted or optimistically set)
+  var pendingSubmits = [];          // FIFO queue of rating items awaiting serial network submit
+  var submitInFlight = false;       // true while one submit_item is in-flight (serial drain gate)
+  var maxOptimisticReviewed = (data.session && typeof data.session.reviewedCount === 'number') ? data.session.reviewedCount : 0; // highest displayed reviewed count (monotonic floor)
 
   // True when a card object is MINIMAL — only an id (no renderable content).
   // Some hosts strip the hidden _meta and return { session, card: { id } }.
@@ -638,7 +637,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   //    flight) is only cleared when the response carries a REAL terminal or
   //    next-card state — a stale response for an already-rated card keeps
   //    the done panel (no blank/disabled card).
-  function adoptServerState(session, card, preloaded) {
+  function adoptServerState(session, card, preloaded, recovery) {
     // Monotonic session reconciliation: NEVER regress authoritative session
     // counters. A stale or out-of-order snapshot that arrives after the
     // widget has advanced (via optimistic rating or a newer response) must
@@ -663,12 +662,19 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     // current position and must reconcile even if the index matches an
     // optimistic advance.  Only merge additive preloads (never shrink).
     if (!isNewSession && prev.id && session.id === prev.id) {
-      if (newIndex < adoptedIndex) {
+      if (!recovery && newIndex < adoptedIndex) {
         if (Array.isArray(preloaded)) mergeQueueCards(preloaded);
         return;
       }
-      // Also block regressions in reviewedCount/remainingCount.
-      if (newReviewed < prevReviewed || newRemaining > prevRemaining) {
+      // Also block regressions in reviewedCount/remainingCount, and in the
+      // optimistic displayed reviewed count (the monotonic floor).  A stale
+      // snapshot whose reviewedCount + totalRatedCount would drop the
+      // displayed reviewed below the highest value already shown is rejected
+      // so that rapid clicks can never regress the counter.  Recovery
+      // responses (sync-after-failure) bypass this guard — the backend's
+      // current state is authoritative.
+      if (!recovery && (newReviewed < prevReviewed || newRemaining > prevRemaining ||
+          (newReviewed + totalRatedCount) < maxOptimisticReviewed)) {
         if (Array.isArray(preloaded)) mergeQueueCards(preloaded);
         return;
       }
@@ -799,6 +805,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
       optimisticDone = false;
       inflightByCard = {};
       inflightByRequest = {};
+      pendingSubmits = [];
       ending = false;
       render();
     }
@@ -837,11 +844,13 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     // display. A rating bumps remaining synchronously; an acknowledged
     // response never double-counts.
     var optimistic = optimisticReviewDelta();
-    // Apply the optimistic delta ONLY to remaining: reviewed is the
-    // server-authoritative count (never inflated by in-flight ratings).
-    // This keeps reviewed + remaining <= total at all times — the delta
-    // only shows forward progress on the remaining queue, not double-counts.
-    var reviewed = s.reviewedCount || 0;
+    // Apply the optimistic delta to BOTH reviewed and remaining: each
+    // locally-accepted rating immediately advances the visible progress
+    // (the serial FIFO ensures one network submit at a time, so the
+    // optimistic projection is safe). Server responses reconcile via
+    // adoptServerState without regressions (monotonic guard).
+    var reviewed = Math.max(maxOptimisticReviewed, (s.reviewedCount || 0) + optimistic);
+    if (reviewed > maxOptimisticReviewed) maxOptimisticReviewed = reviewed;
     var remaining = s.remainingCount != null ? Math.max(0, s.remainingCount - optimistic) : s.remainingCount;
     // Always use computed counters — never stale visibleStatus (a pre-baked
     // server string that doesn't account for optimistic deltas or monotonic
@@ -1297,17 +1306,14 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     revealBtn.disabled = false;
   }
 
-  // PARALLEL rating pipeline: EVERY rating captures the DISPLAYED card id
-  // and submits immediately — there is NO single-flight gate (the old
-  // "if (inflight) return" is gone). Ratings are tracked per claimed card and per
-  // requestId: a rapid double-click on the SAME displayed card never
-  // double-submits (the per-card map), while ratings for DIFFERENT cards
-  // (parallel preloaded-card reviews) all stay in flight at once. The
+  // FIFO rating pipeline: every rating captures the DISPLAYED card id, is
+  // enqueued, and advances the UI optimistically; at most one submit is in
+  // flight.  A rapid double-click on the SAME displayed card is blocked by
+  // the per-card guard (inflightByCard); ratings for DIFFERENT cards are
+  // queued and drain in click order after each submit completes.  The
   // optimistic next card (shifted from the preloaded queue BEFORE the
-  // submit starts) is displayed synchronously; the backend response is the
-  // sole source of truth for the session counters, and an id-only response
-  // resolving to the same card keeps the full displayed card (never a white
-  // card, never a regression).
+  // submit) is displayed synchronously; the backend response is the sole
+  // source of truth for session counters.
   function rate(rating) {
     if (!data.session || !data.session.id) return;
     if (ending) return; // an end request is in flight — no new ratings
@@ -1337,7 +1343,6 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     inflightByCard[expectedCardId] = item;
     inflightByRequest[item.requestId] = item;
     ratedCardIds[expectedCardId] = true;
-    disableControls();
     // OPTIMISTIC next card: the monotonic preloaded queue is the next-card
     // source of truth, so shift the next full card into data.card and render
     // BEFORE the submit starts — the next card's front/back appear
@@ -1364,7 +1369,8 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         : ((data.session && typeof data.session.currentIndex === 'number') ? data.session.currentIndex + 1 : 0);
       if (pos > adoptedIndex) adoptedIndex = pos;
       render();
-      submitItem(item);
+      pendingSubmits.push(item);
+      processNextSubmit();
       return;
     }
     // Queue exhausted. Optimistic completion is ONLY valid when every
@@ -1379,16 +1385,29 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     if (allSessionCardsAccountedFor()) {
       optimisticDone = true;
       render();
-      submitItem(item);
+      pendingSubmits.push(item);
+      processNextSubmit();
       return;
     }
     // Cards beyond the local buffer are still unknown: keep the rated card
     // displayed (the response re-syncs the next card).
     render();
-    submitItem(item);
+    pendingSubmits.push(item);
+    processNextSubmit();
   }
 
-  // Submits ONE rating (parallel). The expectedCardId is the id of the card
+  // FIFO drain: fires the next pending submit if no submit is currently
+  // in-flight.  Called after each enqueue (rate) and after each submit
+  // completion (submitItem success/error) so items process strictly in
+  // click order.
+  function processNextSubmit() {
+    if (submitInFlight || !pendingSubmits.length) return;
+    submitInFlight = true;
+    var next = pendingSubmits.shift();
+    submitItem(next);
+  }
+
+  // Submits ONE rating. The expectedCardId is the id of the card
   // the user was looking at when they rated — the session's authoritative
   // target. Failures NEVER resend a stale id: on any error the widget
   // re-syncs via get_review_session, adopts the authoritative current card,
@@ -1434,12 +1453,14 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         // late/out-of-order duplicate or unsolicited response for this card
         // can never regress the display. Only the in-flight maps are cleared
         // (totalRatedCount stays — the rating was accepted).
-        clearInflightItem(item);
         render();
         statusEl.textContent = '';
+        // FIFO drain: release the serial gate and fire the next queued submit.
+        submitInFlight = false;
+        processNextSubmit();
       })
       .catch(function () {
-        if (gen !== generation) return; // stale: session ended while in flight
+        if (gen !== generation) { submitInFlight = false; processNextSubmit(); return; } // stale: session ended while in flight
         // NO visible error/request copy: the user never sees backend work.
         // Re-sync authoritative state, then re-enable. NEVER retry the stale
         // item: the backend rejected it because the session advanced; the
@@ -1451,17 +1472,16 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         // permanently inflate the optimistic delta.
         clearInflightItem(item, true);
         totalRatedCount = Math.max(0, totalRatedCount - 1);
-        // RECOVERY: reset the optimistic queue state when this was the only
-        // in-flight item. The optimistic shift advanced adoptedIndex past the
-        // session's currentIndex; without resetting, the stale guard in
-        // adoptServerState blocks the authoritative recovery snapshot
-        // (currentIndex < adoptedIndex). Safe only when no other in-flight
-        // items depend on the advanced index — otherwise the stale guard is
-        // still needed for those items.
-        if (Object.keys(inflightByCard).length === 0) {
-          adoptedIndex = (data.session && typeof data.session.currentIndex === 'number') ? data.session.currentIndex : 0;
-        }
-        syncAfterSubmit(gen);
+        // RECOVERY: flag the sync so adoptServerState bypasses the stale-
+        // snapshot guard (the sync response is authoritative recovery, not
+        // a stale out-of-order snapshot).  The FIFO gate stays held until
+        // the recovery sync settles — the next queued rating must not
+        // submit before the authoritative get_review_session applies.
+        item.recovery = true;
+        syncAfterSubmit(gen, item.recovery, function () {
+          submitInFlight = false;
+          processNextSubmit();
+        });
       });
   }
 
@@ -1488,30 +1508,36 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // result, then re-enable the rating controls for the displayed card.
   // Parallel-safe: clears ONLY this item's bookkeeping (other in-flight
   // items are untouched) and reconciles the displayed card against the
-  // authoritative current card.
-  function syncAfterSubmit(gen) {
+  // authoritative current card.  When onDone is provided (FIFO drain),
+  // it is called AFTER the sync settles (success or error) so the next
+  // queued rating does not submit before recovery applies.
+  function syncAfterSubmit(gen, recovery, onDone) {
+    function done() { if (onDone) onDone(); }
     if (!data.getTool || !data.session || !data.session.id) {
       render();
+      done();
       return;
     }
     callTool(data.getTool, { sessionId: data.session.id })
       .then(function (syncRes) {
-        if (gen !== generation) return; // session ended while syncing
+        if (gen !== generation) { done(); return; } // session ended while syncing
         var sc = syncRes && (syncRes.structuredContent || (syncRes.content && syncRes.content[0] && syncRes.content[0].structuredContent));
         if (sc && sc.session) {
           // Authoritative card restored: adopt the session's current card
           // (full from cache or preloaded; id-only resolved from cache).
-          adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded);
+          adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded, recovery);
         } else {
           // No usable sync state: keep the displayed card (full or minimal)
           // so the user can still rate or reveal — never a blank card.
           render();
         }
         statusEl.textContent = '';
+        done();
       })
       .catch(function () {
-        if (gen !== generation) return;
+        if (gen !== generation) { done(); return; }
         render();
+        done();
       });
   }
 
@@ -1571,6 +1597,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     // is abandoned (the session is being ended, not reviewed).
     inflightByCard = {};
     inflightByRequest = {};
+    pendingSubmits = [];
     disableControls();
     // No request-state wording: the user never sees that a backend call is
     // in flight. The end result renders the ended state.
