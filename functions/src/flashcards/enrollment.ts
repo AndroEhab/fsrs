@@ -1,74 +1,41 @@
 /**
- * Safe bulk enrollment service — a resumable, idempotent workflow that can
- * handle 5,298+ cards despite 100-card request limits and client timeouts.
- *
- * Design:
- *  - Content-addressable job ID (SHA-256 of sorted card keys) ensures
- *    idempotency: resending the same cards returns the existing job.
- *  - Cards are stored in a Firestore subcollection
- *    `bulkEnrollmentJobs/{jobId}/chunks/{paddedIndex}` as durable payloads,
- *    then processed chunk-by-chunk with Firestore WriteBatch (atomic per chunk).
- *  - Deterministic card document ids (SHA-256 of full card identity including
- *    deckId/topic/suspended) ensure that re-processing the same chunk
- *    overwrites the same documents — never creates duplicates.
- *  - The initial HTTP response returns immediately with the jobId. Background
- *    processing happens via Firestore onDocumentWritten trigger. If the
- *    before all chunks are committed, the next call with the same payload
- *    resumes from the last completed chunk.
- *  - Progress is tracked on the job document; clients poll
- *    `getEnrollmentStatus(jobId)` for reconciliation.
- *
- * No background tasks, Cloud Functions, or new infrastructure required.
+ * Safe bulk enrollment service — a resumable, idempotent workflow for large
+ * card sets. Versioned canonical identities, durable byte-bounded chunks, and
+ * one transaction per chunk keep card creation and progress accounting atomic.
  */
 import {
-  getFirestore, Firestore, Timestamp, FieldValue,
+  getFirestore, Firestore, Timestamp, FieldValue, FieldPath,
 } from 'firebase-admin/firestore';
 import { createHash } from 'crypto';
 import {
   BulkEnrollCardsInput, BulkEnrollCardsResponse, BulkEnrollmentJob,
-  BulkEnrollStatusResponse,
-  CreateFlashcardInput,
-  ENROLLMENT_CHUNK_SIZE, ENROLLMENT_MAX_CARDS,
-  DEFAULT_DECK_NAME,
+  BulkEnrollStatusResponse, CreateFlashcardInput,
+  ENROLLMENT_CHUNK_SIZE, ENROLLMENT_MAX_CARDS, DECK_NAME_MAX_LENGTH,
 } from './types';
+import { getDefaultOwnedDeck, deckFromSnapshot, resolveOwnedDeckRef, type DeckRef, DeckNotFoundError, AmbiguousDeckNameError } from './decks';
 import { initialScheduling } from './scheduler';
-
-/* ------------------------------------------------------------------ */
-/* Constants                                                           */
-/* ------------------------------------------------------------------ */
-
 const JOBS_COLLECTION = 'bulkEnrollmentJobs';
 const CHUNKS_SUBCOLLECTION = 'chunks';
 const FLASHCARDS_COLLECTION = 'flashcards';
+const ENROLLMENT_KEYS_COLLECTION = 'bulkEnrollmentCardKeys';
 const DECKS_COLLECTION = 'decks';
-
-/* ------------------------------------------------------------------ */
-/* Firestore access                                                    */
-/* ------------------------------------------------------------------ */
+const ENROLLMENT_FORMAT_VERSION = 2;
+const CHUNK_DOCUMENT_BUDGET_BYTES = 700 * 1024;
+const CHUNK_BATCH_BUDGET_BYTES = 6 * 1024 * 1024;
+const CHUNK_BATCH_WRITE_LIMIT = 400;
 
 let db: Firestore | undefined;
 
 function getDb(): Firestore {
-  if (!db) {
-    db = getFirestore();
-  }
+  if (!db) db = getFirestore();
   return db;
 }
 
-/* ------------------------------------------------------------------ */
-/* Card key (content-addressable identity)                             */
-/* ------------------------------------------------------------------ */
+function digest(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
 
-/**
- * Deterministic key for a card: SHA-256(ownerId + '|' + trimmed front +
- * '|' + trimmed back + '|' + sorted tags + '|' + deckId + '|' + topic +
- * '|' + suspended).
- *
- * `suspended` is normalized to '0'/'1' — an omitted (undefined) value
- * maps to '0', matching the default `false` persisted on created cards.
- * This ensures the key is the same whether the caller passes
- * `{ suspended: false }` or omits `suspended` entirely.
- */
+/** Versioned, unambiguous deterministic card identity. */
 export function computeCardKey(
   ownerId: string,
   front: string,
@@ -78,99 +45,49 @@ export function computeCardKey(
   topic?: string | null,
   suspended?: boolean,
 ): string {
-  const normalizedFront = front.trim();
-  const normalizedBack = back.trim();
-  const sortedTags = [...tags].sort().join(',');
-  const normDeckId = (deckId ?? '').trim();
-  const normTopic = (topic ?? '').trim();
-  const suspendedStr = suspended === true ? '1' : '0';
-  const payload = `${ownerId}|${normalizedFront}|${normalizedBack}|${sortedTags}|${normDeckId}|${normTopic}|${suspendedStr}`;
-  return createHash('sha256').update(payload).digest('hex');
+  const identity = [
+    'flashcard', ENROLLMENT_FORMAT_VERSION, ownerId, front.trim(), back.trim(),
+    [...tags].sort(), deckId ?? '', (topic ?? '').trim(), suspended === true,
+  ];
+  return `c2_${digest(JSON.stringify(identity))}`;
 }
 
-/**
- * Content-addressable job ID: SHA-256 of the JSON-sorted array of card
- * keys. Two identical card sets (in any order) produce the same job ID.
- */
-function computeJobId(ownerId: string, cards: CreateFlashcardInput[]): string {
-  const cardKeys = cards
-    .map((c) => computeCardKey(
-      ownerId, c.front, c.back, c.tags || [],
-      c.deckId, c.topic, c.suspended,
-    ))
-    .sort();
-  return createHash('sha256').update(JSON.stringify(cardKeys)).digest('hex');
+interface CanonicalCard extends CreateFlashcardInput {
+  front: string;
+  back: string;
+  tags: string[];
+  deckId: string;
+  deck: string;
+  suspended: boolean;
 }
 
-/* ------------------------------------------------------------------ */
-/* Deck resolution (mirrors service.ts patterns)                       */
-/* ------------------------------------------------------------------ */
-
-async function findDeckIdByName(name: string, ownerId: string): Promise<string | null> {
-  const q = getDb()
-    .collection(DECKS_COLLECTION)
-    .where('name', '==', name)
-    .where('ownerId', '==', ownerId)
-    .limit(1);
-  const existing = await q.get();
-  if (existing.empty) return null;
-  return existing.docs[0].id;
+interface EnrollmentChunk {
+  index: number;
+  cards: CanonicalCard[];
+  payloadHash: string;
+  startOrdinal: number;
 }
 
-async function createDeckEntity(name: string, ownerId: string): Promise<string> {
-  const now = Timestamp.now();
-  const docRef = getDb().collection(DECKS_COLLECTION).doc();
-  await docRef.set({ name, ownerId, createdAt: now, updatedAt: now });
-  return docRef.id;
+function canonicalCardKey(ownerId: string, card: CanonicalCard): string {
+  return computeCardKey(ownerId, card.front, card.back, card.tags, card.deckId, card.topic, card.suspended);
 }
 
-async function findOrCreateDeckByName(name: string, ownerId: string): Promise<string> {
-  const existingId = await findDeckIdByName(name, ownerId);
-  if (existingId !== null) return existingId;
-  return createDeckEntity(name, ownerId);
-}
 
-/**
- * Resolves the deck a card input refers to. Returns { deckId, deck } or
- * null when neither is set. Throws when a referenced deckId does not exist
- * or belongs to another owner.
- */
-async function resolveDeckRef(
-  input: { deckId?: string | null; deck?: string | null },
-  ownerId: string,
-): Promise<{ deckId: string; deck: string } | null> {
-  if (input.deckId !== undefined && input.deckId !== null) {
-    const doc = await getDb().collection(DECKS_COLLECTION).doc(input.deckId).get();
-    if (!doc.exists || doc.data()?.ownerId !== ownerId) {
-      throw new Error(`Deck not found: ${input.deckId}`);
-    }
-    return { deckId: input.deckId, deck: doc.data()?.name as string };
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`;
   }
-  if (input.deck !== undefined && input.deck !== null) {
-    const deckId = await findOrCreateDeckByName(input.deck, ownerId);
-    return { deckId, deck: input.deck };
-  }
-  return null;
+  return JSON.stringify(value);
 }
 
-function applyDeckRef(
-  target: Record<string, unknown>,
-  ref: { deckId: string; deck: string } | null,
-): void {
-  if (!ref) return;
-  target.deckId = ref.deckId;
-  target.deck = ref.deck;
+function computeJobId(ownerId: string, cards: CanonicalCard[]): string {
+  const keys = cards.map((card) => canonicalCardKey(ownerId, card)).sort();
+  return `e2_${digest(JSON.stringify(['bulk-enrollment', ENROLLMENT_FORMAT_VERSION, ownerId, keys]))}`;
 }
 
-/** Lazily resolves the default `Uncategorized` deck for an owner. */
-async function resolveDefaultDeck(ownerId: string): Promise<{ deckId: string; deck: string }> {
-  const deckId = await findOrCreateDeckByName(DEFAULT_DECK_NAME, ownerId);
-  return { deckId, deck: DEFAULT_DECK_NAME };
-}
-
-/* ------------------------------------------------------------------ */
-/* Error classes                                                       */
-/* ------------------------------------------------------------------ */
+/** Enrollment shares the registry's exact owner/name and explicit-ID rules. */
 
 export class EnrollmentValidationError extends Error {
   constructor(message: string) {
@@ -179,589 +96,619 @@ export class EnrollmentValidationError extends Error {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Chunk management                                                    */
-/* ------------------------------------------------------------------ */
-
-/**
- * Splits cards into chunks of ≤ENROLLMENT_CHUNK_SIZE and writes them as
- * chunk documents in a Firestore subcollection under the job. Each chunk
- * stores the raw card payloads so that resume does not require the client
- * to resend the full payload.
- */
-async function writeChunks(
-  jobId: string,
-  cards: CreateFlashcardInput[],
-  ownerId: string,
-): Promise<{ totalChunks: number; totalCards: number }> {
-  if (cards.length === 0) {
-    return { totalChunks: 0, totalCards: 0 };
+function normalizeInputCard(card: CreateFlashcardInput): Omit<CanonicalCard, 'deckId' | 'deck'> {
+  const front = card.front.trim();
+  const back = card.back.trim();
+  const topic = card.topic == null ? undefined : card.topic.trim();
+  if (!front || !back) {
+    throw new EnrollmentValidationError('Front and back must not be empty after trimming');
   }
-  const chunksSubcoll = getDb()
-    .collection(JOBS_COLLECTION)
-    .doc(jobId)
-    .collection(CHUNKS_SUBCOLLECTION);
-
-  const totalChunks = Math.ceil(cards.length / ENROLLMENT_CHUNK_SIZE);
-
-  // Write all chunk metadata in a single Firestore WriteBatch (atomic).
-  // 53 chunks for 5,298 cards is well under the 500-write batch limit.
-  // This turns 53 sequential network round-trips into one, keeping the
-  // initial POST fast enough for the 15s MCP bridge timeout.
-  const batch = getDb().batch();
-  for (let i = 0; i < totalChunks; i++) {
-    const chunkCards = cards.slice(i * ENROLLMENT_CHUNK_SIZE, (i + 1) * ENROLLMENT_CHUNK_SIZE);
-    const paddedIndex = String(i).padStart(5, '0');
-    batch.set(chunksSubcoll.doc(paddedIndex), {
-      chunkIndex: i,
-      cards: chunkCards,
-      cardCount: chunkCards.length,
-      status: 'pending',
-      ownerId,
-      createdCount: 0,
-      failedCount: 0,
-    });
+  if (front.length > 10_000 || back.length > 10_000) {
+    throw new EnrollmentValidationError('Front and back must not exceed 10000 characters after trimming');
   }
-  await batch.commit();
-
-  return { totalChunks, totalCards: cards.length };
-}
-
-/**
- * Reads the card payloads from a chunk document.
- */
-async function readChunkCards(
-  jobId: string,
-  chunkIndex: number,
-): Promise<CreateFlashcardInput[]> {
-  const paddedIndex = String(chunkIndex).padStart(5, '0');
-  const snap = await getDb()
-    .collection(JOBS_COLLECTION)
-    .doc(jobId)
-    .collection(CHUNKS_SUBCOLLECTION)
-    .doc(paddedIndex)
-    .get();
-  if (!snap.exists) return [];
-  return (snap.data()?.cards as CreateFlashcardInput[]) || [];
-}
-
-/**
- * Scans all chunk documents for a job and returns the status of each.
- * Used by the resume path to detect stuck/pending/processing chunks
- * that need to be retriggered.
- */
-async function scanChunkStatuses(
-  jobId: string,
-  totalChunks: number,
-): Promise<Array<{ index: number; status: string | undefined; exists: boolean }>> {
-  const chunksSubcoll = getDb()
-    .collection(JOBS_COLLECTION)
-    .doc(jobId)
-    .collection(CHUNKS_SUBCOLLECTION);
-  const results: Array<{ index: number; status: string | undefined; exists: boolean }> = [];
-  for (let i = 0; i < totalChunks; i++) {
-    const paddedIndex = String(i).padStart(5, '0');
-    const snap = await chunksSubcoll.doc(paddedIndex).get();
-    results.push({
-      index: i,
-      status: snap.exists ? (snap.data()?.status as string | undefined) : undefined,
-      exists: snap.exists,
-    });
+  if (topic !== undefined && (!topic || topic.length > 200)) {
+    throw new EnrollmentValidationError('Topic must contain 1 to 200 characters after trimming');
   }
-  return results;
-}
-
-/* ------------------------------------------------------------------ */
-/* Job document management                                             */
-/* ------------------------------------------------------------------ */
-
-async function createJobDocument(
-  jobId: string,
-  ownerId: string,
-  totalChunks: number,
-  totalCards: number,
-): Promise<void> {
-  const now = Timestamp.now();
-  await getDb().collection(JOBS_COLLECTION).doc(jobId).set({
-    ownerId,
-    status: 'pending',
-    contentHash: jobId,
-    totalCards,
-    totalChunks,
-    completedChunks: 0,
-    createdCount: 0,
-    skippedCount: 0,
-    failedCount: 0,
-    createdAt: now,
-    updatedAt: now,
-  });
-}
-
-async function readJobDocument(jobId: string): Promise<BulkEnrollmentJob | null> {
-  const snap = await getDb().collection(JOBS_COLLECTION).doc(jobId).get();
-  if (!snap.exists) return null;
-  const data = snap.data()!;
-  return { id: snap.id, ...data } as BulkEnrollmentJob;
-}
-
-async function updateJobProgress(
-  jobId: string,
-  fields: Partial<Pick<BulkEnrollmentJob,
-    'completedChunks' | 'createdCount' | 'failedCount' | 'status' | 'error' | 'completedAt'
-  >>,
-): Promise<void> {
-  await getDb().collection(JOBS_COLLECTION).doc(jobId).update({
-    ...fields,
-    updatedAt: Timestamp.now(),
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* Chunk processing                                                    */
-/* ------------------------------------------------------------------ */
-
-/**
- * Normalizes a card's content fields for comparison against existing cards.
- * Used for legacy reconciliation: matching cards created by random-ID
- * bulk_create that won't match the deterministic card key.
- */
-function normalizeCardContent(card: {
-  front: string; back: string; tags?: string[];
-  topic?: string | null; suspended?: boolean;
-}): { front: string; back: string; tags: string[]; topic: string; suspended: boolean } {
+  const tags = [...(card.tags || [])].sort();
+  if (tags.length > 20 || tags.some((tag) => !tag || tag.length > 50)) {
+    throw new EnrollmentValidationError('Tags must contain at most 20 non-empty values of at most 50 characters');
+  }
   return {
-    front: card.front.trim(),
-    back: card.back.trim(),
-    tags: [...(card.tags || [])].sort(),
-    topic: (card.topic ?? '').trim(),
+    front,
+    back,
+    tags,
+    ...(topic !== undefined ? { topic } : {}),
     suspended: card.suspended === true,
   };
 }
 
-function contentMatches(
-  existing: { front?: string; back?: string; tags?: string[]; topic?: string; suspended?: boolean },
-  target: ReturnType<typeof normalizeCardContent>,
-): boolean {
-  return (existing.front ?? '').trim() === target.front
-    && (existing.back ?? '').trim() === target.back
-    && JSON.stringify([...(existing.tags || [])].sort()) === JSON.stringify(target.tags)
-    && ((existing.topic ?? '').trim() === target.topic)
-    && ((existing.suspended ?? false) === target.suspended);
-}
-
-/**
- * Reconciles a new card against existing same-owner cards in a deck.
- * For cards WITH a deckId: queries existing cards in that deck and checks
- * for content match (front/back/tags/topic/suspended). If found, returns
- * the existing card's id (skip write). If not found, returns null (create).
- *
- * This handles legacy random-ID cards created by the old bulk_create API.
- *
- * LIMITATION: Cards without a deckId in the input are resolved to the
- * `Uncategorized` default deck, so reconciliation uses the deck-scoped
- * query path. Legacy random-ID cards without a deckId cannot be safely
- * reconciled without a broad scan of the owner's entire library (no
- * composite index on content fields).
- *
- * @param chunkCards  Cards in the current chunk
- * @param ownerId     The authenticated owner
- * @param deckCache   Resolved deck references (deckId → { deckId, deck })
- * @param matchedKeys Set to track already-matched content keys within
- *                    this chunk (prevents intra-chunk duplicates)
- * @returns Map from card index → existing card id (skip) or null (create)
- */
-async function reconcileLegacyCards(
-  chunkCards: CreateFlashcardInput[],
+async function canonicalizeCards(
+  cards: CreateFlashcardInput[],
   ownerId: string,
-  deckCache: Map<string, { deckId: string; deck: string } | null>,
-  matchedKeys: Set<string>,
-): Promise<Map<number, string | null>> {
-  const result = new Map<number, string | null>();
-
-  // Group cards by resolved deckId for efficient querying.
-  const byDeck = new Map<string, number[]>();
-  const noDeck: number[] = [];
-
-  for (let i = 0; i < chunkCards.length; i++) {
-    const card = chunkCards[i];
-    const deckKey = `${card.deckId ?? ''}|${card.deck ?? ''}`;
-    const ref = deckCache.get(deckKey);
-    if (ref?.deckId) {
-      if (!byDeck.has(ref.deckId)) byDeck.set(ref.deckId, []);
-      byDeck.get(ref.deckId)!.push(i);
-    } else {
-      noDeck.push(i);
-    }
-  }
-
-  // For each deck: query existing cards once, then match all cards in
-  // that deck against the query results.
-  for (const [deckId, indices] of byDeck) {
-    const existingSnap = await getDb()
-      .collection(FLASHCARDS_COLLECTION)
-      .where('ownerId', '==', ownerId)
-      .where('deckId', '==', deckId)
-      .get();
-
-    const existingDocs = existingSnap.docs.map((d) => ({
-      id: d.id,
-      data: d.data(),
-    }));
-
-    for (const idx of indices) {
-      const card = chunkCards[idx];
-      const target = normalizeCardContent(card);
-      const contentKey = `${target.front}|${target.back}|${JSON.stringify(target.tags)}|${target.topic}|${target.suspended}`;
-
-      // Check deterministic card key first (same-owner direct hit).
-      const cardKey = computeCardKey(
-        ownerId, card.front, card.back, card.tags || [],
-        card.deckId, card.topic, card.suspended,
-      );
-      const keySnap = await getDb().collection(FLASHCARDS_COLLECTION).doc(cardKey).get();
-      if (keySnap.exists && keySnap.data()?.ownerId === ownerId) {
-        result.set(idx, cardKey);
-        matchedKeys.add(contentKey);
-        continue;
-      }
-
-      // Legacy content match: check existing cards in this deck.
-      for (const existing of existingDocs) {
-        if (contentMatches(existing.data, target)) {
-          result.set(idx, existing.id);
-          matchedKeys.add(contentKey);
-          break;
+  useStoredDeckSnapshot = false,
+): Promise<CanonicalCard[]> {
+  const defaultDeck = await getDefaultOwnedDeck(ownerId);
+  const deckCache = new Map<string, DeckRef>();
+  const withOrdinal: Array<{ card: CanonicalCard; ordinal: number }> = [];
+  for (const [ordinal, card] of cards.entries()) {
+    const normalized = normalizeInputCard(card);
+    const deckKey = JSON.stringify([card.deckId ?? null, card.deck ?? null]);
+    let deck = deckCache.get(deckKey);
+    if (!deck) {
+      try {
+        if (useStoredDeckSnapshot && typeof card.deckId === 'string') {
+          const deckSnapshot = await getDb().collection(DECKS_COLLECTION).doc(card.deckId).get();
+          const deckData = deckSnapshot.data();
+          const currentDeck = deckData ? deckFromSnapshot(deckSnapshot) : null;
+          // This label is only for identity/legacy lookup; processChunk validates it again before writes.
+          deck = {
+            deckId: card.deckId,
+            deck: currentDeck?.ownerId === ownerId && typeof currentDeck.name === 'string' ? currentDeck.name : '',
+          };
+        } else {
+          deck = await resolveOwnedDeckRef(card, ownerId) ?? {
+            deckId: defaultDeck.id,
+            deck: defaultDeck.name,
+          };
         }
+      } catch (error) {
+        if (error instanceof DeckNotFoundError || error instanceof AmbiguousDeckNameError) {
+          throw new EnrollmentValidationError(error.message);
+        }
+        throw error;
       }
-
-      // Also check if another card in this chunk with the same content
-      // was already matched (prevents intra-chunk duplicates).
-      if (!result.has(idx) && matchedKeys.has(contentKey)) {
-        result.set(idx, '__skip__');
-      }
+      deckCache.set(deckKey, deck);
     }
+    withOrdinal.push({ card: { ...normalized, deckId: deck.deckId, deck: deck.deck }, ordinal });
   }
-
-  // Cards without a deckId: only check by deterministic key (already
-  // done in processChunk's existingSnaps). Mark as not reconciled.
-  for (const idx of noDeck) {
-    result.set(idx, null);
-  }
-
-  return result;
+  withOrdinal.sort((a, b) => {
+    const order = canonicalCardKey(ownerId, a.card).localeCompare(canonicalCardKey(ownerId, b.card));
+    return order || a.ordinal - b.ordinal;
+  });
+  return withOrdinal.map(({ card }) => card);
 }
 
-/**
- * Processes one chunk: reconciles legacy cards, writes new cards, skips
- * existing same-owner cards.
- *
- * Cards use deterministic document ids (cardKey) that include ALL content-
- * bearing fields. If a card document already exists with the same ownerId,
- * the write is SKIPPED. For cards that don't match by key (legacy random-
- * ID cards), a deck-scoped content search finds matches by front/back/
- * tags/topic/suspended within the target deck.
- *
- * Deck resolution happens outside the batch (standalone writes allowed).
- */
-async function processChunk(
-  chunkCards: CreateFlashcardInput[],
+function hashChunkCards(cards: CanonicalCard[], ownerId: string): string {
+  const identities = cards.map((card) => canonicalCardKey(ownerId, card));
+  return digest(stableJson(identities));
+}
+
+function makeChunkDocument(chunk: EnrollmentChunk, ownerId: string): Record<string, unknown> {
+  return {
+    formatVersion: ENROLLMENT_FORMAT_VERSION,
+    chunkIndex: chunk.index,
+    startOrdinal: chunk.startOrdinal,
+    cards: chunk.cards.map(({ deck: _deck, ...card }) => card),
+    payloadHash: chunk.payloadHash,
+    cardCount: chunk.cards.length,
+    status: 'pending',
+    ownerId,
+    createdCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+  };
+}
+
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function partitionCards(cards: CanonicalCard[], ownerId: string): EnrollmentChunk[] {
+  const chunks: EnrollmentChunk[] = [];
+  let current: CanonicalCard[] = [];
+  let startOrdinal = 0;
+
+  const flush = () => {
+    if (current.length === 0) return;
+    const chunk: EnrollmentChunk = {
+      index: chunks.length,
+      cards: current,
+      payloadHash: hashChunkCards(current, ownerId),
+      startOrdinal,
+    };
+    const document = makeChunkDocument(chunk, ownerId);
+    if (serializedBytes(document) > CHUNK_DOCUMENT_BUDGET_BYTES) {
+      throw new EnrollmentValidationError(`Card ${startOrdinal} cannot fit in a bounded enrollment chunk`);
+    }
+    chunks.push(chunk);
+    startOrdinal += current.length;
+    current = [];
+  };
+
+  for (const card of cards) {
+    const candidate = [...current, card];
+    const next: EnrollmentChunk = {
+      index: chunks.length,
+      cards: candidate,
+      payloadHash: hashChunkCards(candidate, ownerId),
+      startOrdinal,
+    };
+    if (current.length > 0 && (candidate.length > ENROLLMENT_CHUNK_SIZE
+      || serializedBytes(makeChunkDocument(next, ownerId)) > CHUNK_DOCUMENT_BUDGET_BYTES)) {
+      flush();
+    }
+    const single: EnrollmentChunk = {
+      index: chunks.length,
+      cards: [card],
+      payloadHash: hashChunkCards([card], ownerId),
+      startOrdinal,
+    };
+    if (serializedBytes(makeChunkDocument(single, ownerId)) > CHUNK_DOCUMENT_BUDGET_BYTES) {
+      throw new EnrollmentValidationError(`Card ${startOrdinal} cannot fit in a bounded enrollment chunk`);
+    }
+    current.push(card);
+  }
+  flush();
+  return chunks;
+}
+
+function computeCanonicalSetHash(ownerId: string, cards: CanonicalCard[]): string {
+  return digest(JSON.stringify(['canonical-card-set', ENROLLMENT_FORMAT_VERSION, ownerId,
+    cards.map((card) => canonicalCardKey(ownerId, card)).sort()]));
+}
+
+function sameCardPayload(left: unknown, right: CanonicalCard[], ownerId: string): boolean {
+  if (!Array.isArray(left) || left.length !== right.length) return false;
+  const leftKeys = left.map((card) => canonicalCardKey(ownerId, card as CanonicalCard)).sort();
+  const rightKeys = right.map((card) => canonicalCardKey(ownerId, card)).sort();
+  return stableJson(leftKeys) === stableJson(rightKeys);
+}
+
+function validateStoredChunk(data: FirebaseFirestore.DocumentData, chunk: EnrollmentChunk, ownerId: string): void {
+  const payloadHash = Array.isArray(data.cards) ? hashChunkCards(data.cards as CanonicalCard[], ownerId) : '';
+  if (data.formatVersion !== ENROLLMENT_FORMAT_VERSION || data.ownerId !== ownerId
+    || data.chunkIndex !== chunk.index || data.startOrdinal !== chunk.startOrdinal
+    || data.payloadHash !== payloadHash || data.cardCount !== chunk.cards.length
+    || !sameCardPayload(data.cards, chunk.cards, ownerId)) {
+    throw new EnrollmentValidationError(`Stored enrollment chunk ${chunk.index} does not match this exact submission`);
+  }
+}
+
+function chunkDocumentRef(jobId: string, index: number) {
+  return getDb().collection(JOBS_COLLECTION).doc(jobId)
+    .collection(CHUNKS_SUBCOLLECTION).doc(String(index).padStart(5, '0'));
+}
+
+function validateExistingJob(
+  data: FirebaseFirestore.DocumentData,
   ownerId: string,
-): Promise<{ created: number; skipped: number; failed: number; errors: string[] }> {
-  if (chunkCards.length === 0) {
-    return { created: 0, skipped: 0, failed: 0, errors: [] };
+  jobId: string,
+  cards: CanonicalCard[],
+  chunks: EnrollmentChunk[],
+  canonicalSetHash: string,
+): void {
+  if (data.ownerId !== ownerId) throw new EnrollmentValidationError('Job belongs to another owner');
+  if (data.formatVersion !== ENROLLMENT_FORMAT_VERSION) {
+    throw new EnrollmentValidationError('This legacy enrollment job cannot be safely resumed by the current identity format');
   }
-
-  // Resolve deck references outside the batch.  Every enrolled card must
-  // belong to a deck — fall back to Uncategorized when input omits both.
-  const deckCache = new Map<string, { deckId: string; deck: string } | null>();
-  const defaultDeck = await resolveDefaultDeck(ownerId);
-  for (const card of chunkCards) {
-    const deckKey = `${card.deckId ?? ''}|${card.deck ?? ''}`;
-    if (!deckCache.has(deckKey)) {
-      if (card.deckId !== undefined || card.deck !== undefined) {
-        deckCache.set(deckKey, await resolveDeckRef(card, ownerId) ?? defaultDeck);
-      } else {
-        deckCache.set(deckKey, defaultDeck);
-      }
-    }
+  if (data.contentHash !== jobId || data.canonicalCardSetHash !== canonicalSetHash
+    || data.totalCards !== cards.length || data.totalChunks !== chunks.length) {
+    throw new EnrollmentValidationError('Stored enrollment job does not match this exact submission');
   }
-
-  // Reconcile against existing cards (handles legacy random-ID cards).
-  const matchedKeys = new Set<string>();
-  const reconciled = await reconcileLegacyCards(chunkCards, ownerId, deckCache, matchedKeys);
-
-  // Read existing cards by deterministic key (fast path).
-  const cardKeys = chunkCards.map((c) =>
-    computeCardKey(ownerId, c.front, c.back, c.tags || [], c.deckId, c.topic, c.suspended),
-  );
-  const docRefs = cardKeys.map((k) => getDb().collection(FLASHCARDS_COLLECTION).doc(k));
-  const existingSnaps = await Promise.all(docRefs.map((r) => r.get()));
-
-  const now = Timestamp.now();
-  const scheduling = initialScheduling(now);
-  const batch = getDb().batch();
-  let created = 0;
-  let skipped = 0;
-  let failed = 0;
-  const errors: string[] = [];
-
-  for (let idx = 0; idx < chunkCards.length; idx++) {
-    const card = chunkCards[idx];
-    try {
-      const existingSnap = existingSnaps[idx];
-
-      // Fast path: deterministic key hit, same owner → skip.
-      if (existingSnap.exists && existingSnap.data()?.ownerId === ownerId) {
-        skipped++;
-        continue;
-      }
-
-      // Deterministic key hit, different owner → fail.
-      if (existingSnap.exists && existingSnap.data()?.ownerId !== ownerId) {
-        failed++;
-        errors.push(`Card "${card.front.slice(0, 40)}…": belongs to another owner`);
-        continue;
-      }
-
-      // Legacy reconciliation found a match → skip.
-      const reconciledId = reconciled.get(idx);
-      if (reconciledId) {
-        skipped++;
-        continue;
-      }
-
-      // New card — create with fresh scheduling.
-      const docRef = docRefs[idx];
-      const payload: Record<string, unknown> = {
-        ownerId,
-        front: card.front.trim(),
-        back: card.back.trim(),
-        tags: (card.tags || []).map((t: string) => t.trim()).sort(),
-        createdAt: now,
-        updatedAt: now,
-        ...scheduling,
-        reviewLog: [],
-        images: [],
-      };
-      if (card.topic !== undefined && card.topic !== null) {
-        payload.topic = card.topic;
-      }
-      const deckKey = `${card.deckId ?? ''}|${card.deck ?? ''}`;
-      applyDeckRef(payload, deckCache.get(deckKey) ?? null);
-
-      batch.set(docRef, payload);
-      created++;
-    } catch (err) {
-      failed++;
-      errors.push(`Card "${card.front.slice(0, 40)}…": ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  if (created > 0) {
-    await batch.commit();
-  }
-
-  return { created, skipped, failed, errors };
 }
 
-/* ------------------------------------------------------------------ */
-/* Firestore trigger — processes chunks on write                       */
-/* ------------------------------------------------------------------ */
+async function ensureJobDocument(
+  jobId: string,
+  ownerId: string,
+  cards: CanonicalCard[],
+  chunks: EnrollmentChunk[],
+  canonicalSetHash: string,
+): Promise<BulkEnrollmentJob> {
+  const jobRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
+  const now = Timestamp.now();
+  await getDb().runTransaction(async (t) => {
+    const snap = await t.get(jobRef);
+    if (snap.exists) {
+      validateExistingJob(snap.data()!, ownerId, jobId, cards, chunks, canonicalSetHash);
+      return;
+    }
+    t.create(jobRef, {
+      formatVersion: ENROLLMENT_FORMAT_VERSION,
+      ownerId,
+      status: 'processing',
+      contentHash: jobId,
+      canonicalCardSetHash: canonicalSetHash,
+      totalCards: cards.length,
+      totalChunks: chunks.length,
+      completedChunks: 0,
+      createdCount: 0,
+      skippedCount: 0,
+      failedCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }, { maxAttempts: 10 });
+  const snap = await jobRef.get();
+  const data = snap.data();
+  if (!data) throw new Error(`Enrollment job ${jobId} was not created`);
+  validateExistingJob(data, ownerId, jobId, cards, chunks, canonicalSetHash);
+  return { id: jobId, ...data } as BulkEnrollmentJob;
+}
 
-/**
- * Firestore onDocumentWritten trigger on
- * `bulkEnrollmentJobs/{jobId}/chunks/{chunkIndex}`.
- *
- * Fires on BOTH creation (initial chunk write) AND updates (resume
- * re-writing pending chunks). The handler reads the CURRENT chunk state
- * inside a single transaction: if the chunk is already completed, it
- * no-ops. Otherwise it processes cards, marks the chunk completed, and
- * increments job counters — all atomically within one transaction.
- *
- * This solves three problems:
- *  1. Duplicate events: a retry carries the ORIGINAL pending snapshot,
- *     but the transaction reads the CURRENT state. If the first
- *     invocation already completed the chunk, the transaction sees
- *     status='completed' and returns without duplicate increments.
- *  2. Resume not triggering: onDocumentWritten fires on .set() updates,
- *     so resume re-writing chunks as 'pending' triggers re-processing.
- *  3. Atomicity: chunk completion + job counters are one transaction.
- *     No standalone chunk update that could be lost between writes.
- *
- * Idempotency guarantees:
- *  - Card writes use deterministic doc ids (cardKey) — re-processing
- *    overwrites the same documents, never duplicates.
- *  - The transaction reads current chunk status: already-completed
- *    chunks are no-ops (zero duplicate increments).
- *  - Failures are recorded on the chunk (lastError) and parent job
- *    (status → failed, error). getEnrollmentStatus surfaces them.
- *    Exact re-submission retriggers non-completed chunks.
- */
-/**
- * Shape of the Firestore onDocumentWritten event.
- * `data.after` is the post-write snapshot; `data.before` is the pre-write
- * snapshot (absent on creation). Both have `.data()` and `.ref` with the
- * document path.
- */
+function chunkWriteGroups(chunks: EnrollmentChunk[], ownerId: string): EnrollmentChunk[][] {
+  const groups: EnrollmentChunk[][] = [];
+  let group: EnrollmentChunk[] = [];
+  let bytes = 0;
+  for (const chunk of chunks) {
+    const size = serializedBytes(makeChunkDocument(chunk, ownerId));
+    if (group.length > 0 && (group.length >= CHUNK_BATCH_WRITE_LIMIT || bytes + size > CHUNK_BATCH_BUDGET_BYTES)) {
+      groups.push(group);
+      group = [];
+      bytes = 0;
+    }
+    group.push(chunk);
+    bytes += size;
+  }
+  if (group.length > 0) groups.push(group);
+  return groups;
+}
+
+async function createMissingChunks(
+  jobId: string,
+  ownerId: string,
+  chunks: EnrollmentChunk[],
+): Promise<Set<number>> {
+  const created = new Set<number>();
+  for (const group of chunkWriteGroups(chunks, ownerId)) {
+    let missing = group;
+    for (let attempt = 0; missing.length > 0 && attempt < 4; attempt++) {
+      const batch = getDb().batch();
+      for (const chunk of missing) {
+        batch.create(chunkDocumentRef(jobId, chunk.index), makeChunkDocument(chunk, ownerId));
+      }
+      try {
+        await batch.commit();
+        for (const chunk of missing) created.add(chunk.index);
+        missing = [];
+      } catch (err) {
+        const snapshots = await Promise.all(group.map((chunk) => chunkDocumentRef(jobId, chunk.index).get()));
+        const nextMissing: EnrollmentChunk[] = [];
+        snapshots.forEach((snap, index) => {
+          const expected = group[index];
+          if (snap.exists) validateStoredChunk(snap.data()!, expected, ownerId);
+          else nextMissing.push(expected);
+        });
+        if (nextMissing.length === missing.length && attempt === 3) throw err;
+        missing = nextMissing;
+      }
+    }
+    if (missing.length > 0) throw new Error('Unable to persist enrollment chunks');
+  }
+  return created;
+}
+
+async function readJobDocument(jobId: string): Promise<BulkEnrollmentJob | null> {
+  const snap = await getDb().collection(JOBS_COLLECTION).doc(jobId).get();
+  return snap.exists ? { id: snap.id, ...snap.data()! } as BulkEnrollmentJob : null;
+}
+
+
+function canonicalIdentity(card: {
+  ownerId?: unknown; front?: unknown; back?: unknown; tags?: unknown; topic?: unknown;
+  suspended?: unknown; deckId?: unknown;
+}, ownerId: string): unknown {
+  if (typeof card.front !== 'string' || typeof card.back !== 'string'
+    || (card.deckId !== undefined && typeof card.deckId !== 'string')
+    || (card.topic !== undefined && card.topic !== null && typeof card.topic !== 'string')
+    || (card.suspended !== undefined && typeof card.suspended !== 'boolean')
+    || (card.tags !== undefined && (!Array.isArray(card.tags) || card.tags.some((tag) => typeof tag !== 'string')))) return null;
+  const tags = card.tags === undefined ? [] : card.tags as string[];
+  return [
+    'flashcard', ENROLLMENT_FORMAT_VERSION, ownerId, card.front.trim(), card.back.trim(), [...tags].sort(),
+    typeof card.deckId === 'string' ? card.deckId : '',
+    (typeof card.topic === 'string' ? card.topic : '').trim(), card.suspended === true,
+  ];
+}
+
+function contentMatches(existing: Record<string, unknown>, target: CanonicalCard, ownerId: string): boolean {
+  return stableJson(canonicalIdentity(existing, ownerId)) === stableJson(canonicalIdentity(target, ownerId));
+}
+
+interface LegacyCandidate {
+  ref: FirebaseFirestore.DocumentReference;
+  decklessByName: boolean;
+}
+
+async function findLegacyCandidates(cards: CanonicalCard[], ownerId: string): Promise<Map<string, LegacyCandidate>> {
+  const candidates = new Map<string, LegacyCandidate>();
+  const unique = new Map(cards.map((card) => [canonicalCardKey(ownerId, card), card]));
+  const byDeck = new Map<string, Array<[string, CanonicalCard]>>();
+  for (const entry of unique) {
+    const deckCards = byDeck.get(entry[1].deckId) ?? [];
+    deckCards.push(entry);
+    byDeck.set(entry[1].deckId, deckCards);
+  }
+  for (const [deckId, deckCards] of byDeck) {
+    const expected = new Map(deckCards.map(([key, card]) => [stableJson(canonicalIdentity(card, ownerId)), key]));
+    const deckName = deckCards[0][1].deck;
+    const matchingDecks = await getDb().collection(DECKS_COLLECTION)
+      .where('ownerId', '==', ownerId).where('name', '==', deckName).select('ownerId', 'name').limit(2).get();
+    const canResolveDeckless = deckName.length > 0 && matchingDecks.size === 1 && matchingDecks.docs[0].id === deckId;
+    const queries = [getDb().collection(FLASHCARDS_COLLECTION)
+      .where('ownerId', '==', ownerId).where('deckId', '==', deckId)];
+    if (canResolveDeckless) {
+      queries.push(getDb().collection(FLASHCARDS_COLLECTION)
+        .where('ownerId', '==', ownerId).where('deck', '==', deckName));
+    }
+    for (let query of queries) {
+      query = query.orderBy(FieldPath.documentId())
+        .select('ownerId', 'deckId', 'deck', 'front', 'back', 'tags', 'topic', 'suspended').limit(200);
+      let cursor: FirebaseFirestore.QueryDocumentSnapshot | undefined;
+      let hasMore = true;
+      while (hasMore) {
+        const pageQuery = cursor ? query.startAfter(cursor) : query;
+        const page = await pageQuery.get();
+        for (const doc of page.docs) {
+          const data = doc.data();
+          const decklessByName = data.deckId === undefined && data.deck === deckName && canResolveDeckless;
+          if (data.deckId !== deckId && !decklessByName) continue;
+          const identityCard = decklessByName ? { ...data, deckId } : data;
+          const key = expected.get(stableJson(canonicalIdentity(identityCard, ownerId)));
+          if (key && !candidates.has(key)) candidates.set(key, { ref: doc.ref, decklessByName });
+        }
+        hasMore = page.docs.length === 200;
+        if (hasMore) cursor = page.docs[page.docs.length - 1];
+      }
+    }
+  }
+  return candidates;
+}
+
+
+
+function cardError(card: CanonicalCard, message: string): string {
+  return `Card "${card.front.slice(0, 40)}…": ${message}`;
+}
+
+interface ChunkOutcome {
+  created: number;
+  skipped: number;
+  failed: number;
+  errors: string[];
+}
+async function processChunk(
+  chunkId: string,
+  chunkRef: FirebaseFirestore.DocumentReference,
+  jobRef: FirebaseFirestore.DocumentReference,
+  ownerId: string,
+  cards: CanonicalCard[],
+): Promise<void> {
+  const uniqueCards = new Map<string, { card: CanonicalCard; multiplicity: number }>();
+  for (const card of cards) {
+    const key = canonicalCardKey(ownerId, card);
+    const item = uniqueCards.get(key);
+    if (item) item.multiplicity++;
+    else uniqueCards.set(key, { card, multiplicity: 1 });
+  }
+  const items = [...uniqueCards.entries()];
+  const legacyCandidates = await findLegacyCandidates(cards, ownerId);
+  const claimRefs = items.map(([key]) => getDb().collection(ENROLLMENT_KEYS_COLLECTION).doc(key));
+  const newCardRefs = items.map(() => getDb().collection(FLASHCARDS_COLLECTION).doc());
+  const legacyRefs = items.map(([key]) => legacyCandidates.get(key) ?? null);
+  const deckRefsById = new Map<string, FirebaseFirestore.DocumentReference>();
+  for (const [, { card }] of items) {
+    if (!deckRefsById.has(card.deckId)) {
+      deckRefsById.set(card.deckId, getDb().collection(DECKS_COLLECTION).doc(card.deckId));
+    }
+  }
+  const deckEntries = [...deckRefsById.entries()];
+
+  try {
+    await getDb().runTransaction(async (t) => {
+      const chunkSnap = await t.get(chunkRef);
+      const jobSnap = await t.get(jobRef);
+      const currentChunk = chunkSnap.data();
+      const currentJob = jobSnap.data();
+      if (!currentChunk || currentChunk.status === 'completed') return;
+      if (!currentJob || currentJob.status === 'completed') return;
+      if (currentChunk.ownerId !== ownerId || currentJob.ownerId !== ownerId) {
+        throw new EnrollmentValidationError('Enrollment owner does not match stored job/chunk');
+      }
+      if (!Array.isArray(currentChunk.cards) || !sameCardPayload(currentChunk.cards, cards, ownerId)) {
+        throw new EnrollmentValidationError('Enrollment chunk payload changed during processing');
+      }
+      if (currentChunk.formatVersion === ENROLLMENT_FORMAT_VERSION
+        && (currentChunk.payloadHash !== hashChunkCards(cards, ownerId) || currentChunk.cardCount !== cards.length)) {
+        throw new EnrollmentValidationError('Stored enrollment chunk failed its canonical payload check');
+      }
+
+      const claimSnaps = await Promise.all(claimRefs.map((ref) => t.get(ref)));
+      const targetRefs = new Map<string, FirebaseFirestore.DocumentReference>();
+      for (let index = 0; index < items.length; index++) {
+        const claim = claimSnaps[index].data();
+        if (claim?.ownerId === ownerId && claim.identity === items[index][0] && typeof claim.cardId === 'string') {
+          const ref = getDb().collection(FLASHCARDS_COLLECTION).doc(claim.cardId);
+          targetRefs.set(ref.path, ref);
+        }
+        const legacyCandidate = legacyRefs[index];
+        if (legacyCandidate) targetRefs.set(legacyCandidate.ref.path, legacyCandidate.ref);
+      }
+      const refs = [...targetRefs.values()];
+      const [targetSnaps, deckSnaps] = await Promise.all([
+        Promise.all(refs.map((ref) => t.get(ref))),
+        Promise.all(deckEntries.map(([, ref]) => t.get(ref))),
+      ]);
+      const targetByPath = new Map(refs.map((ref, index) => [ref.path, targetSnaps[index].data()]));
+      const deckById = new Map(deckEntries.map(([id], index) => [id, deckSnaps[index].data()]));
+      const outcome: ChunkOutcome = { created: 0, skipped: 0, failed: 0, errors: [] };
+
+      const now = Timestamp.now();
+      for (let index = 0; index < items.length; index++) {
+        const [key, { card, multiplicity }] = items[index];
+        const claimRef = claimRefs[index];
+        const claimSnap = claimSnaps[index];
+        const claim = claimSnap.data();
+        const deck = deckById.get(card.deckId);
+        if (!deck || deck.ownerId !== ownerId || typeof deck.name !== 'string'
+          || deck.name.length === 0 || deck.name.length > DECK_NAME_MAX_LENGTH) {
+          outcome.failed += multiplicity;
+          outcome.errors.push(cardError(card, 'referenced deck is missing, invalid, or belongs to another owner'));
+          continue;
+        }
+        if (claimSnap.exists && (claim?.ownerId !== ownerId || claim.identity !== key || typeof claim.cardId !== 'string')) {
+          outcome.failed += multiplicity;
+          outcome.errors.push(cardError(card, 'enrollment identity is claimed by invalid or foreign data'));
+          continue;
+        }
+        const targetRef = claimSnap.exists
+          ? getDb().collection(FLASHCARDS_COLLECTION).doc(claim!.cardId as string)
+          : undefined;
+        const target = targetRef ? targetByPath.get(targetRef.path) : undefined;
+        if (target && target.ownerId !== ownerId) {
+          outcome.failed += multiplicity;
+          outcome.errors.push(cardError(card, 'enrollment identity points to a card owned by another user'));
+          continue;
+        }
+        if (target && contentMatches(target, card, ownerId)) {
+          outcome.skipped += multiplicity;
+          continue;
+        }
+        const legacyCandidate = legacyRefs[index];
+        const legacyRef = legacyCandidate?.ref;
+        const legacy = legacyRef ? targetByPath.get(legacyRef.path) : undefined;
+        const legacyMatches = legacy?.ownerId === ownerId && (legacyCandidate?.decklessByName
+          ? stableJson(canonicalIdentity({ ...legacy, deckId: card.deckId }, ownerId))
+            === stableJson(canonicalIdentity(card, ownerId))
+          : contentMatches(legacy, card, ownerId));
+        if (legacyMatches && legacyRef) {
+          const nextClaim = { ownerId, identity: key, cardId: legacyRef.id };
+          if (claimSnap.exists) t.update(claimRef, nextClaim);
+          else t.create(claimRef, nextClaim);
+          outcome.skipped += multiplicity;
+          continue;
+        }
+
+        const payload: Record<string, unknown> = {
+          ownerId,
+          front: card.front,
+          back: card.back,
+          tags: card.tags,
+          deckId: card.deckId,
+          deck: deck.name,
+          topic: card.topic,
+          suspended: card.suspended,
+          enrollmentIdentity: key,
+          createdAt: now,
+          updatedAt: now,
+          ...initialScheduling(now),
+          reviewLog: [],
+          images: [],
+        };
+        for (const field of Object.keys(payload)) {
+          if (payload[field] === undefined) delete payload[field];
+        }
+        t.create(newCardRefs[index], payload);
+        const nextClaim = { ownerId, identity: key, cardId: newCardRefs[index].id };
+        if (claimSnap.exists) t.update(claimRef, nextClaim);
+        else t.create(claimRef, nextClaim);
+        outcome.created++;
+        if (multiplicity > 1) outcome.skipped += multiplicity - 1;
+      }
+
+      const completedChunks = Number(currentJob.completedChunks ?? 0) + 1;
+      const createdCount = Number(currentJob.createdCount ?? 0) + outcome.created;
+      const skippedCount = Number(currentJob.skippedCount ?? 0) + outcome.skipped;
+      const failedCount = Number(currentJob.failedCount ?? 0) + outcome.failed;
+      const terminal = completedChunks >= Number(currentJob.totalChunks ?? 0);
+      const finalStatus = terminal
+        ? (failedCount > 0 ? 'failed' : 'completed')
+        : (currentJob.status === 'failed' ? 'failed' : 'processing');
+      t.update(chunkRef, {
+        status: 'completed', createdCount: outcome.created, skippedCount: outcome.skipped,
+        failedCount: outcome.failed,
+        error: outcome.errors.length > 0 ? outcome.errors[outcome.errors.length - 1] : null,
+        lastError: FieldValue.delete(), processedAt: now,
+      });
+      t.update(jobRef, {
+        completedChunks, createdCount, skippedCount, failedCount, status: finalStatus,
+        ...(terminal ? { completedAt: now } : { completedAt: FieldValue.delete() }),
+        ...(terminal && failedCount > 0
+          ? { error: `${failedCount} card(s) failed during enrollment` }
+          : (finalStatus === 'processing' ? { error: FieldValue.delete() } : {})),
+        updatedAt: now,
+      });
+    }, { maxAttempts: 20 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await getDb().runTransaction(async (t) => {
+      const chunkSnap = await t.get(chunkRef);
+      const jobSnap = await t.get(jobRef);
+      const chunk = chunkSnap.data();
+      const job = jobSnap.data();
+      if (!chunk || chunk.status === 'completed' || !job || job.status === 'completed') return;
+      const now = Timestamp.now();
+      t.update(chunkRef, { lastError: message, lastErrorAt: now });
+      t.update(jobRef, { status: 'failed', error: `Chunk ${chunkId}: ${message}`, updatedAt: now });
+    }, { maxAttempts: 10 });
+    throw err;
+  }
+}
+
 export interface ChunkWrittenEvent {
   data?: {
     after?: {
       data?: () => Record<string, unknown>;
       ref?: {
         id?: string;
-        parent?: {
-          id?: string;
-          parent?: {
-            id?: string;
-          };
-        };
+        parent?: { id?: string; parent?: { id?: string } };
       };
     };
-    before?: {
-      data?: () => Record<string, unknown>;
-    };
+    before?: { data?: () => Record<string, unknown> };
   };
 }
 
-export async function onEnrollmentChunkWritten(
-  event: ChunkWrittenEvent,
-): Promise<void> {
+export async function onEnrollmentChunkWritten(event: ChunkWrittenEvent): Promise<void> {
   const after = event.data?.after;
-  if (!after?.data) return;
-
-  const chunkRef = after.ref;
+  const chunkRef = after?.ref;
   const jobId = chunkRef?.parent?.parent?.id;
   const chunkId = chunkRef?.id;
-  if (!jobId || !chunkId) return;
+  if (!after?.data || !jobId || !chunkId) return;
 
-  // Read CURRENT chunk state (not the event snapshot, which may be stale
-  // from a duplicate/retry event that carries the original pending data).
-  const chunkDocRef = getDb()
-    .collection(JOBS_COLLECTION)
-    .doc(jobId)
-    .collection(CHUNKS_SUBCOLLECTION)
-    .doc(chunkId);
-  const chunkSnap = await chunkDocRef.get();
-  const chunkData = chunkSnap.data();
-  if (!chunkData || chunkData.status === 'completed') return;
+  const actualChunkRef = chunkDocumentRef(jobId, Number.parseInt(chunkId, 10));
+  const jobRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
+  const snapshot = await actualChunkRef.get();
+  const data = snapshot.data();
+  if (!data || data.status === 'completed') return;
 
-  const ownerId = chunkData.ownerId as string | undefined;
-  const cards = chunkData.cards as CreateFlashcardInput[] | undefined;
-  if (!ownerId || !cards || cards.length === 0) return;
+  const ownerId = data.ownerId as string | undefined;
+  const inputCards = data.cards as CreateFlashcardInput[] | undefined;
+  if (!ownerId || !Array.isArray(inputCards) || inputCards.length === 0) return;
 
-  // Process cards OUTSIDE any transaction. processChunk is idempotent:
-  // deterministic card doc ids mean re-processing overwrites the same
-  // documents. Card writes are harmless duplicates on re-submission.
-  let result: { created: number; skipped: number; failed: number; errors: string[] };
   try {
-    result = await processChunk(cards, ownerId);
+    const cards = await canonicalizeCards(inputCards, ownerId, true);
+    await processChunk(chunkId, actualChunkRef, jobRef, ownerId, cards);
   } catch (err) {
-    // Best-effort: record error on chunk AND mark parent job failed so
-    // getEnrollmentStatus surfaces the failure. Chunk stays
-    // non-completed → exact re-submission retriggers it.
-    const errMsg = err instanceof Error ? err.message : String(err);
-    const now = Timestamp.now();
-    await chunkDocRef.update({ lastError: errMsg, lastErrorAt: now }).catch(() => {});
-    const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
-    await jobDocRef.update({
-      status: 'failed',
-      error: `Chunk ${chunkId}: ${errMsg}`,
-      updatedAt: now,
-    }).catch(() => {});
-    throw err;
-  }
-
-  // Metadata-only transaction: read current chunk + job state, no-op if
-  // chunk already completed (handles concurrent/repeated triggers),
-  // otherwise mark chunk completed and atomically increment job counters.
-  // No external writes inside this transaction — only t.update on
-  // documents we just read.
-  const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
-
-  try {
+    const message = err instanceof Error ? err.message : String(err);
     await getDb().runTransaction(async (t) => {
-      // ALL reads must come before ANY writes (Firestore tx constraint).
-      const txChunkSnap = await t.get(chunkDocRef);
-      const jobSnap = await t.get(jobDocRef);
-
-      const txChunkData = txChunkSnap.data();
-      if (!txChunkData || txChunkData.status === 'completed') return;
-
-      const jobData = jobSnap.data();
-      if (!jobData) return;
-
-      // Compute terminal state from read values before any writes.
-      const totalChunks = jobData.totalChunks ?? 0;
-      const newCompletedChunks = (jobData.completedChunks ?? 0) + 1;
-      const isLastChunk = newCompletedChunks >= totalChunks;
-
-      // Now issue all writes.
-      t.update(chunkDocRef, {
-        status: 'completed',
-        createdCount: result.created,
-        failedCount: result.failed,
-        skippedCount: result.skipped,
-        error: result.errors.length > 0 ? result.errors[result.errors.length - 1] : null,
-        processedAt: Timestamp.now(),
+      const chunkSnap = await t.get(actualChunkRef);
+      const jobSnap = await t.get(jobRef);
+      const chunk = chunkSnap.data();
+      const job = jobSnap.data();
+      if (!chunk || chunk.status === 'completed' || !job || job.status === 'completed') return;
+      const now = Timestamp.now();
+      t.update(actualChunkRef, { lastError: message, lastErrorAt: now });
+      t.update(jobRef, {
+        status: 'failed', error: `Chunk ${chunkId}: ${message}`, updatedAt: now,
       });
-
-      t.update(jobDocRef, {
-        completedChunks: FieldValue.increment(1),
-        createdCount: FieldValue.increment(result.created),
-        skippedCount: FieldValue.increment(result.skipped),
-        failedCount: FieldValue.increment(result.failed),
-        ...(result.errors.length > 0 ? { lastChunkError: result.errors[result.errors.length - 1] } : {}),
-        ...(isLastChunk ? {
-          status: result.failed > 0 ? 'failed' : 'completed',
-          completedAt: Timestamp.now(),
-        } : {}),
-        updatedAt: Timestamp.now(),
-      });
-    });
-  } catch (txErr) {
-    // Transaction failed (contention, deadline, etc.). Best-effort: mark
-    // parent job failed for observability. Chunk stays non-completed →
-    // exact re-submission rewrites it as pending and retriggers it.
-    const errMsg = txErr instanceof Error ? txErr.message : String(txErr);
-    const now = Timestamp.now();
-    await chunkDocRef.update({ lastError: errMsg, lastErrorAt: now }).catch(() => {});
-    const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
-    await jobDocRef.update({
-      status: 'failed',
-      error: `Chunk ${chunkId}: ${errMsg}`,
-      updatedAt: now,
-    }).catch(() => {});
-    throw txErr;
+    }, { maxAttempts: 10 });
+    throw err;
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Public API                                                          */
-/* ------------------------------------------------------------------ */
+function responseFromJob(job: BulkEnrollmentJob, retriedChunkCount: number): BulkEnrollCardsResponse {
+  return {
+    jobId: job.id,
+    status: job.status,
+    totalCards: job.totalCards,
+    totalChunks: job.totalChunks,
+    completedChunks: job.completedChunks,
+    createdCount: job.createdCount,
+    skippedCount: job.skippedCount ?? 0,
+    failedCount: job.failedCount,
+    retriedChunkCount,
+  };
+}
 
-/**
- * Start or resume a bulk enrollment. Returns IMMEDIATELY with the jobId
- * and initial status. Chunk processing is triggered by Firestore's
- * onDocumentWritten trigger on the chunk subcollection — durable and
- * independent of HTTP connection lifetime. On failure the chunk and
- * parent job are marked failed; exact re-submission retriggers
- * non-completed chunks.
- *
- * Flow:
- *  1. Validate input (1..ENROLLMENT_MAX_CARDS cards).
- *  2. Compute content-addressable job ID from card keys.
- *  3. If job exists → check status. If completed, return immediately.
- *     If incomplete, mark processing.
- *  4. If new → write chunk documents (each triggers the Firestore
- *     onDocumentWritten handler), create job doc.
- *  5. Return jobId + status IMMEDIATELY (no waiting for card writes).
- *
- * Each chunk's Firestore trigger fires on document creation and
- * processes the chunk atomically. Progress is updated after each chunk.
- * On failure, the chunk and parent job are marked failed with an error.
- * The chunk status check short-circuits re-processing of completed chunks.
- * Exact re-submission retriggers non-completed chunks.
- */
 export async function bulkEnrollCards(
   input: BulkEnrollCardsInput,
   ownerId: string,
@@ -770,152 +717,71 @@ export async function bulkEnrollCards(
     throw new EnrollmentValidationError('Cards array must not be empty');
   }
   if (input.cards.length > ENROLLMENT_MAX_CARDS) {
-    throw new EnrollmentValidationError(
-      `Too many cards: ${input.cards.length} (max ${ENROLLMENT_MAX_CARDS})`,
-    );
+    throw new EnrollmentValidationError(`Too many cards: ${input.cards.length} (max ${ENROLLMENT_MAX_CARDS})`);
   }
 
-  const jobId = computeJobId(ownerId, input.cards);
-  const existingJob = await readJobDocument(jobId);
+  const cards = await canonicalizeCards(input.cards, ownerId);
+  const chunks = partitionCards(cards, ownerId);
+  const jobId = computeJobId(ownerId, cards);
+  const canonicalSetHash = computeCanonicalSetHash(ownerId, cards);
+  let job = await ensureJobDocument(jobId, ownerId, cards, chunks, canonicalSetHash);
+  if (job.status === 'completed' || (job.status === 'failed' && job.completedChunks >= job.totalChunks)) {
+    return responseFromJob(job, 0);
+  }
 
-  let totalChunks: number;
-  let totalCards: number;
-  let startChunk: number;
-  let createdCount: number;
-  let failedCount: number;
-  let retriedChunkCount = 0;
-
-  if (existingJob) {
-    if (existingJob.ownerId !== ownerId) {
-      throw new EnrollmentValidationError('Job belongs to another owner');
+  const chunkCollection = getDb().collection(JOBS_COLLECTION).doc(jobId).collection(CHUNKS_SUBCOLLECTION);
+  const storedChunks = await chunkCollection.get();
+  const storedByIndex = new Map<number, FirebaseFirestore.QueryDocumentSnapshot>();
+  for (const snap of storedChunks.docs) {
+    const index = snap.data().chunkIndex;
+    if (typeof index === 'number') storedByIndex.set(index, snap);
+  }
+  const missing: EnrollmentChunk[] = [];
+  for (const chunk of chunks) {
+    const stored = storedByIndex.get(chunk.index);
+    if (!stored) {
+      missing.push(chunk);
+    } else {
+      validateStoredChunk(stored.data(), chunk, ownerId);
     }
+  }
+  const createdIndices = await createMissingChunks(jobId, ownerId, missing);
+  let retriedChunkCount = createdIndices.size;
+  const retryChunks = chunks.filter((chunk) => {
+    if (createdIndices.has(chunk.index)) return false;
+    const stored = storedByIndex.get(chunk.index);
+    return !!stored && stored.data().status !== 'completed';
+  });
+  const rootRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
 
-    // Already done: return immediately.
-    if (existingJob.status === 'completed') {
-      return {
-        jobId,
-        status: 'completed',
-        totalCards: existingJob.totalCards,
-        totalChunks: existingJob.totalChunks,
-        completedChunks: existingJob.totalChunks,
-        createdCount: existingJob.createdCount,
-        skippedCount: 'skippedCount' in existingJob ? (existingJob.skippedCount as number) : 0,
-        failedCount: existingJob.failedCount,
-        retriedChunkCount: 0,
-      };
-    }
-
-    // Resume from last completed chunk.
-    totalChunks = existingJob.totalChunks;
-    totalCards = existingJob.totalCards;
-    startChunk = existingJob.completedChunks;
-    createdCount = existingJob.createdCount;
-    failedCount = existingJob.failedCount;
-
-    if (totalCards !== input.cards.length) {
-      throw new EnrollmentValidationError(
-        `Job ${jobId} exists with ${totalCards} cards but ${input.cards.length} were provided`,
-      );
-    }
-
-    // Set status to 'processing' — allows transition from any non-completed
-    // state including 'failed' (self-healing). Only 'completed' is terminal.
-    const jobDocRef = getDb().collection(JOBS_COLLECTION).doc(jobId);
-    await getDb().runTransaction(async (t) => {
-      const snap = await t.get(jobDocRef);
-      const data = snap.data();
-      if (!data || data.status === 'completed') return;
-      t.update(jobDocRef, { status: 'processing', updatedAt: Timestamp.now() });
-    });
-
-    // Re-read to get the authoritative status after the transaction.
-    const postTxJob = await readJobDocument(jobId);
-    if (postTxJob?.status === 'completed') {
-      return {
-        jobId,
-        status: 'completed',
-        totalCards: postTxJob.totalCards,
-        totalChunks: postTxJob.totalChunks,
-        completedChunks: postTxJob.totalChunks,
-        createdCount: postTxJob.createdCount,
-        skippedCount: 'skippedCount' in postTxJob ? (postTxJob.skippedCount as number) : 0,
-        failedCount: postTxJob.failedCount,
-        retriedChunkCount: 0,
-      };
-    }
-
-    // Scan ALL chunks to find any that are not completed (pending,
-    // processing, missing, or failed). Rewriting them as 'pending'
-    // triggers the onDocumentWritten handler for reprocessing.
-    // This self-heals: missing chunks (partial batch write), stuck
-    // chunks (trigger/tx failed after card writes), and previously
-    // failed jobs where individual chunks weren't completed.
-    const chunkStatuses = await scanChunkStatuses(jobId, totalChunks);
-    const resumeBatch = getDb().batch();
-    retriedChunkCount = 0;
-    const chunksSubcoll = getDb()
-      .collection(JOBS_COLLECTION)
-      .doc(jobId)
-      .collection(CHUNKS_SUBCOLLECTION);
-    for (const cs of chunkStatuses) {
-      if (cs.status === 'completed') continue;
-      // Chunk is pending, processing, missing, or in an unknown state.
-      // For existing chunk docs, read durable card payloads; for missing
-      // chunks (partial initial batch write), reconstruct from input.cards.
-      let chunkCards = await readChunkCards(jobId, cs.index);
-      if (chunkCards.length === 0) {
-        // Missing chunk — reconstruct from the original input.
-        const start = cs.index * ENROLLMENT_CHUNK_SIZE;
-        chunkCards = input.cards.slice(start, start + ENROLLMENT_CHUNK_SIZE);
-      }
-      if (chunkCards.length === 0) continue;
-      const paddedIndex = String(cs.index).padStart(5, '0');
-      resumeBatch.set(chunksSubcoll.doc(paddedIndex), {
-        chunkIndex: cs.index,
-        cards: chunkCards,
-        cardCount: chunkCards.length,
-        status: 'pending',
-        ownerId,
-        createdCount: 0,
-        failedCount: 0,
+  await Promise.all(retryChunks.map(async (chunk) => {
+    const ref = chunkDocumentRef(jobId, chunk.index);
+    const changed = await getDb().runTransaction(async (t) => {
+      const rootSnap = await t.get(rootRef);
+      const chunkSnap = await t.get(ref);
+      const root = rootSnap.data();
+      const data = chunkSnap.data();
+      if (!root || root.status === 'completed' || !data || data.status === 'completed') return false;
+      validateStoredChunk(data, chunk, ownerId);
+      t.update(ref, {
+        status: 'pending', lastError: FieldValue.delete(), lastErrorAt: FieldValue.delete(),
       });
-      retriedChunkCount++;
-    }
-    await resumeBatch.commit();
-  } else {
-    // New job: create job doc FIRST so triggers that fire on chunk
-    // creation always find a parent job document.
-    totalCards = input.cards.length;
-    totalChunks = Math.ceil(totalCards / ENROLLMENT_CHUNK_SIZE);
-    startChunk = 0;
-    createdCount = 0;
-    failedCount = 0;
-    retriedChunkCount = 0;
+      if (root.status !== 'processing') {
+        t.update(rootRef, {
+          status: 'processing', error: FieldValue.delete(), completedAt: FieldValue.delete(), updatedAt: Timestamp.now(),
+        });
+      }
+      return true;
+    }, { maxAttempts: 10 });
+    if (changed) retriedChunkCount++;
+  }));
 
-    await createJobDocument(jobId, ownerId, totalChunks, totalCards);
-    await updateJobProgress(jobId, { status: 'processing' });
-
-    // Now write chunks — each triggers onDocumentWritten.
-    await writeChunks(jobId, input.cards, ownerId);
-  }
-
-  return {
-    jobId,
-    status: 'processing',
-    totalCards,
-    totalChunks,
-    completedChunks: startChunk,
-    createdCount,
-    skippedCount: 0,
-    failedCount,
-    retriedChunkCount,
-  };
+  const fresh = await readJobDocument(jobId);
+  if (!fresh) throw new Error(`Enrollment job ${jobId} disappeared`);
+  job = fresh;
+  return responseFromJob(job, retriedChunkCount);
 }
 
-/**
- * Get the current status of an enrollment job. Returns a normalized
- * response for the client, or null when the job doesn't exist.
- */
 export async function getEnrollmentStatus(
   jobId: string,
   ownerId: string,
@@ -923,19 +789,17 @@ export async function getEnrollmentStatus(
   const job = await readJobDocument(jobId);
   if (!job || job.ownerId !== ownerId) return null;
 
-  // Surface per-chunk errors when the job is not terminal.
   const chunkErrors: Array<{ chunkIndex: number; error: string }> = [];
   if (job.status !== 'completed') {
-    for (let i = 0; i < (job.totalChunks ?? 0); i++) {
-      const paddedIndex = String(i).padStart(5, '0');
-      const snap = await getDb()
-        .collection(JOBS_COLLECTION).doc(jobId)
-        .collection(CHUNKS_SUBCOLLECTION).doc(paddedIndex).get();
+    const chunks = await getDb().collection(JOBS_COLLECTION).doc(jobId)
+      .collection(CHUNKS_SUBCOLLECTION).get();
+    for (const snap of chunks.docs) {
       const data = snap.data();
-      if (data?.lastError) {
-        chunkErrors.push({ chunkIndex: i, error: data.lastError as string });
+      if (data.lastError) {
+        chunkErrors.push({ chunkIndex: data.chunkIndex as number, error: data.lastError as string });
       }
     }
+    chunkErrors.sort((a, b) => a.chunkIndex - b.chunkIndex);
   }
 
   return {
@@ -945,7 +809,7 @@ export async function getEnrollmentStatus(
     totalChunks: job.totalChunks,
     completedChunks: job.completedChunks,
     createdCount: job.createdCount,
-    skippedCount: 'skippedCount' in job ? (job.skippedCount as number) : 0,
+    skippedCount: job.skippedCount ?? 0,
     failedCount: job.failedCount,
     createdAt: job.createdAt.toDate().toISOString(),
     updatedAt: job.updatedAt.toDate().toISOString(),

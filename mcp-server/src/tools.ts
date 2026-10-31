@@ -10,7 +10,7 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { FirebaseBridge, FirebaseBridgeError, type Flashcard, type Deck, type CardImage, type ReviewSession, type ReviewSessionWithCard, type SearchCardsQuery, type CountFlashcardsQuery, type CountFlashcardsResponse, type FlashcardCounts, type TagSummary, type ListTagsResponse, type TagActionResult, type ReviewHistoryResponse, type StudyStatsResponse, type TopLapsedResponse, type MigrateReviewEventsResponse } from './bridge.js';
+import { FirebaseBridge, FirebaseBridgeError, ANKI_IMPORT_PACKAGE_MAX, MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_FILE_NAME_LENGTH, type Flashcard, type Deck, type CardImage, type ReviewSession, type ReviewSessionWithCard, type SearchCardsQuery, type CountFlashcardsQuery, type CountFlashcardsResponse, type FlashcardCounts, type TagSummary, type ListTagsResponse, type TagActionResult, type ReviewHistoryResponse, type StudyStatsResponse, type TopLapsedResponse, type MigrateReviewEventsResponse } from './bridge.js';
 import { REVIEW_WIDGET_URI } from './widget.js';
 import { loadConfig } from './config.js';
 
@@ -51,14 +51,14 @@ export function formatTimestamp(value: unknown): string {
 export interface CardImageSummary {
   /** Stable image id (server-assigned). */
   id: string;
-  /** The image URL (external for URL attachments, download URL for cloud images). */
+  /** Exact external URL reference, or current short-lived owned Storage URL. */
   url: string;
   alt?: string;
   mimeType?: string;
   addedAt: string;
   /** Firebase Storage object path (cloud images only). */
   storagePath?: string;
-  /** Signed download URL (cloud images only). */
+  /** Short-lived signed cloud URL, refreshed on owner-scoped reads. */
   downloadUrl?: string;
   /** Decoded byte size (cloud images only). */
   sizeBytes?: number;
@@ -135,6 +135,7 @@ export function cardSummary(card: Flashcard): CardSummary {
     difficulty: card.difficulty ?? 0,
     reps: card.reps ?? 0,
     lapses: card.lapses ?? 0,
+    ...(card.learningSteps !== undefined ? { learningSteps: card.learningSteps } : {}),
     ...(card.lastReview !== undefined ? { lastReview: formatTimestamp(card.lastReview) } : {}),
     reviewLog: (card.reviewLog ?? []).map((entry) => ({
       rating: entry.rating,
@@ -145,6 +146,7 @@ export function cardSummary(card: Flashcard): CardSummary {
       difficulty: entry.difficulty,
       reps: entry.reps,
       lapses: entry.lapses,
+      ...(entry.learningStepsAfter !== undefined ? { learningStepsAfter: entry.learningStepsAfter } : {}),
     })),
     images: (card.images ?? []).map((img) => cardImageSummary(img)),
   };
@@ -208,8 +210,8 @@ export interface SessionRatingCountsSummary {
 
 export interface ReviewSessionSummary {
   id: string;
-  /** The API key name that started the session (backend-enforced ownership). */
-  apiKeyName: string;
+  /** Authenticated backend owner id; absent only for quarantined ownerless legacy data. */
+  ownerId?: string;
   /** Lifecycle status: active | completed | ended | failed. */
   status: 'active' | 'completed' | 'ended' | 'failed';
   /** Session mode; currently always 'spaced_repetition'. */
@@ -336,14 +338,15 @@ export function sessionSummary(session: ReviewSession): ReviewSessionSummary {
     || (!Array.isArray(session.cardIds) && session.limit != null && session.chunkCount != null);
   let sourceOut: ReviewSessionSummary['source'];
   if (session.source !== undefined) {
-    sourceOut = { ...session.source };
+    const { type, ...sourceFields } = session.source;
+    sourceOut = { type, ...sourceFields };
     if (isV2Summary && Array.isArray(sourceOut.cardIds)) {
       delete sourceOut.cardIds;
     }
   }
   return {
     id: session.id,
-    apiKeyName: session.apiKeyName,
+    ...(session.ownerId !== undefined ? { ownerId: session.ownerId } : {}),
     status: session.status,
     mode: session.mode,
     modeTag,
@@ -388,7 +391,7 @@ export function sessionSummary(session: ReviewSession): ReviewSessionSummary {
       hard: session.ratingCounts.hard,
       good: session.ratingCounts.good,
       easy: session.ratingCounts.easy,
-      ratingCounts: session.ratingCounts.ratingCounts,
+      ratingCounts: session.ratingCounts.ratingCounts as Record<number, number>,
     },
     startedAt: formatTimestamp(session.startedAt),
     ...(session.lastReviewedAt !== undefined ? { lastReviewedAt: formatTimestamp(session.lastReviewedAt) } : {}),
@@ -443,6 +446,7 @@ const flashcardShape = {
   difficulty: z.number(),
   reps: z.number(),
   lapses: z.number(),
+  learningSteps: z.number().optional(),
   lastReview: z.string().optional(),
   reviewLog: z.array(z.object({
     rating: z.number(),
@@ -453,6 +457,7 @@ const flashcardShape = {
     difficulty: z.number(),
     reps: z.number(),
     lapses: z.number(),
+    learningStepsAfter: z.number().optional(),
   })),
   images: z.array(z.object({
     id: z.string(),
@@ -533,7 +538,7 @@ const cardImageOutputShape = {
 /** Review session output shape (timestamps normalized to ISO 8601 by sessionSummary). */
 const sessionShape = {
   id: z.string(),
-  apiKeyName: z.string(),
+  ownerId: z.string().optional(),
   status: z.union([z.literal('active'), z.literal('completed'), z.literal('ended'), z.literal('failed')]),
   mode: z.literal('spaced_repetition'),
   modeTag: z.string(),
@@ -585,7 +590,7 @@ const sessionShape = {
     hard: z.number(),
     good: z.number(),
     easy: z.number(),
-    ratingCounts: z.record(z.number()),
+    ratingCounts: z.record(z.string(), z.number()),
   }),
   startedAt: z.string(),
   lastReviewedAt: z.string().optional(),
@@ -603,6 +608,7 @@ const sessionShape = {
 const sessionWithCardMinimalShape = {
   session: z.object({
     id: z.string(),
+    ownerId: z.string().optional(),
     status: z.union([z.literal('active'), z.literal('completed'), z.literal('ended'), z.literal('failed')]),
     mode: z.literal('spaced_repetition'),
     storageVersion: z.number().optional(),
@@ -620,7 +626,7 @@ const sessionWithCardMinimalShape = {
 /**
  * Apps SDK UI linkage metadata attached ONLY to the start_review_session tool
  * registration `_meta` (the supported extension point in this SDK version):
- * tells widget-capable hosts to MOUNT the review widget (`ui://review-session-v5`)
+ * tells widget-capable hosts to MOUNT the review widget (`ui://review-session-v6`)
  * with the tool's structuredContent as input. get_review_session and
  * submit_review are intentionally data-only (no linkage) so the widget is
  * mounted exactly once; they still deliver the hidden `_meta['ui/widgetState']`
@@ -628,7 +634,7 @@ const sessionWithCardMinimalShape = {
  */
 const REVIEW_WIDGET_TOOL_META = {
   // Current Apps SDK (MCP Apps) linkage: the tool's output renders the
-  // ui://review-session-v5 resource.
+  // ui://review-session-v6 resource.
   ui: { resourceUri: REVIEW_WIDGET_URI },
   // MCP Apps SDK 1.x compatibility alias.
   'ui/resourceUri': REVIEW_WIDGET_URI,
@@ -790,7 +796,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Search flashcards (rich query)',
       description:
-        'Searches flashcards with combined filters (AND across filter families). Filters: search (free text, case-insensitive, matches topic OR front OR back — cards can carry an optional topic label set at create/update); tagsAny / tagsAll / tagsNot (exactly ONE of the three: ANY-of, ALL-of, or NONE-of tag semantics); review (due | notDue | new | reviewed; suspended cards never match review filters — query them with suspended); decks (stable deck ids) and deckNames (legacy deck names) — the two UNION as ANY-of within the deck family, and the family ANDs with everything else; suspended (true = suspended only, false = active only, absent = both); createdFrom/createdTo/updatedFrom/updatedTo (inclusive date bounds; ISO 8601 date-time or YYYY-MM-DD). All filters combine by intersection. Results are ordered createdAt descending, ties by document id ascending (the Firestore native tie-break) and paginated with pageSize (1-100, default 20) and an OPAQUE cursor pageToken: pass back the nextPageToken from the previous response WITH THE EXACT SAME FILTERS to get the next page (a token with different filters is rejected). Read-only.',
+        'Searches flashcards with combined filters (AND across filter families). Filters: search (free text, case-insensitive, matches topic OR front OR back); tagsAny / tagsAll / tagsNot (exactly ONE; ANY-of, ALL-of, or NONE-of); review (due | notDue | new | reviewed; suspended cards never match review filters); decks (stable ids) and deckNames (legacy names) union as ANY-of; suspended; inclusive created/updated date bounds. Array filters accept up to 20 repeated literal values (tags 1-50 chars, deck ids 1-100, deck names 1-300); commas and surrounding whitespace are preserved, never CSV-split or trimmed. Filters intersect across families. Results are ordered createdAt descending, ties by id ascending, and paginated with pageSize (1-100, default 20) and an opaque pageToken that must be reused with the exact same filters. Read-only.',
       inputSchema: {
         search: z.string().max(500).optional(),
         tagsAny: z.array(z.string().min(1).max(50)).max(20).optional(),
@@ -798,7 +804,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
         tagsNot: z.array(z.string().min(1).max(50)).max(20).optional(),
         review: z.enum(['due', 'notDue', 'new', 'reviewed']).optional(),
         decks: z.array(z.string().min(1).max(100)).max(20).optional(),
-        deckNames: z.array(z.string().min(1).max(100)).max(20).optional(),
+        deckNames: z.array(z.string().min(1).max(300)).max(20).optional(),
         suspended: z.boolean().optional(),
         createdFrom: z.string().optional(),
         createdTo: z.string().optional(),
@@ -922,6 +928,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
           difficulty: z.number(),
           reps: z.number(),
           lapses: z.number(),
+          learningStepsAfter: z.number().optional(),
         }),
       }),
       annotations: {
@@ -951,6 +958,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
             difficulty: result.reviewLogItem.difficulty,
             reps: result.reviewLogItem.reps,
             lapses: result.reviewLogItem.lapses,
+            ...(result.reviewLogItem.learningStepsAfter !== undefined ? { learningStepsAfter: result.reviewLogItem.learningStepsAfter } : {}),
           },
         },
       };
@@ -1611,11 +1619,11 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Upload an image to a flashcard (Firebase Storage)',
       description:
-        'Uploads an image for a flashcard as base64 data. The backend decodes the bytes (max 10 MiB), validates the content type (allowed raster types: image/jpeg, image/png, image/gif, image/webp, image/avif, image/bmp — SVG is NOT accepted for upload), writes them to Firebase Storage under a card-scoped path, and persists metadata on the card: id, storagePath, downloadUrl (signed URL), contentType, sizeBytes, alt, addedAt. A card can have at most 5 images. Does not affect FSRS scheduling. Returns the updated card and the uploaded image with its cloud metadata. Use this when the user provides an image file or embedded/base64 image for a card.',
+        'Uploads an image for a flashcard as base64 data. The backend decodes the bytes (max 10 MiB), validates the content type (allowed raster types: image/jpeg, image/png, image/gif, image/webp, image/avif, image/bmp — SVG is NOT accepted for upload), writes them to Firebase Storage under a card-scoped path, and persists metadata on the card: id, storagePath, downloadUrl (short-lived signed URL), contentType, sizeBytes, alt, addedAt. Owned card reads refresh near-expiry URLs; use the latest returned URL. A card can have at most 5 images. Does not affect FSRS scheduling. Returns the updated card and the uploaded image with its cloud metadata. Use this when the user provides an image file or embedded/base64 image for a card.',
       inputSchema: {
         id: z.string().min(1, 'id is required'),
-        data: z.string().min(1, 'Image data is required').max(14000012, 'Image data too large'),
-        fileName: z.string().min(1, 'fileName is required').max(255, 'fileName too long'),
+        data: z.string().min(1, 'Image data is required').max(MAX_IMAGE_DATA_LENGTH, 'Image data too large'),
+        fileName: z.string().min(1, 'fileName is required').max(MAX_IMAGE_FILE_NAME_LENGTH, 'fileName too long'),
         contentType: z.string().min(1, 'contentType is required').max(100, 'contentType too long'),
         alt: z.string().max(500, 'Alt text too long').optional(),
       },
@@ -1652,7 +1660,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'List a flashcard\'s images',
       description:
-        'Lists the image attachments on a flashcard by id. Each image includes its id and url (the external URL for URL attachments, or the signed download URL for cloud uploads), optional alt/mimeType and addedAt, plus cloud metadata for uploaded images: storagePath, downloadUrl, and sizeBytes. Read-only. Use this to show the user which images are attached to a card or to get URLs for remove_image.',
+        'Lists the image attachments on a flashcard by id. Each image includes its id and url (the exact external URL for URL attachments, or a current short-lived signed URL for cloud uploads), optional alt/mimeType and addedAt, plus cloud metadata for uploaded images: storagePath, downloadUrl, and sizeBytes. Read-only. Use this to show the user which images are attached to a card or to get URLs for remove_image.',
       inputSchema: { id: z.string().min(1, 'id is required') },
       outputSchema: z.object({
         cardId: z.string(),
@@ -1685,7 +1693,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Remove an image from a flashcard',
       description:
-        'Removes an image attachment from a flashcard by its URL. The URL must exactly match an attached image\'s url (get it from list_card_images or the card\'s images field). Returns { cardId, removed: true/false } — removed is false when no image with that URL was attached. The image file itself (hosted externally) is NOT deleted; only the card\'s reference to it is removed. Use this when the user asks to remove an image from a card.',
+        'Removes an image attachment from a flashcard by URL. External URL references must match exactly and their source is never deleted; an owned Storage image can be identified by an older signed URL for the same bucket/object across signature refreshes, and its object is deleted after the card-reference transaction commits. Returns { cardId, removed: true/false } — removed is false when no matching attachment exists. Use this when the user asks to remove an image from a card.',
       inputSchema: {
         id: z.string().min(1, 'id is required'),
         url: z.string().min(1, 'Image URL is required').max(2048, 'Image URL too long'),
@@ -1720,7 +1728,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Start a review session',
       description:
-        'Starts a persistent review session: the backend snapshots EVERY selector/default-matching card into the session queue (never capped, no pagination). NO selectors -> the standard DUE queue (new + scheduled cards, earliest due first). Optional selectors (any combination): deckId (stable id) and/or deck (legacy name; deckId wins), tags (ANY-of - a card matching ANY listed tag qualifies), cardIds (explicit allowlist, deduped, every id must exist; combined with deck/tags by INTERSECTION). A selector-defined session may include NON-due cards - the selector query is authoritative; REVIEW_TEST_MODE only widens the DEFAULT due filter, never an explicit selection. The review widget renders the session, cards, source, and progress - DO NOT narrate, summarize, or repeat the session, its cards, its mode tag, progress, source, or the current card in your reply unless the user explicitly asks; the UI owns display. Returns the MINIMAL model-facing state: session id, status, mode, counters, and the current card id (full widget state incl. card content is delivered to the widget). When the session completes, the widget shows the Finish/Continue choice - do not narrate it. The queue is stable across retries: cards that become due later are NOT added. Sessions are scoped to the API key that starts them; only that key can get/submit/end them. Use this when the user wants to study a set of cards, e.g. "start a review session for my spanish deck" or "review my vocab-tagged cards".',
+        'Starts a persistent review session: the backend snapshots EVERY selector/default-matching card into the session queue (never capped, no pagination). NO selectors -> the standard DUE queue (new + scheduled cards, earliest due first). Optional selectors (any combination): deckId (stable id) and/or deck (legacy name; deckId wins), tags (ANY-of - a card matching ANY listed tag qualifies), cardIds (explicit allowlist, deduped, every id must exist; combined with deck/tags by INTERSECTION). A selector-defined session may include NON-due cards - the selector query is authoritative; REVIEW_TEST_MODE only widens the DEFAULT due filter, never an explicit selection. The review widget renders the session, cards, source, and progress - DO NOT narrate, summarize, or repeat the session, its cards, its mode tag, progress, source, or the current card in your reply unless the user explicitly asks; the UI owns display. Returns the MINIMAL model-facing state: session id, status, mode, counters, and the current card id (full widget state incl. card content is delivered to the widget). When the session completes, the widget shows the Finish/Continue choice - do not narrate it. The queue is stable across retries: cards that become due later are NOT added. Session operations are authorized by the authenticated backend ownerId, independently of X-API-Key credential verification. Use this when the user wants to study a set of cards, e.g. "start a review session for my spanish deck" or "review my vocab-tagged cards".',
       inputSchema: {
         deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
         deck: z.string().min(1, 'Deck name cannot be empty').max(100, 'Deck name too long').optional(),
@@ -1760,7 +1768,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Get a review session',
       description:
-        'Retrieves a review session by id (any status: active, completed, or ended) plus the current card id (null when the queue is exhausted or the session is finished). The review widget renders the session state, mode tag, progress, and current card — DO NOT narrate, repeat the mode tag, or summarize progress in your reply unless the user explicitly asks; the UI owns display. Returns the MINIMAL model-facing state: session id, status, mode, counters, and the current card id. Only the API key that started the session can read it. Use this to resume an interrupted review flow (the widget hydrates from the hidden state); if the user asks for the actual card content, call get_flashcard.',
+        'Retrieves a review session by id (any status: active, completed, or ended) plus the current card id (null when the queue is exhausted or the session is finished). The review widget renders the session state, mode tag, progress, and current card — DO NOT narrate, repeat the mode tag, or summarize progress in your reply unless the user explicitly asks; the UI owns display. Returns the MINIMAL model-facing state: session id, status, mode, counters, and the current card id. Access is authorized by the authenticated backend ownerId; X-API-Key credential verification is separate. Use this to resume an interrupted review flow (the widget hydrates from the hidden state); if the user asks for the actual card content, call get_flashcard.',
       inputSchema: {
         sessionId: z.string().min(1, 'sessionId is required'),
       },
@@ -1821,7 +1829,7 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'End a review session',
       description:
-        'Ends an active review session without rating the remaining cards: the session status becomes ended with an endedAt timestamp, and it no longer accepts ratings. Idempotent — ending an already-completed or already-ended session is a no-op that returns it unchanged. Only the API key that started the session can end it. Use this when the user wants to stop studying before the queue is finished (or after a session started with an empty due queue).',
+        'Ends an active review session without rating the remaining cards: the session status becomes ended with an endedAt timestamp, and it no longer accepts ratings. Idempotent — ending an already-completed or already-ended session is a no-op that returns it unchanged. Access is authorized by the authenticated backend ownerId; X-API-Key credential verification is separate. Use this when the user wants to stop studying before the queue is finished (or after a session started with an empty due queue).',
       inputSchema: {
         sessionId: z.string().min(1, 'sessionId is required'),
       },
@@ -2177,9 +2185,9 @@ export function registerFlashcardTools(server: McpServer, bridge: FirebaseBridge
     {
       title: 'Import flashcards from an Anki .apkg package',
       description:
-        'Imports a standard Anki package (.apkg — a ZIP containing a SQLite collection.anki2) into the library. Pass the WHOLE package file base64-encoded in `package` (base64 of the .apkg bytes; the request is bounded to 20 MiB decoded and the import to 1000 cards). Each Anki note becomes one flashcard: the note model\'s Front/Back (or Cloze Text/Extra) fields are converted from HTML to plain text, tags are kept (max 30 per card), and each note\'s deck is found-or-created (deck names may be nested like "Spanish::Verbs"). Deterministic and safe: malformed packages are rejected with no partial writes (a single batch commits atomically up to 500 cards); notes with 0 or 2+ cards (reversed/multi-cloze) and empty-field notes are SKIPPED and reported in skippedNotes/skippedEmpty. Optional deckPath overrides the deck for every imported card. After import, list_flashcards/search_cards shows the new cards. Returns the imported cards plus skip counts.',
+        'Imports a standard Anki package (.apkg, ZIP containing SQLite collection.anki2). Provide the whole package as base64 in `package` (≤20 MiB decoded); imports are limited to 1000 cards. Notes with 0 or multiple generated cards, or invalid/empty required fields, are skipped and reported; model Front/Back or Cloze Text/Extra fields are selected, HTML is converted to plain text, tags are retained (max 20), and decks are found-or-created (including nested names). For Cloze models, Anki card ordinal + 1 selects the active deletion: its answer becomes `[answer]`, other deletion answers remain visible, and Extra is Back. Hints, nested/malformed clozes, empty or missing active deletions, and literal square brackets are rejected with a typed format error (HTTP 400); Basic-model braces remain literal. Package parsing/validation precedes writes. Writes use count- and byte-bounded transactions; each transaction is atomic, but a multi-transaction import may partially commit if a later transaction fails. `atomic` is true only for a single transaction and `batchCount` reports the transaction count. Optional `deckPath` overrides every imported card deck.',
       inputSchema: {
-        package: z.string().min(1, 'package (base64 .apkg) is required').max(33554448, 'package too large (max 20 MiB decoded)'),
+        package: z.string().min(1, 'package (base64 .apkg) is required').max(ANKI_IMPORT_PACKAGE_MAX, 'package too large (max 20 MiB decoded)'),
         deckPath: z.string().min(1, 'deckPath cannot be empty').max(300, 'deckPath too long (max 300 chars)').optional(),
       },
       outputSchema: z.object({
@@ -2279,6 +2287,7 @@ function sessionWithCardText(
   const structuredContent = {
     session: {
       id: s.id,
+      ...(s.ownerId !== undefined ? { ownerId: s.ownerId } : {}),
       status: s.status,
       mode: s.mode,
       ...(s.storageVersion !== undefined ? { storageVersion: s.storageVersion } : {}),
@@ -2307,7 +2316,7 @@ function sessionWithCardText(
       ...((p as { position?: number }).position !== undefined ? { position: (p as { position?: number }).position } : {}),
     })),
     ...(result.currentPosition !== undefined ? { currentPosition: result.currentPosition } : {}),
-    ...(result.queueWindow !== undefined ? { queueWindow: result.queueWindow } : {}),
+    ...(result.queueWindow !== undefined ? { queueWindow: { ...result.queueWindow, currentPosition: result.queueWindow.currentPosition ?? null } } : {}),
     ...((result as { requestId?: string }).requestId !== undefined ? { requestId: (result as { requestId?: string }).requestId } : {}),
   };
   return {

@@ -17,13 +17,20 @@
  *    client-supplied `reviewAt`).
  */
 
-import { fsrs, State, type Card, type RecordLogItem, type Grade } from 'ts-fsrs';
+import { fsrs, generatorParameters, State, type Card, type RecordLogItem, type Grade } from 'ts-fsrs';
 import { Timestamp } from 'firebase-admin/firestore';
-import { Flashcard, ReviewLogEntry, ReviewRating } from './types';
-
+import type { Flashcard, ReviewLogEntry, ReviewRating } from './types';
 /** One shared FSRS scheduler instance — parameters are process-wide defaults. */
-const scheduler = fsrs();
+const schedulerParameters = generatorParameters();
+const scheduler = fsrs(schedulerParameters);
 
+/** Copy the real short-term step lists used by review scheduling. */
+export function getFSRSStepConfiguration(): { learningSteps: string[]; relearningSteps: string[] } {
+  return {
+    learningSteps: [...schedulerParameters.learning_steps],
+    relearningSteps: [...schedulerParameters.relearning_steps],
+  };
+}
 function parseDate(value: unknown): Date {
   if (value instanceof Date) return value;
   if (typeof value === 'number') return new Date(value);
@@ -46,17 +53,89 @@ function parseTimestamp(value: unknown): Timestamp {
   return Timestamp.fromMillis(parseDate(value).getTime());
 }
 
-function toReviewLogItem(log: RecordLogItem['log'], card: Card): ReviewLogEntry {
+function toReviewLogItem(log: RecordLogItem['log'], dueBefore: Timestamp, card: Card): ReviewLogEntry {
   return {
     rating: log.rating as ReviewLogEntry['rating'],
     state: log.state as ReviewLogEntry['state'],
     review: Timestamp.fromMillis(log.review.getTime()),
-    due: Timestamp.fromMillis(log.due.getTime()),
+    due: dueBefore,
     stability: log.stability,
     difficulty: log.difficulty,
     reps: card.reps,
     lapses: card.lapses,
+    learningStepsAfter: card.learning_steps,
   };
+}
+
+/**
+ * Reconstructs legacy learning progress only when a retained log provides a
+ * boundary from New/Review or an explicit stored learningStepsAfter value.
+ * A current Learning/Relearning card with no such evidence is ambiguous and
+ * must not advance with guessed progress.
+ */
+type LearningProgressSnapshot = {
+  state: number;
+  learningSteps?: number;
+  reviewLog: Array<{ state: number; rating: number; learningStepsAfter?: number }>;
+};
+
+export function reconstructLearningSteps(card: LearningProgressSnapshot): number {
+  const isLearning = card.state === State.Learning || card.state === State.Relearning;
+  if (!isLearning) return 0;
+  if (typeof card.learningSteps === 'number' && Number.isInteger(card.learningSteps) && card.learningSteps >= 0) {
+    return card.learningSteps;
+  }
+
+  let step: number | undefined;
+  for (let index = 0; index < card.reviewLog.length; index += 1) {
+    const entry = card.reviewLog[index];
+    const nextState = card.reviewLog[index + 1]?.state ?? card.state;
+    if (typeof entry.learningStepsAfter === 'number' && Number.isInteger(entry.learningStepsAfter) && entry.learningStepsAfter >= 0) {
+      step = entry.learningStepsAfter;
+      continue;
+    }
+    if (![State.New, State.Learning, State.Review, State.Relearning].includes(entry.state as State)
+      || ![1, 2, 3, 4].includes(entry.rating)) {
+      step = undefined;
+      continue;
+    }
+    if (entry.state === State.New) {
+      step = entry.rating === 1 || entry.rating === 2
+        ? 0
+        : entry.rating === 3 && (nextState === State.Learning || nextState === State.Relearning) ? 1 : undefined;
+      continue;
+    }
+    if (entry.state === State.Review) {
+      step = entry.rating === 1 && nextState === State.Relearning ? 0 : undefined;
+      continue;
+    }
+    if (entry.rating === 1) {
+      // Again is a complete reset boundary even when older progress is trimmed.
+      step = 0;
+    } else if (entry.rating === 2) {
+      // Hard preserves a known step. Without an earlier boundary it does not
+      // reveal which step was current, so step remains unknown.
+    } else if (entry.rating === 3) {
+      // Count one completed short-term step only when the following state
+      // proves Good did not graduate. No configured step count is duplicated.
+      step = (nextState === State.Learning || nextState === State.Relearning) && step !== undefined
+        ? step + 1
+        : undefined;
+    } else {
+      step = undefined;
+    }
+  }
+  if (step === undefined) {
+    throw new LearningProgressUnavailableError();
+  }
+  return step;
+}
+
+export class LearningProgressUnavailableError extends Error {
+  constructor() {
+    super('This legacy card has incomplete learning progress. Reset its scheduling state before reviewing again. No review was recorded.');
+    this.name = 'LearningProgressUnavailableError';
+  }
 }
 
 /** Builds the ts-fsrs input card from a stored flashcard. */
@@ -67,7 +146,7 @@ function toFsrsCard(card: Flashcard): Card {
     difficulty: card.difficulty,
     elapsed_days: 0,
     scheduled_days: 0,
-    learning_steps: card.state === 1 ? Math.max(card.reps, 1) : 0,
+    learning_steps: reconstructLearningSteps(card),
     reps: card.reps,
     lapses: card.lapses,
     state: card.state,
@@ -76,17 +155,19 @@ function toFsrsCard(card: Flashcard): Card {
 }
 
 /** Serializes a ts-fsrs Card into the fields stored on the flashcard document. */
-function fromFsrsCard(card: Card): Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'due' | 'lastReview'> {
+function fromFsrsCard(card: Card): Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'learningSteps' | 'due' | 'lastReview'> {
   return {
     state: card.state,
     stability: card.stability,
     difficulty: card.difficulty,
     reps: card.reps,
     lapses: card.lapses,
+    learningSteps: card.learning_steps,
     due: Timestamp.fromMillis(card.due.getTime()),
     lastReview: card.last_review ? Timestamp.fromMillis(card.last_review.getTime()) : undefined,
   };
 }
+
 
 /**
  * Applies one review to a stored flashcard using the FSRS scheduler.
@@ -96,7 +177,7 @@ function fromFsrsCard(card: Card): Pick<Flashcard, 'state' | 'stability' | 'diff
  * review's timestamp (defaults to the server's current time).
  */
 export function applyReview(card: Flashcard, rating: ReviewRating, reviewAt: Date = new Date()): {
-  scheduling: Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'due' | 'lastReview'>;
+  scheduling: Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'learningSteps' | 'due' | 'lastReview'>;
   logEntry: ReviewLogEntry;
 } {
   const fsrsCard = toFsrsCard(card);
@@ -105,18 +186,19 @@ export function applyReview(card: Flashcard, rating: ReviewRating, reviewAt: Dat
   const item: RecordLogItem = scheduler.next(fsrsCard, reviewAt, grade);
   return {
     scheduling: fromFsrsCard(item.card),
-    logEntry: toReviewLogItem(item.log, item.card),
+    logEntry: toReviewLogItem(item.log, Timestamp.fromMillis(fsrsCard.due.getTime()), item.card),
   };
 }
 
 /** Initial scheduling state for a brand-new card: New, due immediately. */
-export function initialScheduling(now: Timestamp = Timestamp.now()): Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'due'> {
+export function initialScheduling(now: Timestamp = Timestamp.now()): Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'learningSteps' | 'due'> {
   return {
     state: State.New,
     stability: 0,
     difficulty: 0,
     reps: 0,
     lapses: 0,
+    learningSteps: 0,
     due: now,
   };
 }

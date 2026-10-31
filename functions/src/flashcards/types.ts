@@ -27,6 +27,9 @@ export const CARD_TYPE_LABELS: Record<CardType, string> = {
  */
 export const DEFAULT_DECK_NAME = 'Uncategorized';
 
+/** Maximum persisted deck name length; Anki imports support hierarchical paths up to 300 characters. */
+export const DECK_NAME_MAX_LENGTH = 300;
+
 /** A cloze deletion marker embedded in `front` text, e.g. `[Berlin]` in
  * "The capital of Germany is [Berlin]". Canonical form: exactly one
  * `[answer]` token; all other brackets are treated as literal text.
@@ -72,7 +75,10 @@ export interface ReviewLogEntry {
   reps: number;
   /** Number of lapses (forgotten reviews) after this review. */
   lapses: number;
+  /** Number of learning/relearning steps completed after this review, when recorded by the current scheduler. */
+  learningStepsAfter?: number;
 }
+
 
 /** Maximum number of image attachments allowed on a single card. */
 export const MAX_CARD_IMAGES = 5;
@@ -95,15 +101,17 @@ export const MAX_IMAGE_FILE_NAME_LENGTH = 255;
  * For external URLs (attachImage): the backend stores only the validated URL
  * reference plus optional metadata — never the image bytes.
  *
- * For cloud uploads (uploadImage): the backend stores the bytes in Firebase
- * Storage and persists metadata — id, storagePath, downloadUrl, contentType,
- * sizeBytes, alt, addedAt — with `url` set to the download URL. No image
- * bytes are stored in Firestore.
+ * For cloud uploads (uploadImage): the backend stores bytes privately in
+ * Firebase Storage and persists metadata — id, storagePath, downloadUrl,
+ * contentType, sizeBytes, alt, addedAt — with `url` set to a short-lived
+ * signed download URL. Owner-scoped card/image reads refresh the persisted
+ * URL as it nears expiry; use the latest returned URL. Image bytes are not
+ * stored in Firestore.
  */
 export interface CardImage {
   /** Stable image id (server-assigned; the Storage object name suffix for cloud images). */
   id: string;
-  /** The image URL: the external https(s) URL for URL attachments, or the download URL for cloud images. */
+  /** External URL references remain exact; cloud URLs are refreshed on owned reads. */
   url: string;
   /** Optional short description / alt text. */
   alt?: string;
@@ -113,7 +121,7 @@ export interface CardImage {
   addedAt: Timestamp;
   /** Firebase Storage object path (cloud images only), e.g. card-images/{cardId}/{imageId}.jpg. */
   storagePath?: string;
-  /** Signed download URL for cloud images. */
+  /** Short-lived signed download URL for cloud images; refreshed on owned reads. */
   downloadUrl?: string;
   /** Decoded byte size (cloud images only). */
   sizeBytes?: number;
@@ -223,6 +231,8 @@ export interface Flashcard {
   reps: number;
   /** Number of lapses (forgotten reviews). */
   lapses: number;
+  /** Current ts-fsrs learning/relearning step. Absent on legacy cards with unrecorded progress. */
+  learningSteps?: number;
   /** Time of the last review, if any. */
   lastReview?: Timestamp;
   /** Full FSRS review history, oldest first. */
@@ -273,6 +283,7 @@ export interface UpdateFlashcardInput {
   tags?: string[];
 }
 
+/** Lists by createdAt DESC, document id DESC; filters bind the opaque cursor. */
 export interface ListFlashcardsQuery {
   /** Filter by stable deck id (cards whose `deckId` equals this). */
   deckId?: string;
@@ -280,6 +291,7 @@ export interface ListFlashcardsQuery {
   deck?: string;
   tags?: string;
   pageSize?: number;
+  /** Opaque owner- and selector-bound cursor from a prior listFlashcards page. */
   pageToken?: string;
 }
 
@@ -288,12 +300,14 @@ export interface ListFlashcardsResponse {
   nextPageToken: string | null;
 }
 
+/** Lists by due ASC, document id ASC; selector cursors are owner-bound. */
 export interface DueFlashcardsQuery {
   /** Filter by stable deck id. */
   deckId?: string;
   /** Legacy filter by deck name. */
   deck?: string;
   pageSize?: number;
+  /** Opaque owner- and selector-bound cursor from a prior dueFlashcards page. */
   pageToken?: string;
 }
 
@@ -443,18 +457,12 @@ export type TagMatchMode = (typeof TAG_MATCH_MODES)[number];
  *    (23:59:59.999). Invalid calendar dates (e.g. 2026-02-31) are rejected.
  *
  * PAGINATION CONTRACT (stable, cursor-based, deterministic): every page
- * returns the page's cards plus an opaque `nextPageToken`. The token encodes
- * the id of the LAST card of the page plus the FULL filter set of the
- * original request (URL-safe base64url JSON), so page 2 re-applies the exact
- * same filters and the ordering is deterministic even when the dataset or the
- * filters change between calls. Ordering: `createdAt` descending, ties by
- * card id ASCENDING — the same total order Firestore applies natively to an
- * `orderBy('createdAt', 'desc')` query (document id is its implicit
- * secondary sort key). The service repeats that secondary order explicitly
- * (`orderBy(FieldPath.documentId())`), so Firestore cursors, the in-memory
- * matcher and the token agree on every boundary. `pageToken` is the ONLY
- * pagination input; a token combined with different filters yields a 400
- * (token-filters mismatch).
+ * returns cards plus an opaque, bounded `nextPageToken` bound to the
+ * authenticated owner, query kind, and canonical active-filter fingerprint.
+ * The token carries the exact createdAt `(seconds, nanoseconds, document id)`
+ * boundary; results order by createdAt descending, ties by card id ASCENDING
+ * (searchCards' explicit tie-break). A token combined with another owner,
+ * query kind, or filter set is rejected with 400.
  */
 export interface SearchCardsQuery {
   /** Free-text search over topic OR front OR back (case-insensitive substring). */
@@ -620,8 +628,10 @@ export interface UpdateDeckInput {
   description?: string;
 }
 
+/** Lists by createdAt DESC, document id DESC. */
 export interface ListDecksQuery {
   pageSize?: number;
+  /** Opaque owner-bound cursor from a prior listDecks page. */
   pageToken?: string;
 }
 
@@ -713,9 +723,10 @@ export type SessionMode = (typeof SESSION_MODES)[number];
 
 /**
  * Lifecycle of a review session:
- *  - `active`: started, has a current card (or an exhausted queue), awaiting ratings.
- *  - `completed`: every snapshot card was reviewed (reached the end of the queue).
- *  - `ended`: abandoned by the client before the queue was exhausted.
+ *  - `active`: accepting ratings (or advancing past deleted snapshot cards).
+ *  - `completed`: every live snapshot card was rated or skipped.
+ *  - `ended`: abandoned before the queue was exhausted.
+ *  - `failed`: the v2 queue build failed; the session is not reviewable.
  */
 export const SESSION_STATUSES = ['active', 'completed', 'ended', 'failed'] as const;
 export type SessionStatus = (typeof SESSION_STATUSES)[number];
@@ -736,41 +747,37 @@ export interface SessionRatingCounts {
 }
 
 /**
- * A persistent review session. The session snapshots the card ids that were
- * due when it started (ordered by due time ascending) so the queue is stable
- * across restarts; each rating
- * atomically applies FSRS scheduling to ONE claimed card and records the
- * claim on the session, so concurrent submissions and retries can never
- * double-apply a review, lose progress, or rate the wrong card.
+ * A persistent review session. At start, the backend snapshots every card in
+ * the selected set (the due queue when no selectors are given; selectors can
+ * include non-due cards), ordered by due time. New v2 sessions store that
+ * complete queue in chunks, while responses expose only a bounded current
+ * card/preload window; legacy v1/no-version sessions retain their in-root
+ * arrays and legacy response shape.
  *
- * Ratings are addressed by CARD (the card the client is looking at), not by
- * "the current card": a submission may claim any live, unrated card in
- * `cardIds`. `reviewedCardIds` records every claimed card (each card can be
- * claimed exactly once — enforced inside the same transaction that applies
- * the rating). `currentIndex` always points at the FIRST unrated live card,
- * so out-of-order ratings (card N+1 committed before card N) never stall the
- * queue and never corrupt the counters: `reviewedCount` == the number of
- * claims, `ratingCounts` accumulates every applied rating exactly once.
+ * Ratings are applied atomically with the session's queue progress. For v2,
+ * when no `expectedPosition` is supplied, `expectedCardId` confirms the
+ * current live card; a different id is rejected rather than scanned forward.
+ * A v2 caller may instead address a pending queue position with
+ * `expectedPosition` (and optionally confirm its id with `expectedCardId`).
+ * Legacy sessions keep their separate array-based behavior. A `requestId`,
+ * when supplied, is recorded atomically as a retry receipt so a replay does
+ * not apply the rating twice.
  *
- * Sessions are scoped to the API-key model: every session records the API key
- * name that started it (the same `X-API-Key` used by all other handlers, the
- * `apiKeys` collection) — there is no user identity concept.
+ * Every session is scoped to its owner identity (verified Auth0 `sub` in
+ * production, or the fixed `'emulator'` identity in the emulator).
  */
 export interface ReviewSession {
   id: string;
   /**
-   * The owner of this session (verified Auth0 `sub`, or `'emulator'` in the
-   * emulator). Session idempotency/ownership checks are owner-scoped; absent
-   * on pre-multi-tenant (legacy/unowned) documents.
+   * Owner identity from the verified Auth0 subject, or the fixed emulator
+   * identity. Historical ownerless roots remain inaccessible to callers.
    */
   ownerId?: string;
-  /** The API key name that started the session (from the `apiKeys` collection). */
-  apiKeyName: string;
-  /** Lifecycle status: active | completed | ended. */
+  /** Lifecycle status: active | completed | ended | failed (failed builds are not reviewable). */
   status: SessionStatus;
   /** Session mode; currently always 'spaced_repetition'. */
   mode: SessionMode;
-  /** Optional deck restriction captured at start (card ids were due within it). */
+  /** Optional deck restriction captured at start; selected cards may be non-due. */
   deckId?: string;
   /**
    * Optional session display name (e.g. the deck name) captured at start.
@@ -778,12 +785,10 @@ export interface ReviewSession {
    */
   name?: string;
   /**
-   * Persisted provenance of the session's card set: what selectors defined
-   * the snapshot ('due' | 'deck' | 'custom') plus the selector details
-   * (deck id/name, tags, explicit card ids). Echoed on every response so the
-   * widget can show the source ("Due cards" / deck name / "Custom") and
-   * Continue can replay the exact selection. Absent on sessions created
-   * before this field.
+   * Persisted provenance of the session's card set and available selector
+   * details. V2 session responses omit `source.cardIds`; Continue copies their
+   * chunked snapshot via `repeatSessionId`. Legacy responses may retain selector
+   * card ids for replay. Absent on sessions created before this field.
    */
   source?: ReviewSessionSource;
   /**
@@ -808,9 +813,9 @@ export interface ReviewSession {
    * them); the v2 path never reads them.
    */
   storageVersion?: number;
-  /** Number of cards snapshotted into this session (v1: equals `cardIds.length`; v2: equals the total queued positions across chunks). */
+  /** Number of cards in the snapshot; selector-defined sessions may include non-due cards. */
   limit: number;
-  /** Exact number of cards that were due when the session started. */
+  /** With no selectors, the exact due-queue count; selector-defined sessions may include non-due cards. */
   dueCount: number;
   /**
    * Number of queue positions still awaiting review (unrated, non-deleted).
@@ -840,12 +845,12 @@ export interface ReviewSession {
    */
   deletedCount?: number;
   /**
-   * Id of the session this session REPEATS — set when a session is started
-   * with `repeatSessionId` (the widget's Continue action): the selector
-   * provenance is copied from the repeated session and this id records the
-   * lineage. v2 keeps the id on the root ONLY (a single string, never an
-   * array), so an arbitrarily long Continue chain never grows the document.
-   * Legacy sessions that predate the field omit it.
+   * Id of the v2 session this session REPEATS, set by Continue through
+   * `repeatSessionId`. The backend copies the referenced session's chunked
+   * queue into a fresh session and retains this id as lineage; it does not
+   * re-run the original selection. The bounded id prevents Continue chains
+   * from growing the root document. Legacy sessions that predate the field
+   * omit it; their client path replays selector provenance instead.
    */
   repeatSessionId?: string;
   /**
@@ -891,22 +896,24 @@ export interface ReviewSession {
    */
   cardIds?: string[];
   /**
-   * Index into `cardIds` of the FIRST unrated, non-deleted card — the next
-   * card a client should rate. Out-of-order ratings (a later card committed
-   * first) keep `currentIndex` at the earliest unrated card until it is
-   * claimed, so the queue never stalls and remaining progress is exact.
+   * v1: index into the in-root `cardIds` array. V2: stable queue position of
+   * the current live card (also exposed as `currentPosition` in responses).
+   * A later pending v2 position may be claimed explicitly with
+   * `expectedPosition`; otherwise a supplied `expectedCardId` must match the
+   * current card. Legacy v1/no-version submissions retain their separate
+   * forward lookup behavior.
    */
   currentIndex: number;
   /**
-   * Number of cards successfully rated in this session. Always equals
-   * `reviewedCardIds.length` (deleted snapshot cards are never claimed and
-   * never counted).
+   * Number of cards successfully rated; deleted snapshot cards skipped by v2
+   * are not included. On legacy roots this equals `reviewedCardIds.length`;
+   * v2 stores claim state in queue chunks instead of that root array.
    */
   reviewedCount: number;
   /**
-   * Number of cards still awaiting review in this session's snapshot:
-   * `cardIds.length - currentIndex - (claims at indices > currentIndex)`.
-   * Computed on responses, not persisted.
+   * Number of live cards still awaiting review. Legacy responses compute this
+   * from the in-root arrays; v2 responses use the exact bounded-root
+   * `remainingQueueCount` maintained with ratings and deleted-card skips.
    */
   remainingCount?: number;
   /** True when the snapshot was capped at start (legacy sessions only — new sessions never cap, so this is always false). */
@@ -922,40 +929,30 @@ export interface ReviewSession {
   /** Ratings applied so far, keyed by name and by rating number. */
   ratingCounts: SessionRatingCounts;
   /**
-   * The cards rated in this session, in claim order. Each card id appears at
-   * most once — a claim is recorded atomically with the rating that applied
-   * it, so concurrent submissions can never rate the same card twice and a
-   * client can never rate a card that was already rated by a sibling request.
-   * Parallel submissions may claim cards OUT OF ORDER — any live, unrated
-   * card at or after `currentIndex` — and `currentIndex` always advances to
-   * the FIRST unrated live card, so the queue never stalls. The widget uses
-   * this set (plus its own in-flight submissions) to know exactly which card
-   * to display next, independent of response ordering.
+   * Card ids rated by legacy v1/no-version sessions, in claim order. Each
+   * id appears at most once because the queue-item claim and rating commit
+   * atomically. Legacy submissions may use `expectedCardId` to select a later
+   * live id from the remaining in-root array; v2 instead uses the current
+   * card by default or an explicit pending `expectedPosition`.
    *
-   * LEGACY (v1/no-version) sessions ONLY — v2 roots are BOUNDED and omit
-   * this array: v2 claim records live in the queueChunks child documents
-   * (each queue item carries its rating's `requestId`), so the root
-   * never grows with the session. Absent on v2 roots.
+   * V2 roots omit this array: their queueChunks items carry claim status and
+   * rating/requestId data, so the root never grows with the session.
    */
   reviewedCardIds?: string[];
   /**
-   * Every requestId that has already been applied, in claim order. A retried
-   * submission whose requestId is listed here (or equals `lastRequestId`) is
-   * a no-op returning the recorded result — a duplicate requestId can never
-   * double-apply a rating, even after the session advanced past the rated
-   * card. Absent on sessions created before this field.
+   * Applied request ids retained by legacy v1/no-version sessions. Replaying
+   * one is a no-op; the legacy response reflects current session state, not a
+   * frozen copy of the earlier response.
    *
-   * LEGACY (v1/no-version) sessions ONLY — v2 roots are BOUNDED and omit
-   * this array: duplicate-requestId detection reads the item's `requestId`
-   * in the queueChunks document, never a root array.
-   * Absent on v2 roots.
+   * V2 roots omit this array: private per-session requestClaims documents
+   * store request receipts, and queue item requestIds record the claim.
    */
   processedRequestIds?: string[];
   /**
-   * Idempotency bookkeeping: the requestId and card id of the most recently
-   * applied claim. A retried submission with the same requestId is a no-op
-   * (the recorded result is returned), and a retry of ANY earlier requestId
-   * is recognized via `processedRequestIds`.
+   * Bounded compatibility marker for the most recent v2 requestId claim.
+   * New roots keep complete idempotency history in private requestClaims
+   * child documents; this marker also permits immediate replay recovery for
+   * legacy roots. lastRatedCardId is absent for a deleted-target skip.
    */
   lastRequestId?: string;
   lastRatedCardId?: string;
@@ -965,6 +962,10 @@ export interface ReviewSession {
   lastReviewedAt?: Timestamp;
   /** When the session became completed or ended. */
   endedAt?: Timestamp;
+  /** Version 1 means every requestId claim from the new session's creation
+   *  onward is stored in its private requestClaims child collection. Absent
+   *  identifies legacy roots; unknown present values are rejected. */
+  requestClaimsVersion?: unknown;
   /**
    * Persisted REVIEW_TEST_MODE flag captured at start. A session started in
    * test mode stays non-mutating (submit skips the card FSRS write) even if
@@ -985,9 +986,10 @@ export const SESSION_SOURCE_TYPES = ['due', 'deck', 'custom'] as const;
 export type SessionSourceType = (typeof SESSION_SOURCE_TYPES)[number];
 
 /**
- * Persisted provenance of a review session's card set (stored on the session
- * document at start and echoed on every response). The queue is a snapshot:
- * card ids are captured once at start and never re-evaluated.
+ * Persisted provenance of a review session's card set and echoed on responses.
+ * V2 source metadata never includes `cardIds`; Continue copies the chunked
+ * snapshot by `repeatSessionId`. Legacy sessions may retain their selector
+ * card ids for replay.
  */
 export interface ReviewSessionSource {
   /** Which selector(s) defined the snapshot: 'due' | 'deck' | 'custom'. */
@@ -1004,8 +1006,9 @@ export interface ReviewSessionSource {
    */
   tags?: string[];
   /**
-   * The explicit card-id allowlist as given (deduped, validated to exist,
-   * ordered deterministically by the backend). Absent when no ids were given.
+   * Explicit card-id allowlist provenance for a legacy session (deduped,
+   * validated to exist, ordered deterministically). V2 source metadata omits
+   * the ids because its queue is stored in chunks.
    */
   cardIds?: string[];
 }
@@ -1344,11 +1347,9 @@ export interface ReviewEvent {
   /** The card that was reviewed. */
   cardId: string;
   /**
-   * Stable, immutable authenticated API-key identity of the actor that
-   * performed the review: the apiKeys document id (the key itself) when the
-   * key is the stable identity, else its immutable key id. Falls back to
-   * `'unknown'` when no key was supplied (dev/emulator). Review history and
-   * stats are scoped to this actor.
+   * Authenticated owner identity that performed the review (verified Auth0
+   * `sub`, or the fixed `'emulator'` in emulator mode). History and stats are
+   * scoped by `ownerId`; this field remains as a compatibility alias.
    */
   actorId: string;
   /** The rating given: 1=Again, 2=Hard, 3=Good, 4=Easy. */
@@ -1368,6 +1369,8 @@ export interface ReviewEvent {
   repsAfter: number;
   /** Lapses AFTER this review. */
   lapsesAfter: number;
+  /** FSRS learning/relearning step after this review when available. */
+  learningStepsAfter?: number;
   /** When the review was performed (server time, or a client reviewAt). */
   reviewedAt: Timestamp;
   /** When the event document was recorded (server time). */
@@ -1545,142 +1548,96 @@ export interface TopLapsedResponse {
 /* Bulk enrollment (resumable, idempotent, chunked)                    */
 /* ------------------------------------------------------------------ */
 
-/** Number of cards per chunk in the enrollment subcollection. Each chunk is
- *  committed atomically via a Firestore WriteBatch (well under the 500-op
- *  batch ceiling). */
+/** Maximum number of cards per enrollment chunk. Chunk documents are also
+ * bounded by a conservative serialized-byte budget because Firestore limits
+ * each document to 1 MiB. */
 export const ENROLLMENT_CHUNK_SIZE = 100;
 
-/** Maximum number of cards accepted in a single enrollment request. The server
- *  chunks them into ENROLLMENT_CHUNK_SIZE batches and writes each atomically.
- *  10 000 cards ≈ 50 chunks ≈ 100 s sequential Firestore commits; well within
- *  Cloud Functions' 540 s timeout. Payload ≈ 5–10 MiB JSON. */
+/** Maximum number of cards accepted in one enrollment request. Cards are
+ * canonically ordered and partitioned by count and serialized bytes. */
 export const ENROLLMENT_MAX_CARDS = 10_000;
 
-/** Maximum length of a content-addressable card key (SHA-256 hex = 64 chars).
- *  Defensive bound for Firestore index key safety. */
-export const CARD_KEY_MAX_LENGTH = 64;
 
 /**
  * Lifecycle of a bulk enrollment job:
- *  - `pending`:   accepted and chunked; not yet processing.
- *  - `processing`: chunks are being committed to Firestore.
- *  - `completed`:  every chunk has been committed (card count = totalCards).
- *  - `failed`:     an observed execution error on a chunk (see `error`/`chunkErrors`);
- *                   exact re-submission retriggers non-completed chunks.
+ *  - `pending`: accepted and chunked; not yet processing.
+ *  - `processing`: one or more chunks remain to be processed.
+ *  - `completed`: every chunk completed without card failures.
+ *  - `failed`: an execution error or card failure was observed; exact
+ *    resubmission retries only chunks that have not completed.
  */
 export const ENROLLMENT_STATUSES = ['pending', 'processing', 'completed', 'failed'] as const;
 export type EnrollmentStatus = (typeof ENROLLMENT_STATUSES)[number];
 
 /**
- * Input for bulk enrollment. Accepts a potentially large array of cards.
- * The server validates, persists chunk documents to Firestore subcollection
- * `bulkEnrollmentJobs/{jobId}/chunks/{paddedIndex}`, and returns the jobId
- * immediately. Each chunk triggers an onDocumentWritten handler that
- * processes cards atomically via WriteBatch (card writes) and a metadata
- * transaction (chunk claim + job counters).
- *
- * The response is IMMEDIATE (no waiting for card writes to finish): the
- * client receives a `jobId` and polls `GET /bulk-enroll-status` for progress.
- * Content-addressable: re-sending the same cards (identical full card
- * identity: front + back + tags + deckId + topic + suspended) with the
- * same ownerId returns the existing job and resumes from the last
- * incomplete chunk — never duplicates cards.
+ * Input for bulk enrollment. The server resolves owner-scoped deck references,
+ * canonicalizes full card identity, stores bounded durable chunks, and returns
+ * immediately. Exact resubmission resumes the same canonical job without
+ * resetting completed chunks or mutable fields on existing cards.
  */
 export interface BulkEnrollCardsInput {
   cards: CreateFlashcardInput[];
 }
 
-/**
- * Immediate response from `POST /bulk-enroll`. Returns the job identity and
- * total counts so the client can poll for progress.
- */
+/** Immediate response from `POST /bulk-enroll`. */
 export interface BulkEnrollCardsResponse {
-  /** Content-addressable job id (SHA-256 of sorted card keys). */
+  /** Content-addressable job id. */
   jobId: string;
-  /** Total number of cards in the enrollment request. */
+  /** Number of input cards, including repeated equivalent entries. */
   totalCards: number;
-  /** Total number of chunks (ceil(totalCards / ENROLLMENT_CHUNK_SIZE)). */
+  /** Number of byte- and count-bounded chunks. */
   totalChunks: number;
-  /** Number of chunks fully committed (0..totalChunks). */
+  /** Number of chunks completed exactly once. */
   completedChunks: number;
-  /** Job status (new submissions return 'processing'). */
+  /** Current job status. */
   status: EnrollmentStatus;
-  /** Number of cards successfully created across committed chunks. */
+  /** Distinct new cards committed. */
   createdCount: number;
-  /** Number of cards skipped because they already exist for this owner. */
+  /** Existing or repeated cards skipped. */
   skippedCount: number;
-  /** Number of cards that failed validation or creation. */
+  /** Card-level failures accumulated from completed chunks. */
   failedCount: number;
-  /** Number of chunks rewritten as pending during resume (self-healing). 0 on first submission. */
+  /** Noncompleted chunks retriggered by this exact resubmission. */
   retriedChunkCount: number;
 }
 
-/**
- * Content-addressable enrollment job document persisted in Firestore
- * at `bulkEnrollmentJobs/{jobId}`. Progress fields are updated atomically
- * as each chunk is committed.
- */
+/** Persisted content-addressable enrollment job document. */
 export interface BulkEnrollmentJob {
-  /** Content-addressable job id (SHA-256 of sorted card keys). */
   id: string;
-  /** The owner of this enrollment job (verified Auth0 `sub`). */
   ownerId: string;
-  /** Lifecycle status. */
   status: EnrollmentStatus;
-  /** SHA-256 of JSON-sorted card keys (for content-addressable idempotency). */
+  /** Versioned canonical job identity digest. */
   contentHash: string;
-  /** Total number of cards across all chunks. */
+  /** Full canonical-set digest; distinguishes verified new-format jobs. */
+  canonicalCardSetHash?: string;
+  /** Enrollment storage format; absent on legacy jobs. */
+  formatVersion?: number;
   totalCards: number;
-  /** Total number of chunks. */
   totalChunks: number;
-  /** Number of chunks fully committed (0..totalChunks). */
   completedChunks: number;
-  /** Number of cards successfully created across committed chunks. */
   createdCount: number;
-  /** Number of cards that failed validation or creation. */
   failedCount: number;
-  /** Number of cards skipped because they already exist for this owner. */
   skippedCount: number;
-  /** When the job was created. */
   createdAt: Timestamp;
-  /** When the job was last updated (any chunk committed). */
   updatedAt: Timestamp;
-  /** When the job completed (absent while pending/processing/failed). */
   completedAt?: Timestamp;
-  /** Error message when status = 'failed'. */
   error?: string;
+
 }
 
-/**
- * Progress report returned by `GET /bulk-enroll-status`. Mirrors the job
- * document's progress fields so the client knows exactly how far along
- * the enrollment is.
- */
+/** Progress report returned by `GET /bulk-enroll-status`. */
 export interface BulkEnrollStatusResponse {
-  /** Content-addressable job id. */
   jobId: string;
-  /** Current lifecycle status. */
   status: EnrollmentStatus;
-  /** Total cards across all chunks. */
   totalCards: number;
-  /** Total number of chunks. */
   totalChunks: number;
-  /** Number of chunks fully committed. */
   completedChunks: number;
-  /** Number of cards successfully created. */
   createdCount: number;
-  /** Number of cards skipped (already enrolled for this owner). */
   skippedCount: number;
-  /** Number of cards that failed. */
   failedCount: number;
-  /** ISO 8601 of when the job was created. */
   createdAt: string;
-  /** ISO 8601 of when the job was last updated. */
   updatedAt: string;
-  /** ISO 8601 of when the job completed (absent while pending/processing/failed). */
   completedAt?: string;
-  /** Error message when status = 'failed' (absent otherwise). */
   error?: string;
-  /** Per-chunk errors observed during processing (absent when all chunks are clean). */
   chunkErrors?: Array<{ chunkIndex: number; error: string }>;
 }

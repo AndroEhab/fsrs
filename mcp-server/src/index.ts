@@ -14,24 +14,54 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isIP } from 'node:net';
 import { createServer } from 'node:http';
-import { FirebaseBridge } from './bridge.js';
-import { authGuardError, hasAuthMechanism, loadConfig } from './config.js';
+import { FirebaseBridge, MCP_HTTP_MAX_REQUEST_BODY_SIZE } from './bridge.js';
+import { auth0Configured, authConfigurationError, authGuardError, backendIdentityError, hasAuthMechanism, loadConfig } from './config.js';
 import { registerFlashcardTools } from './tools.js';
 import { registerReviewWidget } from './widget.js';
 import { OAUTH_RESOURCE_METADATA_MCP_PATH, OAUTH_RESOURCE_METADATA_PATH, METADATA_CORS_HEADERS, challengeFor, gateRequest, serveResourceMetadata } from './auth.js';
-
 const config = loadConfig();
+const configuredHosts = (process.env.MCP_ALLOWED_HOSTS ?? '').split(',').map((host) => host.trim().toLowerCase()).filter(Boolean);
+const authConfigError = authConfigurationError(config) ?? backendIdentityError(config);
+if (authConfigError) throw new Error(authConfigError);
+const auth0Enabled = auth0Configured(config);
+const allowedOrigins = new Set([
+  'https://chatgpt.com',
+  'https://chat.openai.com',
+  ...((process.env.MCP_ALLOWED_ORIGINS ?? '').split(',').map((origin) => origin.trim()).filter(Boolean)),
+]);
+const loopbackHost = config.host.toLowerCase().replace(/^\[|\]$/g, '');
+const isLoopbackListener = loopbackHost === 'localhost' || loopbackHost === '::1'
+  || (isIP(loopbackHost) === 4 && loopbackHost.startsWith('127.'));
+const expectedHost = `${loopbackHost.includes(':') ? `[${loopbackHost}]` : loopbackHost}:${config.port}`;
+const resourceHost = (() => {
+  try {
+    return new URL(config.resourceUrl).host.toLowerCase();
+  } catch {
+    return expectedHost;
+  }
+})();
+// Public resource authority plus explicitly configured additions and exact
+// loopback authorities for local browser/desktop clients. No suffix/wildcard
+// matching: arbitrary DNS names remain rejected to prevent rebinding.
+const permittedHosts = new Set([
+  resourceHost,
+  `localhost:${config.port}`,
+  `127.0.0.1:${config.port}`,
+  `[::1]:${config.port}`,
+  ...(isLoopbackListener ? [expectedHost] : []),
+  ...configuredHosts,
+]);
 
 function createAppServer(bearerToken?: string): McpServer {
   const bridge = new FirebaseBridge({
     apiKey: config.apiKey,
     baseUrl: config.apiBaseUrl,
     timeoutMs: config.requestTimeoutMs,
-    // Request-scoped: the verified incoming Auth0 token is attached to THIS
-    // request's bridge only (the HTTP layer passes gate.token per /mcp
-    // request; stdio/health pass nothing). Never stored on the shared config.
-    bearerToken,
+    // Per-request Auth0 always wins; process identity is used only for trusted
+    // stdio or static single-user mode.
+    bearerToken: bearerToken ?? (!auth0Enabled ? config.backendAuthToken || undefined : undefined),
   });
   const server = new McpServer(
     {
@@ -77,15 +107,6 @@ async function runStdio(): Promise<void> {
 const MCP_PATH = '/mcp';
 const MCP_METHODS = new Set(['POST', 'GET', 'DELETE']);
 
-function handleOptions(res: import('node:http').ServerResponse): void {
-  res.writeHead(204, {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'POST, GET, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'content-type, mcp-session-id, authorization',
-    'Access-Control-Expose-Headers': 'Mcp-Session-Id',
-  });
-  res.end();
-}
 
 function serveHttp(): Promise<void> {
   // Deploy-time fail-closed guard: never serve an unauthenticated /mcp
@@ -109,21 +130,62 @@ function serveHttp(): Promise<void> {
       // answered so the browser can read the document.
       const isMetadataPath = url.pathname === OAUTH_RESOURCE_METADATA_MCP_PATH || url.pathname === OAUTH_RESOURCE_METADATA_PATH;
       if (isMetadataPath) {
+        const origin = req.headers.origin;
+        if (!req.headers.host || !permittedHosts.has(req.headers.host.toLowerCase())) {
+          res.writeHead(403).end('Forbidden');
+          return;
+        }
+        if (origin && !allowedOrigins.has(origin)) {
+          res.writeHead(403).end('Forbidden');
+          return;
+        }
+        if (origin) {
+          res.setHeader('Access-Control-Allow-Origin', origin);
+          res.setHeader('Vary', 'Origin');
+        } else {
+          res.setHeader('Access-Control-Allow-Origin', '*');
+        }
+        res.setHeader('Access-Control-Expose-Headers', 'WWW-Authenticate, Mcp-Session-Id');
         if (req.method === 'OPTIONS') {
-          res.writeHead(204, METADATA_CORS_HEADERS);
+          res.writeHead(204, {
+            ...METADATA_CORS_HEADERS,
+            'access-control-allow-origin': origin ?? '*',
+            'access-control-expose-headers': 'WWW-Authenticate, Mcp-Session-Id',
+            ...(origin ? { Vary: 'Origin' } : {}),
+          });
           res.end();
           return;
         }
         if (req.method === 'GET') {
-          serveResourceMetadata(res, config);
+          serveResourceMetadata(res, config, origin);
           return;
         }
-        res.writeHead(405, METADATA_CORS_HEADERS).end('Method Not Allowed');
+        res.writeHead(405, {
+          ...METADATA_CORS_HEADERS,
+          'access-control-allow-origin': origin ?? '*',
+          'access-control-expose-headers': 'WWW-Authenticate, Mcp-Session-Id',
+          ...(origin ? { Vary: 'Origin' } : {}),
+        }).end('Method Not Allowed');
         return;
       }
-
       if (req.method === 'OPTIONS' && url.pathname === MCP_PATH) {
-        handleOptions(res);
+        if (!req.headers.host || !permittedHosts.has(req.headers.host.toLowerCase())) {
+          res.writeHead(403).end('Forbidden');
+          return;
+        }
+        const origin = req.headers.origin;
+        if (origin && !allowedOrigins.has(origin)) {
+          res.writeHead(403).end('Forbidden');
+          return;
+        }
+        res.writeHead(204, {
+          'Access-Control-Allow-Origin': origin ?? '*',
+          'Access-Control-Allow-Methods': 'POST, GET, DELETE, OPTIONS',
+          'Access-Control-Allow-Headers': 'content-type, mcp-session-id, authorization, mcp-protocol-version, last-event-id',
+          'Access-Control-Expose-Headers': 'WWW-Authenticate, Mcp-Session-Id',
+          ...(origin ? { Vary: 'Origin' } : {}),
+        });
+        res.end();
         return;
       }
 
@@ -132,36 +194,42 @@ function serveHttp(): Promise<void> {
         return;
       }
 
-      // Auth0 gate (fails closed when AUTH0_ISSUER/AUTH0_AUDIENCE are set).
+      if (!req.headers.host || !permittedHosts.has(req.headers.host.toLowerCase())) {
+        res.writeHead(403).end('Forbidden');
+        return;
+      }
+      const origin = req.headers.origin;
+      if (origin && !allowedOrigins.has(origin)) {
+        res.writeHead(403).end('Forbidden');
+        return;
+      }
+      const auth = req.headers.authorization ?? '';
+      const match = /^Bearer\s+(.+)$/i.exec(auth);
+      const presented = match?.[1].trim();
+      if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+      } else {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+      }
+      res.setHeader('Access-Control-Expose-Headers', 'WWW-Authenticate, Mcp-Session-Id');
+
       const gate = await gateRequest(req, config);
-      if (!gate.ok) {
+      const staticAuthorized = Boolean(config.authToken) && presented === config.authToken;
+      if ((auth0Enabled && !gate.ok) || (config.authToken && !staticAuthorized)) {
         res.writeHead(401, {
           'content-type': 'application/json',
-          'WWW-Authenticate': challengeFor(config),
+          ...(auth0Enabled ? { 'www-authenticate': challengeFor(config) } : {}),
         }).end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }
-
-      // Identity propagation: the VERIFIED token (gate.token) is handed to the
-      // per-request bridge, which forwards it to the backend as Authorization
-      // so the Firebase API scopes the call to the caller's verified `sub`.
-      const bearerToken = gate.token ?? undefined;
-
-      // Optional static Bearer gate (defense in depth behind a tunnel).
-      if (config.authToken) {
-        const auth = req.headers.authorization ?? '';
-        if (auth !== `Bearer ${config.authToken}`) {
-          res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Unauthorized' }));
-          return;
-        }
-      }
-
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+      // Only a verified Auth0 token is forwarded as request-scoped identity.
+      const bearerToken = auth0Enabled ? gate.token ?? undefined : undefined;
 
       const server = createAppServer(bearerToken);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined, // stateless mode — one server per request
+        maxRequestBodySize: MCP_HTTP_MAX_REQUEST_BODY_SIZE,
         enableJsonResponse: true,
       });
 

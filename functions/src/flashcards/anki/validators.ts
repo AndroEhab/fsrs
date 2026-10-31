@@ -9,12 +9,10 @@
  */
 import { z } from 'zod';
 import {
-  ANKI_MAX_APKG_BYTES, ExportApkgInput, ImportApkgInput,
+  ANKI_MAX_APKG_BASE64_LENGTH, ANKI_MAX_APKG_BYTES, ExportApkgInput, ImportApkgInput,
 } from './types';
 import { ValidationError } from '../validators';
 
-/** base64 length ceiling for a decoded .apkg of ANKI_MAX_APKG_BYTES. */
-export const IMPORT_PACKAGE_MAX_LENGTH = Math.ceil((ANKI_MAX_APKG_BYTES * 4) / 3) + 8;
 
 const deckPathSchema = z.string()
   .min(1, 'deckPath cannot be empty')
@@ -24,7 +22,7 @@ const deckPathSchema = z.string()
   });
 
 const importApkgSchema = z.object({
-  package: z.string().min(1, 'package is required').max(IMPORT_PACKAGE_MAX_LENGTH, `package too large (max ${ANKI_MAX_APKG_BYTES} bytes decoded)`),
+  package: z.string().min(1, 'package is required').max(ANKI_MAX_APKG_BASE64_LENGTH, `package too large (max ${ANKI_MAX_APKG_BYTES} bytes decoded)`),
   deckPath: deckPathSchema.optional(),
 }).strict() satisfies z.ZodType<ImportApkgInput>;
 

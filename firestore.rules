@@ -40,6 +40,11 @@ service cloud.firestore {
       match /queueChunks/{chunkIndex} {
         allow read, write: if false;
       }
+
+      // Request idempotency claims are private session children like queue chunks.
+      match /requestClaims/{requestIdHash} {
+        allow read, write: if false;
+      }
     }
 
     // Review events (append-only review history) - admin-only

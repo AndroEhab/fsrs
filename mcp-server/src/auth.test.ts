@@ -1,7 +1,8 @@
+import { afterEach, describe, expect, it, jest } from '@jest/globals';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type GenerateKeyPairResult } from 'jose';
 import type { ServerResponse } from 'node:http';
-import { ServerConfig } from './config';
-import { OAUTH_RESOURCE_METADATA_MCP_PATH, OAUTH_RESOURCE_METADATA_PATH, challengeFor, gateRequest, getJwks, invalidateJwksCache, serveResourceMetadata, shouldEnforceAuth, verifyAuth0Token } from './auth';
+import { ServerConfig, shouldEnforceAuth } from './config';
+import { OAUTH_RESOURCE_METADATA_MCP_PATH, OAUTH_RESOURCE_METADATA_PATH, challengeFor, gateRequest, getJwks, invalidateJwksCache, serveResourceMetadata, verifyAuth0Token } from './auth';
 
 type KeyPair = GenerateKeyPairResult;
 
@@ -17,6 +18,7 @@ function config(overrides: Partial<ServerConfig> = {}): ServerConfig {
     host: '127.0.0.1',
     transport: 'http',
     authToken: '',
+    backendAuthToken: '',
     requestTimeoutMs: 15000,
     auth0Issuer: ISSUER,
     auth0Audience: AUDIENCE,
@@ -38,10 +40,13 @@ describe('shouldEnforceAuth', () => {
     expect(shouldEnforceAuth(config())).toBe(true);
   });
 
-  it('does not enforce when Auth0 config is missing (local/dev remains usable)', () => {
+  it('does not enforce when both Auth0 values are absent (static/local mode)', () => {
     expect(shouldEnforceAuth(config({ auth0Issuer: '', auth0Audience: '' }))).toBe(false);
-    expect(shouldEnforceAuth(config({ auth0Issuer: '', auth0Audience: AUDIENCE }))).toBe(false);
-    expect(shouldEnforceAuth(config({ auth0Issuer: ISSUER, auth0Audience: '' }))).toBe(false);
+  });
+
+  it('treats either partial Auth0 value as an enforcement request', () => {
+    expect(shouldEnforceAuth(config({ auth0Issuer: '', auth0Audience: AUDIENCE }))).toBe(true);
+    expect(shouldEnforceAuth(config({ auth0Issuer: ISSUER, auth0Audience: '' }))).toBe(true);
   });
 
   it('never enforces on stdio (local no-auth transport stays usable)', () => {
@@ -239,6 +244,12 @@ describe('protected resource metadata', () => {
     const { res, state } = capture();
     serveResourceMetadata(res, config());
     expect(state.headers['access-control-allow-origin']).toBe('*');
+  });
+  it('echoes an explicitly validated origin rather than wildcard CORS', () => {
+    const { res, state } = capture();
+    serveResourceMetadata(res, config(), 'https://chatgpt.com');
+    expect(state.headers['access-control-allow-origin']).toBe('https://chatgpt.com');
+    expect(state.headers.vary).toBe('Origin');
   });
 
   it('exposes the two metadata paths used by the connector and an absolute challenge', () => {

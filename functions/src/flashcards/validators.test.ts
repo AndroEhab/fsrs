@@ -348,6 +348,9 @@ describe('Bulk Validators', () => {
       const cards = Array(BULK_LIMIT + 1).fill({ id: 'a' });
       expect(() => validateBulkUpdateFlashcards({ cards })).toThrow(ValidationError);
     });
+    it('rejects ids that are not flat Firestore document ids', () => {
+      expect(() => validateBulkUpdateFlashcards({ cards: [{ id: 'nested/card' }] })).toThrow(ValidationError);
+    });
   });
 
   describe('validateBulkDeleteFlashcards', () => {
@@ -362,6 +365,9 @@ describe('Bulk Validators', () => {
 
     it('rejects empty id string', () => {
       expect(() => validateBulkDeleteFlashcards({ ids: [''] })).toThrow(ValidationError);
+    });
+    it('rejects ids that are not flat Firestore document ids', () => {
+      expect(() => validateBulkDeleteFlashcards({ ids: ['nested/card'] })).toThrow(ValidationError);
     });
 
     it('rejects more than the bulk limit', () => {
@@ -633,6 +639,9 @@ describe('Review Session Validators', () => {
       expect(() => validateStartReviewSession({ tags: [] })).toThrow(ValidationError);
       expect(() => validateStartReviewSession({ cardIds: [] })).toThrow(ValidationError);
     });
+    it('rejects card ids that are not flat Firestore document ids', () => {
+      expect(() => validateStartReviewSession({ cardIds: ['nested/card'] })).toThrow(ValidationError);
+    });
 
     it('accepts a LARGE card id allowlist (101+ ids — no session cap)', () => {
       // Regression for the removed 100-card session cap: an explicit
@@ -785,6 +794,16 @@ describe('Rich query (searchCards) validators', () => {
       expect(data.tagsAll).toEqual(['a', 'b']);
       expect(data.suspended).toBe(false);
     });
+    it('accepts persisted deck-name and deck-ID limits in repeated search arrays', () => {
+      const deckName = 'a'.repeat(300);
+      const deckId = 'd'.repeat(100);
+      const data = validateSearchCardsQuery({ deckNames: [deckName], decks: [deckId] });
+      expect(data.deckNames).toEqual([deckName]);
+      expect(data.decks).toEqual([deckId]);
+      expect(() => validateSearchCardsQuery({ deckNames: ['a'.repeat(301)] })).toThrow(ValidationError);
+      expect(() => validateSearchCardsQuery({ decks: ['d'.repeat(101)] })).toThrow(ValidationError);
+      expect(() => validateSearchCardsQuery({ deckNames: Array(21).fill('valid') })).toThrow(ValidationError);
+    });
 
     it('rejects multiple tag modes at once', () => {
       expect(() => validateSearchCardsQuery({ tagsAny: ['a'], tagsAll: ['b'] })).toThrow(ValidationError);
@@ -799,13 +818,18 @@ describe('Rich query (searchCards) validators', () => {
       expect(() => validateSearchCardsQuery({ pageSize: 101 })).toThrow(ValidationError);
     });
 
-    it('rejects invalid calendar dates that Date.UTC would silently normalize', () => {
+    it('validates ISO calendar dates, including Firestore years 0001–0099', () => {
       expect(() => validateSearchCardsQuery({ createdFrom: '2026-02-31' })).toThrow(ValidationError);
       expect(() => validateSearchCardsQuery({ createdTo: '2026-13-01' })).toThrow(ValidationError);
       expect(() => validateSearchCardsQuery({ updatedFrom: '2026-04-31' })).toThrow(ValidationError);
-      // Valid leap day and month-end pass.
+      expect(() => validateSearchCardsQuery({ createdFrom: '2026-02-31T00:00:00.000Z' })).toThrow(ValidationError);
+      expect(() => validateSearchCardsQuery({ createdFrom: 'August 1, 2026' })).toThrow(ValidationError);
+      expect(() => validateSearchCardsQuery({ createdFrom: '0000-01-01' })).toThrow(ValidationError);
+      expect(() => validateSearchCardsQuery({ createdFrom: '0099-01-01' })).not.toThrow();
+      expect(() => validateSearchCardsQuery({ createdFrom: '0001-01-01' })).not.toThrow();
       expect(() => validateSearchCardsQuery({ createdFrom: '2024-02-29' })).not.toThrow();
       expect(() => validateSearchCardsQuery({ createdTo: '2026-08-31' })).not.toThrow();
+
     });
 
     it('rejects a suspended value other than true/false', () => {
@@ -821,19 +845,17 @@ describe('Rich query (searchCards) validators', () => {
     });
 
     it('rejects a pageToken that does not pair with identical filters', () => {
-      // Mint a real token for a specific filter set, then change the filters.
-      const token = validateSearchCardsQuery({ search: 'paris', pageSize: 1 });
-      // Build a token from the search module the same way the service does.
       const { normalizeSearchFilters, makeSearchPageToken } = require('./search');
-      const t = makeSearchPageToken(normalizeSearchFilters({ search: 'paris' }), 'card-x', 1234);
-      // Same filters + token → valid.
+      const t = makeSearchPageToken(
+        normalizeSearchFilters({ search: 'paris' }),
+        'owner',
+        'card-x',
+        1_700_000_000,
+        123_000_000,
+      );
       expect(() => validateSearchCardsQuery({ search: 'paris', pageToken: t })).not.toThrow();
-      // Different filters + token → rejected.
       expect(() => validateSearchCardsQuery({ search: 'lyon', pageToken: t })).toThrow(ValidationError);
-      // Malformed token → rejected.
       expect(() => validateSearchCardsQuery({ pageToken: 'garbage' })).toThrow(ValidationError);
-      // `token` var is unused; keep lint quiet.
-      void token;
     });
   });
 
@@ -943,6 +965,9 @@ describe('validateSchedulingActionIds', () => {
 
   it('rejects an empty card id string', () => {
     expect(() => validateSchedulingActionIds({ ids: ['card-1', ''] })).toThrow(ValidationError);
+  });
+  it('rejects ids that are not flat Firestore document ids', () => {
+    expect(() => validateSchedulingActionIds({ ids: ['nested/card'] })).toThrow(ValidationError);
   });
 
   it('rejects a missing ids field', () => {

@@ -1,25 +1,11 @@
 #!/usr/bin/env node
 /**
- * Forwarded-token smoke check for the FSRS MCP server.
- *
- * Verifies the multi-tenant identity-propagation contract end-to-end:
- *   1. NO-TOKEN: an HTTP POST to /mcp WITHOUT an Authorization header while
- *      Auth0 is configured is rejected with 401 (fails closed).
- *   2. FORWARDED-TOKEN: with a valid (locally signed, RS256) Auth0 JWT, the
- *      /mcp request passes the gate and the server forwards the SAME token
- *      as `Authorization: Bearer <token>` to the backend. A stub backend
- *      (loopback HTTP) captures the header and the health tool call asserts
- *      the forwarded value equals the presented token — proving the verified
- *      token is propagated per request and not swapped/cleared.
- *
- * The token is signed by an ephemeral local key whose JWKS the server is
- * pointed at (issuer = the loopback stub), so no real Auth0 tenant or network
- * is needed. The backend the MCP server calls is the stub, so this smoke
- * never touches production.
- *
- * Run: node scripts/forwarded-token-smoke.mjs   (after npm run build)
+ * Live HTTP smoke for per-user auth, Host/Origin protections, and browser CORS.
+ * Uses ephemeral local RS256/JWKS and a local ownership-aware backend fixture.
+ * Run after building; never touches production services or credentials.
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { request as httpRequest } from 'node:http';
 import { createServer } from 'node:http';
 import { generateKeyPairSync, createSign } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -41,27 +27,55 @@ function signJwt(payload, privateKey, kid) {
   return `${header}.${body}.${sig}`;
 }
 
+
+function postWithHost(host, headers, id) {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ hostname: '127.0.0.1', port: MCP_PORT, path: '/mcp', method: 'POST', headers: { ...headers, Host: host } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify({ jsonrpc: '2.0', id, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0.0' } } }));
+  });
+}
 async function main() {
   const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const jwk = publicKey.export({ format: 'jwk' });
   const kid = 'smoke-kid';
   const jwks = { keys: [{ kid, alg: 'RS256', use: 'sig', kty: 'RSA', n: jwk.n, e: jwk.e }] };
 
-  // Captured forwarded Authorization header from the MCP server's backend call.
-  let forwardedAuth = null;
+  const tokenSubjects = new Map();
+  const backendRequests = [];
+  const cardsByOwner = new Map([
+    ['auth0|smoke-user-1', { 'user-1-card': { id: 'user-1-card', front: 'Owned by user 1', back: 'answer 1', tags: [], createdAt: { _seconds: 1700000000, _nanoseconds: 0 }, updatedAt: { _seconds: 1700000000, _nanoseconds: 0 }, due: { _seconds: 1700000000, _nanoseconds: 0 }, state: 0, stability: 0, difficulty: 0, reps: 0, lapses: 0, reviewLog: [], images: [] } }],
+    ['auth0|smoke-user-2', { 'user-2-card': { id: 'user-2-card', front: 'Owned by user 2', back: 'answer 2', tags: [], createdAt: { _seconds: 1700000000, _nanoseconds: 0 }, updatedAt: { _seconds: 1700000000, _nanoseconds: 0 }, due: { _seconds: 1700000000, _nanoseconds: 0 }, state: 0, stability: 0, difficulty: 0, reps: 0, lapses: 0, reviewLog: [], images: [] } }],
+  ]);
   const backend = createServer((req, res) => {
-    let body = '';
-    req.on('data', (d) => { body += d; });
+    req.resume();
     req.on('end', () => {
       if (req.url === '/auth0/.well-known/jwks.json') {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(jwks));
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(jwks));
         return;
       }
-      if (req.url.startsWith('/health')) {
-        forwardedAuth = req.headers.authorization ?? null;
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString(), sawAuth: forwardedAuth }));
+      if (req.headers['x-api-key'] !== 'smoke-backend-key') {
+        res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Invalid API key' }));
+        return;
+      }
+      const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
+      const subject = token ? tokenSubjects.get(token) : undefined;
+      backendRequests.push({ token, subject, url: req.url });
+      if (!subject) {
+        res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Verified user identity required' }));
+        return;
+      }
+      if (req.url.startsWith('/getFlashcardHandler/')) {
+        const id = decodeURIComponent(req.url.slice('/getFlashcardHandler/'.length));
+        const card = cardsByOwner.get(subject)?.[id];
+        if (!card) {
+          res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Card not found' }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(card));
         return;
       }
       res.writeHead(404).end();
@@ -69,14 +83,50 @@ async function main() {
   });
   await new Promise((resolve) => backend.listen(BACKEND_PORT, '127.0.0.1', resolve));
 
+  const invalidConfigurations = [
+    { MCP_AUTH_TOKEN: 'static', AUTH0_ISSUER: LOCAL_ISSUER, AUTH0_AUDIENCE: AUDIENCE },
+    { MCP_AUTH_TOKEN: '', AUTH0_ISSUER: LOCAL_ISSUER, AUTH0_AUDIENCE: '', MCP_BACKEND_AUTH_TOKEN: '' },
+    { MCP_AUTH_TOKEN: '', AUTH0_ISSUER: '', AUTH0_AUDIENCE: AUDIENCE, MCP_BACKEND_AUTH_TOKEN: '' },
+    { MCP_AUTH_TOKEN: '', AUTH0_ISSUER: LOCAL_ISSUER, AUTH0_AUDIENCE: AUDIENCE, MCP_BACKEND_AUTH_TOKEN: 'trusted-process-token' },
+  ];
+  for (const [index, invalid] of invalidConfigurations.entries()) {
+    const rejected = spawnSync(process.execPath, ['dist/index.js'], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: {
+        PATH: process.env.PATH,
+        SystemRoot: process.env.SystemRoot,
+        TEMP: process.env.TEMP,
+        TMP: process.env.TMP,
+        HOME: process.env.HOME,
+        MCP_TRANSPORT: 'http', MCP_HOST: '127.0.0.1', MCP_PORT: String(MCP_PORT),
+        FSRS_API_BASE_URL: `http://127.0.0.1:${BACKEND_PORT}`,
+        CUELINGUA_API_KEY: 'smoke-backend-key', MCP_AUTH_OPT_OUT: 'false',
+        AUTH0_ISSUER: '', AUTH0_AUDIENCE: '', MCP_AUTH_TOKEN: '',
+        ...invalid,
+      },
+    });
+    if (rejected.status === 0 || !rejected.stderr.includes('Invalid authentication configuration')) {
+      throw new Error(`invalid auth configuration ${index + 1} was not rejected at startup`);
+    }
+  }
+  console.log('PASS startup rejects mixed and incomplete Auth0/static auth settings');
+
   const child = spawn(process.execPath, ['dist/index.js'], {
     env: {
-      ...process.env,
+      PATH: process.env.PATH,
+      SystemRoot: process.env.SystemRoot,
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+      HOME: process.env.HOME,
       MCP_TRANSPORT: 'http',
       MCP_PORT: String(MCP_PORT),
       MCP_HOST: '127.0.0.1',
       FSRS_API_BASE_URL: `http://127.0.0.1:${BACKEND_PORT}`,
       CUELINGUA_API_KEY: 'smoke-backend-key',
+      MCP_AUTH_TOKEN: '',
+      MCP_BACKEND_AUTH_TOKEN: '',
+      MCP_AUTH_OPT_OUT: 'false',
       AUTH0_ISSUER: LOCAL_ISSUER,
       AUTH0_AUDIENCE: AUDIENCE,
       MCP_RESOURCE_URL: `http://127.0.0.1:${MCP_PORT}/mcp`,
@@ -97,6 +147,34 @@ async function main() {
   if (!ready) throw new Error('MCP server did not become ready');
 
   const base = `http://127.0.0.1:${MCP_PORT}/mcp`;
+  const preflight = await fetch(base, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'https://chatgpt.com',
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'content-type,authorization,mcp-protocol-version,last-event-id',
+    },
+  });
+  if (preflight.status !== 204
+    || preflight.headers.get('access-control-allow-origin') !== 'https://chatgpt.com'
+    || !preflight.headers.get('access-control-allow-headers')?.includes('mcp-protocol-version')
+    || !preflight.headers.get('access-control-allow-headers')?.includes('last-event-id')) {
+    throw new Error(`MCP CORS preflight failed: ${preflight.status} ${preflight.headers.get('access-control-allow-headers')}`);
+  }
+  console.log('PASS browser-style MCP preflight advertises protocol and Last-Event-ID headers');
+
+  const unauthorizedBrowser = await fetch(base, {
+    method: 'POST',
+    headers: { Origin: 'https://chatgpt.com', 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0.0' } } }),
+  });
+  if (unauthorizedBrowser.status !== 401
+    || !unauthorizedBrowser.headers.get('access-control-allow-origin')
+    || !unauthorizedBrowser.headers.get('access-control-expose-headers')?.toLowerCase().includes('www-authenticate')
+    || !unauthorizedBrowser.headers.get('www-authenticate')?.includes('resource_metadata=')) {
+    throw new Error('allowed Origin did not receive a browser-readable RFC 9728 401 challenge');
+  }
+  console.log('PASS unauthorized allowed-Origin response exposes RFC 9728 challenge');
 
   // 1. NO-TOKEN: must fail closed with 401 + RFC 9728 challenge.
   const noToken = await fetch(base, {
@@ -128,33 +206,58 @@ async function main() {
     Accept: 'application/json, text/event-stream',
     Authorization: `Bearer ${token}`,
   };
-
-  const initRes = await fetch(base, {
+  const hostileHostStatus = await postWithHost('attacker.invalid', authorizedHeaders, 4);
+  if (hostileHostStatus !== 403) throw new Error(`hostile Host expected 403, got ${hostileHostStatus}`);
+  const hostileOrigin = await fetch(base, {
     method: 'POST',
-    headers: authorizedHeaders,
-    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0.0' } } }),
+    headers: { ...authorizedHeaders, Origin: 'https://attacker.invalid' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0.0' } } }),
   });
-  const initBody = await initRes.json();
-  if (!initRes.ok || initBody.error) {
-    throw new Error(`authorized initialize failed: ${JSON.stringify(initBody)}`);
+  if (hostileOrigin.status !== 403 || hostileOrigin.headers.get('access-control-allow-origin') !== null) {
+    throw new Error(`hostile Origin expected 403 without reflected CORS grant, got ${hostileOrigin.status}`);
   }
-  console.log('PASS authorized /mcp initialize → token accepted');
+  console.log('PASS hostile Host/Origin rejected (403) with a valid Auth0 token');
 
-  // tools/call health must forward the SAME token to the backend.
-  const healthRes = await fetch(base, {
+  const allowedOrigin = await fetch(base, {
     method: 'POST',
-    headers: authorizedHeaders,
-    body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'health', arguments: {} } }),
+    headers: { ...authorizedHeaders, Origin: 'https://chatgpt.com' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0.0' } } }),
   });
-  const healthBody = await healthRes.json();
-  if (healthBody.error) {
-    throw new Error(`health call failed: ${JSON.stringify(healthBody)}`);
+  if (!allowedOrigin.ok || allowedOrigin.headers.get('access-control-allow-origin') !== 'https://chatgpt.com') {
+    throw new Error(`allowed ChatGPT Origin was not accepted with scoped CORS (${allowedOrigin.status})`);
   }
-  await sleep(150);
-  if (forwardedAuth !== `Bearer ${token}`) {
-    throw new Error(`forwarded Authorization mismatch: got ${JSON.stringify(forwardedAuth)}, want Bearer ${token}`);
+  console.log('PASS authorized ChatGPT Origin accepted with exact CORS origin');
+
+  const getCard = async (cardId, authHeaders, requestId) => fetch(base, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({ jsonrpc: '2.0', id: requestId, method: 'tools/call', params: { name: 'get_flashcard', arguments: { id: cardId } } }),
+  });
+  const tokenForUser1 = signJwt({ iss: LOCAL_ISSUER, aud: AUDIENCE, sub: 'auth0|smoke-user-1', iat: Math.floor(Date.now() / 1000) - 5, exp: Math.floor(Date.now() / 1000) + 3600 }, privateKey, kid);
+  const tokenForUser2 = signJwt({ iss: LOCAL_ISSUER, aud: AUDIENCE, sub: 'auth0|smoke-user-2', iat: Math.floor(Date.now() / 1000) - 5, exp: Math.floor(Date.now() / 1000) + 3600 }, privateKey, kid);
+  tokenSubjects.set(tokenForUser1, 'auth0|smoke-user-1');
+  tokenSubjects.set(tokenForUser2, 'auth0|smoke-user-2');
+  const user1Headers = { ...authorizedHeaders, Authorization: `Bearer ${tokenForUser1}` };
+  const user2Headers = { ...authorizedHeaders, Authorization: `Bearer ${tokenForUser2}` };
+  const [user1CardResponse, user2CardResponse, wrongOwnerResponse] = await Promise.all([
+    getCard('user-1-card', user1Headers, 10),
+    getCard('user-2-card', user2Headers, 11),
+    getCard('user-1-card', user2Headers, 12),
+  ]);
+  const user1Card = (await user1CardResponse.json()).result?.structuredContent;
+  const user2Card = (await user2CardResponse.json()).result?.structuredContent;
+  const wrongOwner = (await wrongOwnerResponse.json()).result;
+  if (user1Card?.id !== 'user-1-card' || user2Card?.id !== 'user-2-card' || wrongOwner?.isError !== true) {
+    throw new Error('caller-owned reads crossed user boundaries');
   }
-  console.log('PASS forwarded-token: backend received Authorization: Bearer <same verified token>');
+  const ownerRequests = backendRequests.filter((request) => request.url.startsWith('/getFlashcardHandler/'));
+  if (ownerRequests.length !== 3
+    || ownerRequests[0].token !== tokenForUser1 || ownerRequests[0].subject !== 'auth0|smoke-user-1'
+    || ownerRequests[1].token !== tokenForUser2 || ownerRequests[1].subject !== 'auth0|smoke-user-2'
+    || ownerRequests[2].token !== tokenForUser2 || ownerRequests[2].subject !== 'auth0|smoke-user-2') {
+    throw new Error('verified backend identity was not scoped to each request');
+  }
+  console.log('PASS interleaved callers retain isolated, owner-scoped backend identity');
 
   console.log('\nFORWARDED-TOKEN SMOKE OK');
   child.kill();

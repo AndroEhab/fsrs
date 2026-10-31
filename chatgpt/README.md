@@ -47,14 +47,16 @@ additions.
 | `client.mjs` | Node CLI client to smoke-test the contract against a running server. |
 | `mock-server.mjs` | Local server implementing the exact `openapi.yaml` contract for testing without Firebase. |
 | `validate-schema.mjs` | Structural validation of `openapi.yaml` (`npm run validate`). |
-| `package.json` | Scripts: `npm run mock`, `npm run client`, `npm run validate`. |
+| `package.json` | Scripts: `npm run mock`, `npm run client`, `npm run validate`, `npm run smoke`. |
+| `mock-server.smoke.mjs` | Safe local smoke for client URL handling and mock validation/atomicity; `npm run smoke`. |
 
 ## API contract (GPT-Action era — see mcp-server/ for the current contract)
 
-The backend (`functions/src/index.ts`) deploys **each handler as a separate
-named Cloud Function** — there is **no `/api` router prefix**. Card ids are
-appended to the function URL path. Auth: `X-API-Key` header, enforced by the
-backend **only when `NODE_ENV=production`**; `health` is always public.
+The backend (`functions/src/index.ts`) deploys each handler as a separate
+named Cloud Function; there is no `/api` router prefix. This directory is
+superseded and does not describe the current MCP integration. The backend
+requires BOTH `X-API-Key` and a verified Auth0 RS256 Bearer JWT on every
+protected route outside the emulator; `/health` is public.
 
 | Method | Path (function name) | OperationId | Purpose |
 | --- | --- | --- | --- |
@@ -62,9 +64,9 @@ backend **only when `NODE_ENV=production`**; `health` is always public.
 | POST | `/createFlashcardHandler` | `createFlashcard` | Create a card (front/back, optional `deckId`/`deck`/tags) |
 | POST | `/bulkCreateFlashcardsHandler` | `bulkCreateFlashcards` | Atomically create up to 100 cards (`{ cards: [...] }` → `201 { cards }`) |
 | GET | `/listFlashcardsHandler` | `listFlashcards` | List (filters `deckId`/`deck`, `tags` ANY-of; pagination `pageSize`, `pageToken`) |
-| GET | `/dueFlashcardsHandler` | `getDueFlashcards` | Active cards due for review now (new + scheduled; suspended cards excluded), earliest due first; optional `deckId`/`deck` + pagination |
+| GET | `/searchCardsHandler` | `searchCards` | Rich query with repeated literal `tagsAny`/`tagsAll`/`tagsNot`, `decks`, and `deckNames` filters (commas and whitespace preserved; bounds: 20 values, tags 50 chars, ids 100 chars, names 300 chars), plus text/review/suspension/date filters and pagination |
 | POST | `/startReviewSessionHandler` | `startReviewSession` | Start a persistent review session: snapshot EVERY matching card (the due queue, or optional `deckId`/`deck`/`tags`/`cardIds` selectors — never capped, earliest due first); reports mode/dueCount/remainingCount; returns session + first card |
-| GET | `/getReviewSessionHandler/{sessionId}` | `getReviewSession` | Get a review session (any status) plus its current card; only the starting API key can read it (403 otherwise) |
+| GET | `/getReviewSessionHandler/{sessionId}` | `getReviewSession` | Get a review session plus its current card; authenticated `ownerId` is required (403 otherwise) |
 | POST | `/submitSessionReviewHandler/{sessionId}` | `submitSessionReview` | Rate the session's expected current card (`{ rating, reviewAt? }`); atomically applies FSRS and advances the session; returns session + next card |
 | POST | `/endReviewSessionHandler/{sessionId}` | `endReviewSession` | End an active review session without rating the rest (idempotent; status → `ended`) |
 | GET | `/getFlashcardHandler/{id}` | `getFlashcard` | Get one card |
@@ -83,49 +85,55 @@ backend **only when `NODE_ENV=production`**; `health` is always public.
 | POST | `/attachImageHandler/{cardId}` | `attachImage` | Attach an image to a card by URL (`{ url, alt?, mimeType? }` → `201 { card, image }`); validated http(s), allowed MIME/extension, ≤5 per card |
 | POST | `/uploadImageHandler/{cardId}` | `uploadImage` | Upload an image (base64) to Firebase Storage (`{ data, fileName, contentType, alt? }` → `201 { card, image }`); ≤10 MiB, raster MIME only (no SVG), persists cloud metadata |
 | GET | `/listImagesHandler/{cardId}` | `listImages` | List a card's image attachments (`200 { cardId, images }`; URL refs + cloud metadata: id, storagePath, downloadUrl, sizeBytes) |
-| DELETE | `/removeImageHandler/{cardId}` | `removeImage` | Remove an image by its exact URL (`200 { cardId, removed }`; only the card's reference, not the hosted file) |
+| DELETE | `/removeImageHandler/{cardId}` | `removeImage` | Remove an image by URL (`200 { cardId, removed }`); direct URL references match byte-for-byte, while an owned Storage image can be removed using an older signed URL for the same bucket/object; successful removal deletes only that card's Storage object |
 
 Validation limits (mirror `functions/src/flashcards/validators.ts`):
-`front`/`back` 1–10000 chars; `deckId`/`deck` ≤100; `tags` ≤20 items, each 1–50
-chars. Image attachments: URL 1–2048 chars, `http(s)` only, allowed MIME
-`image/jpeg|png|gif|webp|avif|bmp|svg+xml` (declared or inferred from path
-extension), at most **5 per card** (`MAX_CARD_IMAGES`). Uploads: decoded ≤ **10 MiB**, raster MIME only (jpeg/png/gif/webp/avif/bmp; SVG not accepted), fileName ≤255, base64 payload ≤ ~14 MiB. `listFlashcards` filters
-tags with `array-contains-any` (ANY match) and pages via `pageToken` = last card
-id of the previous page.
+`front`/`back` 1–10000 chars; `deckId` and legacy `deck` fields plus
+list/due/count `deckId`/`deck` filters are ≤100 chars. `searchCards` accepts
+up to 20 `decks` IDs (≤100 chars each) or up to 20 `deckNames` (≤300 chars
+each). `tags` ≤20 items, each 1–50 chars. Image attachments: URL 1–2048 chars,
+`http(s)` only, allowed MIME `image/jpeg|png|gif|webp|avif|bmp|svg+xml`
+(declared or inferred from path extension), at most **5 per card**
+(`MAX_CARD_IMAGES`). Uploads: decoded ≤ **10 MiB**, raster MIME only (jpeg/png/gif/webp/avif/bmp; SVG not accepted), fileName ≤255, base64 payload ≤ ~14 MiB. `listFlashcards` filters
+tags with `array-contains-any` (ANY match). List/deck pages order by
+`createdAt` descending then document ID descending; due pages order by `due`
+ascending then document ID ascending. Pagination tokens are opaque and bound
+to the authenticated owner and query selectors; pass each `nextPageToken`
+back unchanged.
 
-**Operation count:** `openapi.yaml` exposes **25 operations** — the 24 user-facing
-endpoints plus `migrateDecks` (a maintenance route: backfill `deckId` from
-legacy `deck` names; idempotent and paged, call repeatedly until `migrated: 0`).
+**Maintenance route:** `migrateDecks` backfills `deckId` from legacy `deck`
+names; it is idempotent and paged, so call repeatedly until `migrated: 0`.
 
-**Review sessions** (`startReviewSession` → `submitSessionReview` → …) are
-persistent: `startReviewSession` snapshots EVERY matching card id (ordered
-earliest-due first, optional `deckId`/`deck`/`tags`/`cardIds` selectors) into
-the session queue on the backend (`reviewSessions` collection) — the queue is
-NEVER capped (a client-supplied `limit` is rejected) — so the same
-session can be resumed across turns. Every session reports its `mode`
-(`spaced_repetition`), the EXACT `dueCount` captured at start, and the full
-`cardIds` snapshot (`limit` always equals `cardIds.length`; `truncated`/
-`continuationAvailable` are only present on legacy pre-cap sessions). Each
-`submitSessionReview` atomically
-applies the FSRS scheduler to the session's **expected current card** AND
-advances the session (currentIndex, reviewedCount, ratingCounts, status) in one
-Firestore transaction — retries and concurrent submissions can never
-double-apply a review or lose progress; cards deleted since the snapshot are
-skipped automatically and the response always returns the next LIVE card
-(never `card: null` while cards remain). The session exposes `status`
-(`active`/`completed`/`ended`), `ratingCounts` (again/hard/good/easy + numeric
-map), `reviewedCount`/`currentIndex`/`remainingCount`, `cardIds`, `dueCount`,
-and timestamps; the response always includes the next card to review (null
-when the queue is exhausted). Every session response leads with the
-human-readable mode tag **"[Spaced repetition review · N cards due]"** (N =
-the exact `dueCount`) plus progress ("X reviewed, Y remaining of N"). On
-completion the client text says "Review session complete — choose Finish (all
-due cards were reviewed)" (legacy sessions that started before the cap was
-removed may still offer Continue via `continuationAvailable`).
-Sessions are scoped to the API key that started them: `getReviewSession`,
-`submitSessionReview`, and `endReviewSession` with a different key return 403.
-Use `endReviewSession` (idempotent) to abandon an unfinished session. Sessions
-snapshot every matching card — never capped.
+**Review sessions** (`startReviewSession` → `getReviewSession` →
+`submitSessionReview`) snapshot every selected card once: no selectors use the
+due queue; `deckId`/`deck`/`tags`/`cardIds` selectors define a stable snapshot
+and may include non-due cards. New v2 sessions store the full queue in
+`queueChunks` (200 positions per chunk), not in root `cardIds`,
+`reviewedCardIds`, `processedRequestIds`, or `source.cardIds` arrays. Responses
+carry the current card and a bounded `queueWindow` (current position/card plus
+up to 100 upcoming positions); `preloaded` carries up to 100 upcoming card
+summaries. Legacy v1/no-version sessions retain their array-based response
+shape. `dueCount` equals the due-queue count when no selectors are supplied;
+selector-defined sessions may include non-due cards.
+
+Ratings update the card's FSRS state and session progress atomically. On v2,
+`expectedCardId` without `expectedPosition` must match the current live card;
+a stale or different id is rejected with 409. A client may address a pending
+queue position with `expectedPosition`, optionally confirming its card id with
+`expectedCardId`; a target already claimed by a different request or an
+out-of-range position conflicts. Deleted targets are skipped without a rating;
+v2 persists the skip and adjusts remaining progress. Legacy sessions retain
+their separate array-based lookup. A supplied `requestId` is recorded
+atomically as a retry receipt, so replay does not apply the rating twice.
+
+The lifecycle is `active`, `completed`, `ended`, or `failed` (a failed v2
+queue build is not reviewable). v2 Continue copies the same chunked snapshot
+into a new session via `repeatSessionId`; legacy Continue replays its stored
+selector provenance. Session `cardType` and `name` are presentation metadata,
+not card-selection filters. Sessions are scoped to the authenticated
+`ownerId`: get, submit, and end by another owner return 403. The verified
+Auth0 subject determines owner identity; API-key credential verification is a
+separate gate. `endReviewSession` idempotently abandons an unfinished session.
 
 ### Bulk endpoints
 
@@ -176,13 +184,16 @@ Firestore Timestamps as-is, so on the wire they serialize to
 firebase-admin. List/due responses: `{ cards, nextPageToken }`. List decks:
 `{ decks, nextPageToken }`. Review response: `{ card, reviewLogItem }`.
 Session responses (`startReviewSession`, `getReviewSession`,
-`submitSessionReview`): `{ session, card }` — `card` is the current card to
-review or `null` when the queue is exhausted; `endReviewSession` returns the
-session alone. Session shape: `{ id, apiKeyName, status, deckId?, limit,
-cardIds, currentIndex, reviewedCount, truncated, ratingCounts {again, hard,
-good, easy, ratingCounts}, startedAt, lastReviewedAt?, endedAt? }`. Delete
-deck: `{ deleted, detachedCards }`. Attach image: `{ card, image }`.
-List images: `{ cardId, images }`. Remove image: `{ cardId, removed }`. Errors:
+`submitSessionReview`) include `{ session, card, preloaded, currentPosition?,
+queueWindow? }`; `card` is the current card or `null` when the queue is
+exhausted. New v2 sessions return a bounded queue window and omit the full
+`cardIds` and `source.cardIds` snapshot from the wire; legacy v1/no-version
+sessions may retain in-root arrays. Session metadata includes `storageVersion`
+and the snapshot/progress counters. New sessions carry the authenticated
+`ownerId`; historical ownerless roots are quarantined from access and never
+use legacy owner aliases. Delete deck:
+`{ deleted, detachedCards }`. Attach image: `{ card, image }`. List images:
+`{ cardId, images }`. Remove image: `{ cardId, removed }`. Errors:
 `{ error, issues? }` (`issues` present on 400 validation failures). Health:
 `{ status, timestamp }`.
 
@@ -205,6 +216,7 @@ npm run mock              # listens on http://127.0.0.1:8787
 node client.mjs http://localhost:8787 health
 node client.mjs http://localhost:8787 create --front "What is FSRS?" --back "Free Spaced Repetition Scheduler" --deck "spaced-repetition" --tags "algorithm,core"
 node client.mjs http://localhost:8787 list --deck "spaced-repetition"
+node client.mjs http://localhost:8787 search --tags-all "a,b" --tags-all " spaced " --decks deck1 --decks deck2 --deck-names "French Class"
 node client.mjs http://localhost:8787 due
 node client.mjs http://localhost:8787 review <id> --rating 3
 node client.mjs http://localhost:8787 get <id>
@@ -232,6 +244,9 @@ node client.mjs http://localhost:8787 get-session <session-id>
 node client.mjs http://localhost:8787 submit-review <session-id> --rating 3
 node client.mjs http://localhost:8787 end-session <session-id>
 ```
+
+Search array values are sent as repeated query parameters, unchanged: commas
+and leading/trailing whitespace are literal parts of each value.
 
 To confirm the schema itself parses as YAML:
 `python -c "import yaml; yaml.safe_load(open('openapi.yaml'))"`

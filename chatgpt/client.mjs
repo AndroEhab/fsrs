@@ -13,7 +13,11 @@
 //   node client.mjs <baseUrl> create --front "..." --back "..." [--deck-id <id> | --deck <name>] [--tags a,b]
 //   node client.mjs <baseUrl> bulk-create --front "..." --back "..." [--deck-id <id> | --deck <name>] [--tags a,b]
 //                          [--front2 ... --back2 ...]  (repeat per card; up to 100)
-//   node client.mjs <baseUrl> list [--deck-id <id> | --deck <name>] [--tags a,b] [--page-size N]
+//   node client.mjs <baseUrl> search [--search text] [--tags-any tag ...] [--tags-all tag ...] [--tags-not tag ...]
+//                          [--decks id ...] [--deck-names exact-name ...] [--review due|notDue|new|reviewed]
+//                          [--suspended true|false] [--created-from ISO] [--created-to ISO]
+//                          [--updated-from ISO] [--updated-to ISO] [--page-size N] [--page-token T]
+//                          Repeat a filter flag as needed; values are literal (commas and whitespace are not split).
 //   node client.mjs <baseUrl> due [--deck-id <id> | --deck <name>] [--page-size N] [--page-token T]
 //   node client.mjs <baseUrl> review <id> --rating N [--review-at ISO]
 //   node client.mjs <baseUrl> get <id>
@@ -37,10 +41,10 @@
 // backend's production auth and the GPT Action API-Key auth setting).
 import process from "node:process";
 
-const baseUrl = process.argv[2];
+const baseUrl = process.argv[2]?.replace(/\/+$/, "");
 const command = process.argv[3];
 if (!baseUrl || !command) {
-  console.error("Usage: node client.mjs <baseUrl> <health|create|bulk-create|list|due|review|get|update|bulk-update|delete|bulk-delete|create-deck|list-decks|get-deck|update-deck|delete-deck|migrate-decks|attach-image|upload-image|list-images|remove-image|start-session|get-session|submit-review|end-session> [args]");
+  console.error("Usage: node client.mjs <baseUrl> <health|create|bulk-create|list|search|due|review|get|update|bulk-update|delete|bulk-delete|create-deck|list-decks|get-deck|update-deck|delete-deck|migrate-decks|attach-image|upload-image|list-images|remove-image|start-session|get-session|submit-review|end-session> [args]");
   process.exit(2);
 }
 
@@ -115,6 +119,35 @@ switch (command) {
     if (arg("page-token")) q.set("pageToken", arg("page-token"));
     const qs = q.toString();
     const { status, data } = await request("GET", `/listFlashcardsHandler${qs ? `?${qs}` : ""}`);
+    console.log(JSON.stringify({ status, data }, null, 2));
+    if (status !== 200) process.exitCode = 1;
+    break;
+  }
+  case "search": {
+    const q = new URLSearchParams();
+    const scalar = [
+      ["search", "search"],
+      ["review", "review"],
+      ["suspended", "suspended"],
+      ["created-from", "createdFrom"],
+      ["created-to", "createdTo"],
+      ["updated-from", "updatedFrom"],
+      ["updated-to", "updatedTo"],
+      ["page-size", "pageSize"],
+      ["page-token", "pageToken"],
+    ];
+    for (const [flag, parameter] of scalar) {
+      const value = arg(flag);
+      if (value !== undefined) q.set(parameter, value);
+    }
+    for (const [flag, parameter] of [
+      ["tags-any", "tagsAny"], ["tags-all", "tagsAll"], ["tags-not", "tagsNot"],
+      ["decks", "decks"], ["deck-names", "deckNames"],
+    ]) {
+      for (const value of argAll(flag)) q.append(parameter, value);
+    }
+    const qs = q.toString();
+    const { status, data } = await request("GET", `/searchCardsHandler${qs ? `?${qs}` : ""}`);
     console.log(JSON.stringify({ status, data }, null, 2));
     if (status !== 200) process.exitCode = 1;
     break;

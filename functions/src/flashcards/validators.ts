@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { CreateFlashcardInput, UpdateFlashcardInput, ListFlashcardsQuery, DueFlashcardsQuery, SearchCardsQuery, ReviewFlashcardInput, BulkCreateFlashcardsInput, BulkUpdateFlashcardsInput, BulkDeleteFlashcardsInput, BULK_LIMIT, CreateDeckInput, UpdateDeckInput, ListDecksQuery, AttachImageInput, RemoveImageInput, UploadImageInput, MAX_IMAGE_URL_LENGTH, MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_FILE_NAME_LENGTH, StartReviewSessionInput, SubmitSessionReviewInput, CountFlashcardsQuery, SchedulingActionInput, SetFlashcardDueDateInput, SCHEDULING_ACTION_LIMIT, ListTagsQuery, RenameTagInput, DeleteTagInput, MergeTagsInput, MIN_TAG_NAME_LENGTH, MAX_TAG_NAME_LENGTH, ReviewHistoryQuery, StudyStatsQuery, TopLapsedQuery, BulkEnrollCardsInput, ENROLLMENT_MAX_CARDS } from './types';
-import { normalizeSearchFilters, searchFiltersKey, readSearchPageToken } from './search';
+import { isValidFirestoreDocumentId } from './documentPageTokens';
+import { normalizeSearchFilters, searchFiltersKey, readSearchPageToken, parseSearchBound } from './search';
 import { normalizeHistoryFilters, historyFiltersKey, readHistoryPageToken } from './analytics';
 
 
@@ -33,7 +34,7 @@ export const listFlashcardsQuerySchema = z.object({
   deck: z.string().max(100).optional(),
   tags: z.string().max(500).optional(),
   pageSize: z.coerce.number().int().min(1).max(100).default(20).optional(),
-  pageToken: z.string().optional(),
+  pageToken: z.string().max(3000).optional(),
 }).transform((data) => ({
   ...data,
   pageSize: data.pageSize ?? 20,
@@ -43,7 +44,7 @@ export const dueFlashcardsQuerySchema = z.object({
   deckId: z.string().max(100).optional(),
   deck: z.string().max(100).optional(),
   pageSize: z.coerce.number().int().min(1).max(100).default(20).optional(),
-  pageToken: z.string().optional(),
+  pageToken: z.string().max(3000).optional(),
 }).transform((data) => ({
   ...data,
   pageSize: data.pageSize ?? 20,
@@ -92,27 +93,15 @@ export function safeValidateCountFlashcardsQuery(data: unknown): { success: true
 /* ------------------------------------------------------------------ */
 
 /**
- * Accepts a full ISO 8601 date-time or a plain YYYY-MM-DD date.
- * YYYY-MM-DD is validated against the REAL calendar (Date.UTC would silently
- * normalize 2026-02-31 to 2026-03-03, so the components are round-tripped
- * through Date.UTC and compared). Date-only lower bounds mean the UTC
- * midnight of that day; date-only UPPER bounds (createdTo/updatedTo) mean
- * the END of that UTC day (23:59:59.999) — see parseSearchBound.
+ * Accepts ISO date-times and plain YYYY-MM-DD dates within Firestore's
+ * timestamp range. Date-only upper bounds include the full UTC day.
  */
 const searchBoundSchema = z.string()
-  .refine((s) => {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-    if (m) {
-      const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
-      const utc = Date.UTC(y, mo - 1, d);
-      const check = new Date(utc);
-      return !Number.isNaN(utc)
-        && check.getUTCFullYear() === y && check.getUTCMonth() === mo - 1 && check.getUTCDate() === d;
-    }
-    return !Number.isNaN(Date.parse(s));
-  }, 'Expected an ISO 8601 date-time or a valid YYYY-MM-DD date');
+  .refine((value) => parseSearchBound(value) !== undefined, 'Expected an ISO 8601 date-time or a valid YYYY-MM-DD date');
 
 const tagListSchema = z.array(z.string().min(1, 'Tag cannot be empty').max(50, 'Tag too long')).max(20, 'Too many tags');
+const deckIdListSchema = z.array(z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long')).max(20, 'Too many decks');
+const deckNameListSchema = z.array(z.string().min(1, 'Deck name cannot be empty').max(300, 'Deck name too long')).max(20, 'Too many decks');
 
 /** Accepts a real boolean or the string forms 'true'/'false' (query strings). */
 const suspendedBoolSchema = z.union([z.boolean(), z.literal('true'), z.literal('false')])
@@ -124,15 +113,15 @@ export const searchCardsQuerySchema = z.object({
   tagsAll: tagListSchema.optional(),
   tagsNot: tagListSchema.optional(),
   review: z.enum(['due', 'notDue', 'new', 'reviewed']).optional(),
-  decks: tagListSchema.optional(),
-  deckNames: tagListSchema.optional(),
+  decks: deckIdListSchema.optional(),
+  deckNames: deckNameListSchema.optional(),
   suspended: suspendedBoolSchema.optional(),
   createdFrom: searchBoundSchema.optional(),
   createdTo: searchBoundSchema.optional(),
   updatedFrom: searchBoundSchema.optional(),
   updatedTo: searchBoundSchema.optional(),
   pageSize: z.coerce.number().int().min(1).max(100).default(20).optional(),
-  pageToken: z.string().max(2000).optional(),
+  pageToken: z.string().max(3000).optional(),
 }).transform((data) => ({
   ...data,
   suspended: data.suspended,
@@ -159,6 +148,7 @@ export const schedulingActionIdsSchema = z.object({
   ids: z.array(z.string().min(1, 'Card id is required'))
     .min(1, 'At least one id is required')
     .max(SCHEDULING_ACTION_LIMIT, `No more than ${SCHEDULING_ACTION_LIMIT} ids per request`)
+    .refine((ids) => ids.every(isValidFirestoreDocumentId), { message: 'Card ids must be valid Firestore document ids' })
     .refine((ids) => new Set(ids).size === ids.length, { message: 'Duplicate card ids are not allowed' }),
 }) satisfies z.ZodType<SchedulingActionInput>;
 
@@ -235,7 +225,7 @@ export const bulkCreateFlashcardsSchema = z.object({
 }) satisfies z.ZodType<BulkCreateFlashcardsInput>;
 
 const bulkUpdateItemSchema = z.object({
-  id: z.string().min(1, 'Card id is required'),
+  id: z.string().min(1, 'Card id is required').refine(isValidFirestoreDocumentId, 'Card id must be a valid Firestore document id'),
   front: z.string().min(1, 'Front cannot be empty').max(10000, 'Front too long').optional(),
   back: z.string().min(1, 'Back cannot be empty').max(10000, 'Back too long').optional(),
   deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
@@ -254,7 +244,8 @@ export const bulkUpdateFlashcardsSchema = z.object({
 export const bulkDeleteFlashcardsSchema = z.object({
   ids: z.array(z.string().min(1, 'Card id is required'))
     .min(1, 'At least one id is required')
-    .max(BULK_LIMIT, `No more than ${BULK_LIMIT} ids per request`),
+    .max(BULK_LIMIT, `No more than ${BULK_LIMIT} ids per request`)
+    .refine((ids) => ids.every(isValidFirestoreDocumentId), { message: 'Card ids must be valid Firestore document ids' }),
 }) satisfies z.ZodType<BulkDeleteFlashcardsInput>;
 
 export function validateCreateFlashcard(data: unknown): CreateFlashcardInput {
@@ -460,7 +451,7 @@ export const updateDeckSchema = z.object({
 
 export const listDecksQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(100).default(20).optional(),
-  pageToken: z.string().optional(),
+  pageToken: z.string().max(3000).optional(),
 }).transform((data) => ({
   ...data,
   pageSize: data.pageSize ?? 20,
@@ -696,7 +687,9 @@ export const startReviewSessionSchema = z.object({
   deckId: z.string().min(1, 'Deck id cannot be empty').max(100, 'Deck id too long').optional(),
   deck: z.string().min(1, 'Deck name cannot be empty').max(100, 'Deck name too long').optional(),
   tags: z.array(z.string().min(1, 'Tag cannot be empty').max(50, 'Tag too long')).min(1, 'At least one tag is required').max(20, 'Too many tags').optional(),
-  cardIds: z.array(z.string().min(1, 'Card id cannot be empty').max(200, 'Card id too long')).min(1, 'At least one card id is required').optional(),
+  cardIds: z.array(z.string().min(1, 'Card id cannot be empty').max(200, 'Card id too long'))
+    .min(1, 'At least one card id is required')
+    .refine((ids) => ids.every(isValidFirestoreDocumentId), { message: 'Card ids must be valid Firestore document ids' }).optional(),
   cardType: z.enum(['qa', 'cloze']).nullable().optional(),
   name: z.string().min(1, 'Session name cannot be empty').max(200, 'Session name too long').nullable().optional(),
   repeatSessionId: z.string().min(1, 'repeatSessionId cannot be empty').max(200, 'repeatSessionId too long').nullable().optional(),

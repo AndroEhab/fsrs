@@ -7,7 +7,8 @@
       "node_modules",
       ".git",
       "*.log",
-      "*.test.ts"
+      "*.test.ts",
+      ".tmp"
     ],
     "predeploy": [
       "npm --prefix functions run build"
@@ -22,6 +23,10 @@
     },
     "firestore": {
       "port": 8080
+    },
+    "storage": {
+      "host": "127.0.0.1",
+      "port": 9199
     },
     "ui": {
       "enabled": true,

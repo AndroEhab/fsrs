@@ -3,9 +3,9 @@ module.exports = {
   testEnvironment: 'node',
   roots: ['<rootDir>/src'],
   testMatch: ['**/*.test.ts'],
-  // firestore.rules.test.ts needs a running Firestore emulator; run it via
-  // `npm run test:rules` (firebase emulators:exec), not plain `npm test`.
-  testPathIgnorePatterns: ['/node_modules/', 'firestore\\.rules\\.test\\.ts'],
+  // Emulator-required suites run only via `npm run test:rules` or
+  // `npm run test:datastore`, each with its own ephemeral localhost emulator.
+  testPathIgnorePatterns: ['/node_modules/', 'firestore\\.rules\\.test\\.ts', '\\.integration\\.test\\.ts'],
   moduleFileExtensions: ['ts', 'js', 'json'],
   collectCoverageFrom: [
     'src/**/*.ts',

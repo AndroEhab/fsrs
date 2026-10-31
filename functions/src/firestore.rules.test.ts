@@ -1,11 +1,11 @@
 /**
  * Deterministic emulator tests for firestore.rules (repo root).
  *
- * Policy under test: DENY-BY-DEFAULT.  Every Firestore path in the repo
- * (apiKeys, flashcards, decks, reviewSessions + queueChunks subcollection,
- * reviewEvents) is read/write-locked; direct mobile/web client SDK access is
- * refused for unauthenticated AND authenticated callers, because all real
- * access goes through Cloud Functions using the Admin SDK (rules bypass).
+ * Policy under test: DENY-BY-DEFAULT. Every Firestore path in the repo
+ * (apiKeys, flashcards, decks, reviewSessions + queueChunks and requestClaims
+ * subcollections, reviewEvents) is read/write-locked; direct mobile/web client
+ * SDK access is refused for unauthenticated AND authenticated callers, because
+ * all real access goes through Cloud Functions using the Admin SDK (rules bypass).
  *
  * Run with:
  *   npm run test:rules            (fires up the Firestore emulator on an
@@ -131,9 +131,9 @@ describe('decks (all access denied)', () => {
   });
 });
 
-// -- reviewSessions (+ queueChunks subcollection) --------------------------
+// -- reviewSessions (+ queueChunks and requestClaims subcollections) ----------
 
-describe('reviewSessions and queueChunks (all access denied)', () => {
+describe('reviewSessions and child collections (all access denied)', () => {
   it('session read denied', async () => {
     await READ_FAILS(unauth().collection('reviewSessions').doc('sess-1').get());
     await READ_FAILS(authed('user-1').collection('reviewSessions').doc('sess-1').get());
@@ -143,18 +143,23 @@ describe('reviewSessions and queueChunks (all access denied)', () => {
     await WRITE_FAILS(authed('user-1').collection('reviewSessions').doc('sess-1').update({ status: 'ended' }));
     await WRITE_FAILS(authed('user-1').collection('reviewSessions').doc('sess-1').delete());
   });
-  it('queueChunks subcollection read denied', async () => {
-    await READ_FAILS(
-      authed('user-1').collection('reviewSessions').doc('sess-1').collection('queueChunks').doc('000000').get(),
-    );
+  it('queueChunks subcollection read and write denied', async () => {
+    const unauthChunks = unauth().collection('reviewSessions').doc('sess-1').collection('queueChunks');
+    const authedChunks = authed('user-1').collection('reviewSessions').doc('sess-1').collection('queueChunks');
+    await READ_FAILS(unauthChunks.doc('000000').get());
+    await READ_FAILS(authedChunks.doc('000000').get());
+    await WRITE_FAILS(unauthChunks.doc('000000').set(CHUNK));
+    await WRITE_FAILS(authedChunks.doc('000000').set(CHUNK));
+    await WRITE_FAILS(authedChunks.doc('000000').delete());
   });
-  it('queueChunks subcollection write denied', async () => {
-    await WRITE_FAILS(
-      authed('user-1').collection('reviewSessions').doc('sess-1').collection('queueChunks').doc('000000').set(CHUNK),
-    );
-    await WRITE_FAILS(
-      authed('user-1').collection('reviewSessions').doc('sess-1').collection('queueChunks').doc('000000').delete(),
-    );
+  it('requestClaims subcollection read and write denied', async () => {
+    const unauthClaims = unauth().collection('reviewSessions').doc('sess-1').collection('requestClaims');
+    const authedClaims = authed('user-1').collection('reviewSessions').doc('sess-1').collection('requestClaims');
+    await READ_FAILS(unauthClaims.doc('request-hash').get());
+    await READ_FAILS(authedClaims.doc('request-hash').get());
+    await WRITE_FAILS(unauthClaims.doc('request-hash').set({ position: 0 }));
+    await WRITE_FAILS(authedClaims.doc('request-hash').set({ position: 0 }));
+    await WRITE_FAILS(authedClaims.doc('request-hash').delete());
   });
 });
 

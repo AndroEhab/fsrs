@@ -28,8 +28,10 @@
  * (e.g. a CDN, Firebase Storage signed URLs) keep working.
  */
 import { lookup } from 'node:dns';
-import { promisify } from 'node:util';
+import type { IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import type { ClientRequest } from 'node:http';
+import { promisify } from 'node:util';
 
 const lookupAll = promisify(lookup);
 
@@ -43,8 +45,7 @@ const BLOCKED_V4_RANGES: Array<{ label: string; start: number; end: number }> = 
   { label: 'private (172.16/12)', start: 0xac100000, end: 0xac1fffff }, // 172.16.0.0/12
   { label: 'benchmarking (198.18/15)', start: 0xc6120000, end: 0xc613ffff }, // 198.18.0.0/15
   { label: 'private (192.168/16)', start: 0xc0a80000, end: 0xc0a8ffff },// 192.168.0.0/16
-  { label: 'IETF (192.0.0/24)', start: 0xc0000000, end: 0xc00000ff },   // 192.0.0.0/24
-  { label: 'TEST-NET-1 (192.0.2/24)', start: 0xc0000200, end: 0xc00002ff },
+  { label: 'TEST-NET-1 (192.0.2/24)', start: 0xc0000200, end: 0xc00002ff }, // 192.0.2.0/24
   { label: 'TEST-NET-2 (198.51.100/24)', start: 0xc6336400, end: 0xc63364ff },
   { label: 'TEST-NET-3 (203.0.113/24)', start: 0xcb007100, end: 0xcb0071ff },
   { label: 'multicast (224/4)', start: 0xe0000000, end: 0xefffffff },   // 224.0.0.0/4
@@ -73,28 +74,27 @@ export function classifyIpv4(address: string): 'public' | { reason: string } {
   return 'public';
 }
 
-/** Expands an IPv6 address into 8 hex groups (lowercase, no compression). */
+/** Expands an IPv6 address into eight lowercase hex groups, or returns null for invalid syntax. */
 function expandIpv6(address: string): string[] | null {
-  let head = address;
-  let tail = '';
   const doubleColon = address.indexOf('::');
-  if (doubleColon >= 0) {
-    head = address.slice(0, doubleColon);
-    tail = address.slice(doubleColon + 2);
-  }
+  const compressed = doubleColon >= 0;
+  if (compressed && address.indexOf('::', doubleColon + 2) >= 0) return null;
+  const head = compressed ? address.slice(0, doubleColon) : address;
+  const tail = compressed ? address.slice(doubleColon + 2) : '';
   const headGroups = head === '' ? [] : head.split(':');
   const tailGroups = tail === '' ? [] : tail.split(':');
   // A dotted-quad tail (::ffff:8.8.8.8) is the LAST two groups as IPv4.
-  const last = tailGroups[tailGroups.length - 1];
+  const last = (tailGroups.length > 0 ? tailGroups : headGroups).at(-1);
   if (last !== undefined && /^\d{1,3}(\.\d{1,3}){3}$/.test(last)) {
     const octets = last.split('.').map(Number);
     if (octets.some((o) => o > 255)) return null;
-    tailGroups[tailGroups.length - 1] = (((octets[0] << 8) >>> 0 | octets[1]) >>> 0).toString(16);
-    tailGroups.push((((octets[2] << 8) >>> 0 | octets[3]) >>> 0).toString(16));
+    const pair = [(((octets[0] << 8) >>> 0 | octets[1]) >>> 0).toString(16), (((octets[2] << 8) >>> 0 | octets[3]) >>> 0).toString(16)];
+    if (tailGroups.length > 0) tailGroups.splice(tailGroups.length - 1, 1, ...pair);
+    else headGroups.splice(headGroups.length - 1, 1, ...pair);
   }
   const total = headGroups.length + tailGroups.length;
-  if (total > 7) return null;
-  const missing = 8 - total;
+  if (compressed ? total > 8 : total !== 8) return null;
+  const missing = compressed ? 8 - total : 0;
   const groups = [...headGroups, ...Array(missing).fill('0'), ...tailGroups];
   const out: string[] = [];
   for (const g of groups) {
@@ -127,10 +127,15 @@ const BLOCKED_V6_PREFIXES: Array<{ label: string; groups: string[]; bits: number
   { label: 'loopback (::1/128)', groups: P('0', '0', '0', '0', '0', '0', '0', '1'), bits: 128 },
   { label: 'IPv4-mapped (::ffff:0:0/96)', groups: P('0', '0', '0', '0', '0', 'ffff', '0', '0'), bits: 96 },
   { label: 'NAT64 (64:ff9b::/96)', groups: P('64', 'ff9b', '0', '0', '0', '0', '0', '0'), bits: 96 },
+  { label: 'local-use NAT64 (64:ff9b:1::/48)', groups: P('64', 'ff9b', '1', '0', '0', '0', '0', '0'), bits: 48 },
+  { label: 'IPv4-compatible (::/96)', groups: P('0', '0', '0', '0', '0', '0', '0', '0'), bits: 96 },
   { label: 'discard-only (100::/64)', groups: P('100', '0', '0', '0', '0', '0', '0', '0'), bits: 64 },
+  { label: 'Teredo (2001::/32)', groups: P('2001', '0', '0', '0', '0', '0', '0', '0'), bits: 32 },
   { label: 'documentation (2001:db8::/32)', groups: P('2001', 'db8', '0', '0', '0', '0', '0', '0'), bits: 32 },
+  { label: 'site-local (fec0::/10)', groups: P('fec0', '0', '0', '0', '0', '0', '0', '0'), bits: 10 },
   { label: 'ULA (fc00::/7)', groups: P('fc00', '0', '0', '0', '0', '0', '0', '0'), bits: 7 },
   { label: 'link-local (fe80::/10)', groups: P('fe80', '0', '0', '0', '0', '0', '0', '0'), bits: 10 },
+  { label: '6to4 (2002::/16)', groups: P('2002', '0', '0', '0', '0', '0', '0', '0'), bits: 16 },
   { label: 'multicast (ff00::/8)', groups: P('ff00', '0', '0', '0', '0', '0', '0', '0'), bits: 8 },
 ];
 
@@ -310,132 +315,195 @@ export type SafeFetchResult =
 export interface SafeFetchOptions {
   /** Maximum response body bytes (default 8 MiB). */
   maxBytes?: number;
-  /** Per-hop timeout ms (default 8000). */
+  /** Absolute total deadline for DNS, connection, redirects, and body (default 8000 ms). */
   timeoutMs?: number;
   /** Maximum redirect hops (default 3). */
   maxRedirects?: number;
 }
 
+interface SafeFetchContext {
+  deadline: number;
+  settled: boolean;
+  request: ClientRequest | null;
+  response: IncomingMessage | null;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  finish(result: SafeFetchResult): void;
+  timeout(): void;
+}
+
 /**
- * Fetches an https URL with the SSRF pinning + redirect policy:
- *  - Only https. The socket connects through a custom `lookup` that hands
- *    Node ONLY the addresses validated as public at resolve time — the
- *    connection cannot re-resolve to a private IP (no check/connect race).
- *  - Redirects (301/302/303/307/308) are followed MANUALLY, at most
- *    `maxRedirects` hops, and each Location is re-validated (https + public
- *    pinning) before the next hop. A redirect to plaintext http or to a
- *    private/link-local/metadata/loopback target is refused.
- *  - Body reads are bounded by `maxBytes`; the request is aborted after
- *    `timeoutMs` per hop.
- * Never throws for network/redirect/policy failures — returns
- * `{ ok: false, reason }`.
+ * Fetches an https URL with pinned DNS, manually validated bounded redirects,
+ * and one absolute deadline covering resolution, connection, and body reads.
+ * Every unused/error response is destroyed immediately; response bytes are
+ * returned as a Uint8Array view without a redundant Buffer copy.
  */
 export function safeMediaFetch(rawUrl: string, options: SafeFetchOptions = {}): Promise<SafeFetchResult> {
   const maxBytes = options.maxBytes ?? 8 * 1024 * 1024;
-  const timeoutMs = options.timeoutMs ?? 8000;
   const maxRedirects = options.maxRedirects ?? 3;
-  return fetchHop(rawUrl, maxBytes, timeoutMs, maxRedirects, 0);
+  const deadline = Date.now() + (options.timeoutMs ?? 8000);
+  return new Promise<SafeFetchResult>((resolve) => {
+    const context: SafeFetchContext = {
+      deadline,
+      settled: false,
+      request: null,
+      response: null,
+      timer: undefined,
+      finish(result): void {
+        if (context.settled) return;
+        context.settled = true;
+        clearTimeout(context.timer);
+        const request = context.request;
+        const response = context.response;
+        context.request = null;
+        context.response = null;
+        if (!result.ok) {
+          response?.destroy();
+          request?.destroy();
+        }
+        resolve(result);
+      },
+      timeout(): void {
+        context.finish({ ok: false, reason: 'unreachable or timed out' });
+      },
+    };
+    context.timer = setTimeout(context.timeout, Math.max(0, deadline - Date.now()));
+    fetchHop(rawUrl, maxBytes, maxRedirects, 0, context);
+  });
 }
 
 function fetchHop(
   rawUrl: string,
   maxBytes: number,
-  timeoutMs: number,
   maxRedirects: number,
   hop: number,
-): Promise<SafeFetchResult> {
-  return new Promise<SafeFetchResult>((resolve) => {
-    let parsed: URL;
-    try {
-      parsed = new URL(rawUrl);
-    } catch {
-      resolve({ ok: false, reason: 'not a valid URL' });
+  context: SafeFetchContext,
+): void {
+  if (context.settled) return;
+  if (Date.now() >= context.deadline) {
+    context.timeout();
+    return;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    context.finish({ ok: false, reason: 'not a valid URL' });
+    return;
+  }
+  if (parsed.protocol !== 'https:') {
+    context.finish({ ok: false, reason: 'only https URLs are fetched during export' });
+    return;
+  }
+  void lookupPublic(parsed.hostname).then((resolved) => {
+    if (context.settled) return;
+    if (Date.now() >= context.deadline) {
+      context.timeout();
       return;
     }
-    if (parsed.protocol !== 'https:') {
-      resolve({ ok: false, reason: 'only https URLs are fetched during export' });
+    if (!resolved.ok) {
+      context.finish({ ok: false, reason: resolved.reason });
       return;
     }
-    const hostname = parsed.hostname;
-    void lookupPublic(hostname).then((resolved) => {
-      if (!resolved.ok) {
-        resolve({ ok: false, reason: resolved.reason });
+    const pinnedLookup = (
+      _host: string,
+      _opts: { all?: boolean },
+      cb: (err: Error | null, addresses?: Array<{ address: string; family: number }>) => void,
+    ): void => {
+      cb(null, resolved.addresses);
+    };
+    const request = httpsRequest({
+      hostname: parsed.hostname,
+      port: parsed.port === '' ? 443 : Number(parsed.port),
+      path: `${parsed.pathname}${parsed.search}`,
+      method: 'GET',
+      headers: { 'User-Agent': 'cuelingua-export/1.0', Accept: 'image/*,*/*;q=0.8' },
+      lookup: pinnedLookup as never,
+      timeout: Math.max(1, context.deadline - Date.now()),
+    }, (res) => {
+      if (context.request !== request || context.settled) {
+        res.destroy();
         return;
       }
-      // The connect lookup returns ONLY the validated public addresses to
-      // Node's socket layer (array form, which Node 22's net.connect expects
-      // when options.all is set). No re-resolution happens after this.
-      const pinnedLookup = (
-        _host: string,
-        _opts: { all?: boolean },
-        cb: (err: Error | null, addresses?: Array<{ address: string; family: number }>) => void,
-      ): void => {
-        cb(null, resolved.addresses);
-      };
+      context.response = res;
+      if (context.settled) {
+        res.destroy();
+        return;
+      }
+      if (Date.now() >= context.deadline) {
+        context.timeout();
+        return;
+      }
+      const status = res.statusCode ?? 0;
+      if (status >= 300 && status < 400 && res.headers.location !== undefined) {
+        const location = res.headers.location;
+        context.response = null;
+        context.request = null;
+        res.destroy();
+        request.destroy();
+        if (hop >= maxRedirects) {
+          context.finish({ ok: false, reason: `too many redirects (${maxRedirects})` });
+          return;
+        }
+        void validateRedirectTarget(rawUrl, location).then((target) => {
+          if (context.settled) return;
+          if (Date.now() >= context.deadline) {
+            context.timeout();
+          } else if (!target.ok) {
+            context.finish({ ok: false, reason: target.reason });
+          } else {
+            fetchHop(target.url, maxBytes, maxRedirects, hop + 1, context);
+          }
+        }).catch(() => context.finish({ ok: false, reason: 'unreachable or timed out' }));
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        context.finish({ ok: false, reason: `fetch failed (HTTP ${status})` });
+        return;
+      }
 
-      const req = httpsRequest({
-        hostname,
-        port: parsed.port === '' ? 443 : Number(parsed.port),
-        path: `${parsed.pathname}${parsed.search}`,
-        method: 'GET',
-        headers: {
-          'User-Agent': 'cuelingua-export/1.0',
-          Accept: 'image/*,*/*;q=0.8',
-        },
-        lookup: pinnedLookup as never,
-        timeout: timeoutMs,
-      }, (res) => {
-        const status = res.statusCode ?? 0;
-        // Redirect: validate Location manually, then follow (bounded).
-        if (status >= 300 && status < 400 && res.headers.location !== undefined) {
-          res.resume(); // drain
-          if (hop >= maxRedirects) {
-            resolve({ ok: false, reason: `too many redirects (${maxRedirects})` });
-            return;
-          }
-          // Resolve + validate the redirect target BEFORE following (https,
-          // no blocked literal host; the follow hop re-pins its DNS).
-          void validateRedirectTarget(rawUrl, res.headers.location).then((target) => {
-            if (!target.ok) {
-              resolve({ ok: false, reason: target.reason });
-              return;
-            }
-            resolve(fetchHop(target.url, maxBytes, timeoutMs, maxRedirects, hop + 1));
-          });
+      const chunks: Buffer[] = [];
+      let total = 0;
+      res.on('data', (chunk: Buffer) => {
+        if (context.request !== request || context.response !== res || context.settled) return;
+        if (Date.now() >= context.deadline) {
+          context.timeout();
           return;
         }
-        if (status < 200 || status >= 300) {
-          res.resume();
-          resolve({ ok: false, reason: `fetch failed (HTTP ${status})` });
+        total += chunk.length;
+        if (total > maxBytes) {
+          context.finish({ ok: false, reason: `response too large (> ${maxBytes} bytes)` });
           return;
         }
-        const chunks: Buffer[] = [];
-        let total = 0;
-        let aborted = false;
-        res.on('data', (chunk: Buffer) => {
-          total += chunk.length;
-          if (total > maxBytes) {
-            aborted = true;
-            req.destroy(new Error(`response too large (> ${maxBytes} bytes)`));
-            return;
-          }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          if (aborted) return;
-          resolve({ ok: true, status, bytes: new Uint8Array(Buffer.concat(chunks)) });
-        });
-        res.on('error', () => {
-          if (!aborted) resolve({ ok: false, reason: 'unreachable or timed out' });
-        });
+        chunks.push(chunk);
       });
-      req.on('timeout', () => {
-        req.destroy(new Error('timeout'));
+      res.on('end', () => {
+        if (context.request !== request || context.response !== res || context.settled) return;
+        if (Date.now() >= context.deadline) {
+          context.timeout();
+          return;
+        }
+        context.finish({ ok: true, status, bytes: Buffer.concat(chunks) });
       });
-      req.on('error', () => {
-        resolve({ ok: false, reason: 'unreachable or timed out' });
+      res.on('close', () => {
+        if (context.request === request && context.response === res && !context.settled && !res.complete) {
+          context.finish({ ok: false, reason: 'unreachable or timed out' });
+        }
       });
-      req.end();
+      res.on('error', () => {
+        if (context.request === request && context.response === res && !context.settled) {
+          context.finish({ ok: false, reason: 'unreachable or timed out' });
+        }
+      });
     });
-  });
+    context.request = request;
+    request.on('timeout', () => {
+      if (context.request === request && !context.settled) context.timeout();
+    });
+    request.on('error', () => {
+      if (context.request === request && !context.settled) {
+        context.finish({ ok: false, reason: 'unreachable or timed out' });
+      }
+    });
+    request.end();
+  }).catch(() => context.finish({ ok: false, reason: 'unreachable or timed out' }));
 }

@@ -25,6 +25,7 @@ module.exports = {
     '@typescript-eslint/no-unused-vars': ['error', { args: 'after-used', argsIgnorePattern: '^_', caughtErrors: 'none' }],
     // The test suite uses require() for isolated Firebase mock setup.
     '@typescript-eslint/no-var-requires': 'off',
+    '@typescript-eslint/no-require-imports': 'off',
     // Existing regex/string escapes are intentional and kept readable.
     'no-useless-escape': 'off',
     // Existing tests use nested non-null assertions with optional chaining.

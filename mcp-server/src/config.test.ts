@@ -1,4 +1,5 @@
-import { authGuardError, hasAuthMechanism, loadConfig, needsRemoteAuth, type ServerConfig } from './config';
+import { describe, expect, it } from '@jest/globals';
+import { authConfigurationError, authGuardError, backendIdentityError, hasAuthMechanism, loadConfig, needsRemoteAuth, type ServerConfig } from './config';
 
 function fullConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
   return {
@@ -8,6 +9,7 @@ function fullConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     host: '0.0.0.0',
     transport: 'http',
     authToken: '',
+    backendAuthToken: '',
     requestTimeoutMs: 15000,
     auth0Issuer: 'https://andrewehab.eu.auth0.com/',
     auth0Audience: 'https://cuelingua-mcp-767542644824.us-central1.run.app/mcp',
@@ -73,6 +75,15 @@ describe('hasAuthMechanism / authGuardError (fail-closed deploy guard)', () => {
     expect(hasAuthMechanism(cfg)).toBe(true);
     expect(authGuardError(cfg)).toBeNull();
   });
+  it('rejects a partial Auth0 configuration even when static auth exists', () => {
+    expect(authConfigurationError(fullConfig({ auth0Audience: '', authToken: 'static' }))).toMatch(/must be configured together/);
+    expect(authGuardError(fullConfig({ auth0Audience: '', authToken: 'static' }))).toMatch(/must be configured together/);
+  });
+
+  it('rejects simultaneous Auth0 and static credentials without weakening Auth0', () => {
+    expect(authConfigurationError(fullConfig({ authToken: 'static' }))).toMatch(/choose Auth0 per-user/);
+    expect(authGuardError(fullConfig({ authToken: 'static' }))).toMatch(/choose Auth0 per-user/);
+  });
 
   it('accepts the explicit local opt-out (MCP_AUTH_OPT_OUT) even against a remote backend', () => {
     const cfg = fullConfig({ auth0Issuer: '', auth0Audience: '', authToken: '', authOptOut: true });
@@ -91,6 +102,22 @@ describe('hasAuthMechanism / authGuardError (fail-closed deploy guard)', () => {
 
   it('allows a local backend with loopback listener without auth', () => {
     expect(authGuardError(fullConfig({ apiBaseUrl: 'http://127.0.0.1:5001', host: '127.0.0.1', auth0Issuer: '', auth0Audience: '' }))).toBeNull();
+  });
+  it('requires backend identity for remote stdio and static mode, but not Auth0 per-user mode', () => {
+    expect(backendIdentityError(fullConfig({ transport: 'stdio', auth0Issuer: '', auth0Audience: '' }))).toMatch(/requires both CUELINGUA_API_KEY and MCP_BACKEND_AUTH_TOKEN/);
+    expect(backendIdentityError(fullConfig({ transport: 'stdio', auth0Issuer: '', auth0Audience: '', backendAuthToken: 'trusted' }))).toBeNull();
+    expect(backendIdentityError(fullConfig({ transport: 'http', auth0Issuer: '', auth0Audience: '', authToken: 'static' }))).toMatch(/requires both CUELINGUA_API_KEY and MCP_BACKEND_AUTH_TOKEN/);
+    expect(backendIdentityError(fullConfig({ apiKey: '', auth0Issuer: 'issuer', auth0Audience: 'audience' }))).toMatch(/CUELINGUA_API_KEY is required/);
+    expect(backendIdentityError(fullConfig({ auth0Issuer: '', auth0Audience: '' }))).toBeNull();
+  });
+
+  
+  it('parses backend timeouts independently from the port range', () => {
+    expect(loadConfig({ FSRS_REQUEST_TIMEOUT_MS: '120000' }).requestTimeoutMs).toBe(120000);
+    expect(loadConfig({ FSRS_REQUEST_TIMEOUT_MS: '12abc' }).requestTimeoutMs).toBe(15000);
+    expect(loadConfig({ FSRS_REQUEST_TIMEOUT_MS: '0' }).requestTimeoutMs).toBe(15000);
+    expect(loadConfig({ FSRS_REQUEST_TIMEOUT_MS: '2147483647' }).requestTimeoutMs).toBe(2147483647);
+    expect(loadConfig({ FSRS_REQUEST_TIMEOUT_MS: '2147483648' }).requestTimeoutMs).toBe(15000);
   });
 
   it('loadConfig reads MCP_AUTH_OPT_OUT and keeps defaults when unset', () => {

@@ -1,4 +1,4 @@
-import { authRequiredAndMissing, isProductionRuntime } from './environment';
+import { assertLocalEmulatorDatastores, authRequiredAndMissing, isProductionRuntime } from './environment';
 
 describe('isProductionRuntime (auth fail-closed detection)', () => {
   const original = process.env.FUNCTIONS_EMULATOR;
@@ -47,6 +47,48 @@ describe('isProductionRuntime (auth fail-closed detection)', () => {
       if (nodeEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = nodeEnv;
     }
+  });
+});
+
+describe('assertLocalEmulatorDatastores', () => {
+  const names = [
+    'FUNCTIONS_EMULATOR',
+    'FIRESTORE_EMULATOR_HOST',
+    'FIREBASE_STORAGE_EMULATOR_HOST',
+    'STORAGE_EMULATOR_HOST',
+  ] as const;
+  const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+
+  beforeEach(() => {
+    process.env.FUNCTIONS_EMULATOR = 'true';
+    process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8080';
+    process.env.FIREBASE_STORAGE_EMULATOR_HOST = '127.0.0.1:9199';
+    delete process.env.STORAGE_EMULATOR_HOST;
+  });
+
+  afterEach(() => {
+    for (const name of names) {
+      const value = original[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  it.each([
+    ['unset Firestore endpoint', 'FIRESTORE_EMULATOR_HOST', undefined],
+    ['remote Firestore endpoint', 'FIRESTORE_EMULATOR_HOST', 'firestore.googleapis.com:443'],
+    ['URI Firestore endpoint', 'FIRESTORE_EMULATOR_HOST', 'http://127.0.0.1:8080'],
+    ['invalid Firestore port', 'FIRESTORE_EMULATOR_HOST', '127.0.0.1:70000'],
+    ['unset Storage endpoint', 'FIREBASE_STORAGE_EMULATOR_HOST', undefined],
+    ['remote Storage endpoint', 'FIREBASE_STORAGE_EMULATOR_HOST', 'storage.googleapis.com:443'],
+    ['URI Storage endpoint', 'FIREBASE_STORAGE_EMULATOR_HOST', 'http://127.0.0.1:9199'],
+    ['Storage endpoint override', 'STORAGE_EMULATOR_HOST', 'http://remote.example:9199'],
+    ['Storage endpoint override with a path', 'STORAGE_EMULATOR_HOST', 'http://127.0.0.1:9199/path'],
+    ['Storage endpoint override with credentials', 'STORAGE_EMULATOR_HOST', 'http://user@127.0.0.1:9199'],
+  ] as const)('rejects %s', (_label, name, value) => {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+    expect(() => assertLocalEmulatorDatastores()).toThrow();
   });
 });
 

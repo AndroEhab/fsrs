@@ -34,8 +34,10 @@ export interface ServerConfig {
   host: string;
   /** Transport: "http" (Streamable HTTP at /mcp) or "stdio". */
   transport: 'http' | 'stdio';
-  /** Optional static Bearer token gate for the /mcp endpoint. */
+  /** Optional static Bearer token for single-user HTTP authentication. */
   authToken: string;
+  /** Trusted process identity for static/stdio single-user mode only. */
+  backendAuthToken: string;
   /** Fetch timeout against the Firebase backend, in ms. */
   requestTimeoutMs: number;
   /** Auth0 issuer (tenant URL). Empty disables Auth0 enforcement. */
@@ -61,11 +63,16 @@ const DEFAULTS = {
   resourceUrl: 'https://cuelingua-mcp-767542644824.us-central1.run.app/mcp',
 };
 
-function parsePort(value: string | undefined, fallback: number): number {
+function parsePositiveInteger(value: string | undefined, fallback: number, max: number): number {
   if (!value) return fallback;
-  const n = Number.parseInt(value, 10);
-  if (Number.isNaN(n) || n <= 0 || n > 65535) return fallback;
+  if (!/^\d+$/.test(value)) return fallback;
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n <= 0 || n > max) return fallback;
   return n;
+}
+
+function parsePort(value: string | undefined, fallback: number): number {
+  return parsePositiveInteger(value, fallback, 65535);
 }
 
 /**
@@ -112,12 +119,56 @@ export function hasAuthMechanism(config: ServerConfig): boolean {
   );
 }
 
+/** Reject invalid auth combinations instead of silently changing the gate. */
+export function authConfigurationError(config: ServerConfig): string | null {
+  const hasIssuer = config.auth0Issuer.length > 0;
+  const hasAudience = config.auth0Audience.length > 0;
+  if (hasIssuer !== hasAudience) {
+    return 'Invalid authentication configuration: AUTH0_ISSUER and AUTH0_AUDIENCE must be configured together.';
+  }
+  if (hasIssuer && config.authToken.length > 0) {
+    return 'Invalid authentication configuration: choose Auth0 per-user authentication or MCP_AUTH_TOKEN static authentication; do not configure both.';
+  }
+  if (config.backendAuthToken.length > 0 && hasIssuer) {
+    return 'Invalid authentication configuration: MCP_BACKEND_AUTH_TOKEN is a trusted single-user credential and cannot be configured with per-user Auth0 mode.';
+  }
+  if (config.transport === 'stdio' && hasIssuer) {
+    return 'Invalid authentication configuration: Auth0 per-user mode requires HTTP; use MCP_BACKEND_AUTH_TOKEN for trusted stdio access.';
+  }
+  return null;
+}
+function backendIsRemote(config: ServerConfig): boolean {
+  try {
+    return !isLoopbackHost(new URL(config.apiBaseUrl).hostname);
+  } catch {
+    return true;
+  }
+}
+
+/** Ensure advertised static/stdio tools have the backend's required identity. */
+export function backendIdentityError(config: ServerConfig): string | null {
+  if (!backendIsRemote(config)) return null;
+  if (auth0Configured(config)) {
+    return config.apiKey.length === 0
+      ? 'Invalid backend identity configuration: CUELINGUA_API_KEY is required for the remote backend in Auth0 HTTP mode.'
+      : null;
+  }
+  const trustedMode = config.transport === 'stdio' || config.authToken.length > 0 || config.authOptOut;
+  if (!trustedMode) return null;
+  if (!config.apiKey || !config.backendAuthToken) {
+    return 'Invalid backend identity configuration: remote-backend stdio/static/local-tunnel mode requires both CUELINGUA_API_KEY and MCP_BACKEND_AUTH_TOKEN; Auth0 HTTP requests use their verified per-user token instead.';
+  }
+  return null;
+}
+
 /**
  * The deploy-time guard: fails (refuses to serve) when the HTTP server would
  * be exposed without any authentication. Returns an error message, or null
  * when the configuration is safe.
  */
 export function authGuardError(config: ServerConfig): string | null {
+  const authError = authConfigurationError(config);
+  if (authError) return authError;
   if (!needsRemoteAuth(config) || hasAuthMechanism(config) || config.authOptOut) {
     return null;
   }
@@ -153,13 +204,14 @@ export function auth0Configured(config: ServerConfig): boolean {
  * explicit MCP_AUTH_OPT_OUT).
  */
 export function shouldEnforceAuth(config: ServerConfig): boolean {
-  return config.transport === 'http' && auth0Configured(config);
+  return config.transport === 'http' && (config.auth0Issuer.length > 0 || config.auth0Audience.length > 0);
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const transport = env.MCP_TRANSPORT === 'stdio' ? 'stdio' : 'http';
   const port = parsePort(env.MCP_PORT, parsePort(env.PORT, DEFAULTS.port));
 
+  const maxTimeout = 2_147_483_647;
   return {
     apiKey: env.CUELINGUA_API_KEY ?? '',
     apiBaseUrl: (env.FSRS_API_BASE_URL || DEFAULTS.apiBaseUrl).replace(/\/+$/, ''),
@@ -167,7 +219,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     host: env.MCP_HOST || DEFAULTS.host,
     transport,
     authToken: env.MCP_AUTH_TOKEN ?? '',
-    requestTimeoutMs: parsePort(env.FSRS_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
+    backendAuthToken: env.MCP_BACKEND_AUTH_TOKEN ?? '',
+    requestTimeoutMs: parsePositiveInteger(env.FSRS_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs, maxTimeout),
     auth0Issuer: env.AUTH0_ISSUER ?? '',
     auth0Audience: env.AUTH0_AUDIENCE ?? '',
     resourceUrl: (env.MCP_RESOURCE_URL || DEFAULTS.resourceUrl).replace(/\/+$/, ''),

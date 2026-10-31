@@ -7,10 +7,9 @@
  * `resource_metadata` challenge, and the protected-resource metadata document
  * is served at /.well-known/oauth-protected-resource/mcp (the root-level
  * path the ChatGPT MCP connector queries, with a /mcp fallback).
- *
- * The stdio transport and the bare `MCP_AUTH_TOKEN` gate are untouched:
- * stdio has no HTTP surface, and the static token remains available as an
- * optional defense-in-depth layer.
+ * Auth0 requires a complete issuer/audience pair and is mutually exclusive
+ * with the static MCP_AUTH_TOKEN mode. Static-token authorization is checked
+ * by the HTTP entry point, never forwarded as a user identity token.
  *
  * No secrets (CUELINGUA_API_KEY, tokens) are ever logged or exposed here.
  */
@@ -19,8 +18,6 @@ import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { auth0Configured, shouldEnforceAuth, type ServerConfig } from './config.js';
 
-// Re-export for tests/back-compat (config.ts now owns the definition).
-export { auth0Configured, shouldEnforceAuth } from './config.js';
 
 export const OAUTH_RESOURCE_METADATA_PATH = '/.well-known/oauth-protected-resource';
 export const OAUTH_RESOURCE_METADATA_MCP_PATH = '/.well-known/oauth-protected-resource/mcp';
@@ -45,7 +42,7 @@ export function challengeFor(config: ServerConfig): string {
 }
 
 /** Serves the RFC 9728 protected-resource metadata document. */
-export function serveResourceMetadata(res: ServerResponse, config: ServerConfig): void {
+export function serveResourceMetadata(res: ServerResponse, config: ServerConfig, origin?: string): void {
   const body = {
     resource: config.resourceUrl,
     ...(auth0Configured(config) ? { authorization_servers: [config.auth0Issuer] } : {}),
@@ -62,7 +59,9 @@ export function serveResourceMetadata(res: ServerResponse, config: ServerConfig)
     // The ChatGPT connector fetches this document cross-origin from
     // chatgpt.com — without CORS the browser blocks the read and the
     // connector cannot discover the authorization server.
-    'access-control-allow-origin': '*',
+    'access-control-expose-headers': 'WWW-Authenticate, Mcp-Session-Id',
+    'access-control-allow-origin': origin ?? '*',
+    ...(origin ? { vary: 'Origin' } : {}),
   });
   res.end(JSON.stringify(body));
 }
@@ -71,7 +70,8 @@ export function serveResourceMetadata(res: ServerResponse, config: ServerConfig)
 export const METADATA_CORS_HEADERS: Record<string, string> = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET, OPTIONS',
-  'access-control-allow-headers': 'authorization, content-type',
+  'access-control-allow-headers': 'authorization, content-type, mcp-protocol-version, last-event-id',
+  'access-control-expose-headers': 'WWW-Authenticate, Mcp-Session-Id',
 };
 
 /**

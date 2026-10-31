@@ -1,55 +1,43 @@
-# ChatGPT GPT Action — FSRS Flashcard integration
+# Legacy Custom GPT Action contract — this integration is superseded by
+# `mcp-server/` (ChatGPT Apps SDK / Streamable HTTP at `/mcp`). Retained only
+# as a migration reference; do not configure new integrations from this file.
+# The Firebase backend deploys separately named Cloud Functions (no router
+# prefix). Protected operations require BOTH a valid X-API-Key and verified
+# Auth0 RS256 Bearer JWT outside the emulator. The JWT `sub` determines owner
+# scope. `/health` is public. Emulator calls use the fixed `emulator` owner.
 #
-# This schema is the current, supported integration surface for letting ChatGPT
-# call an external API: a **GPT Action** (Custom GPT + OpenAPI schema), not the
-# retired legacy ChatGPT Plugins (ai-plugin.json era, shut down April 2024).
+# This file describes the superseded Custom GPT Action integration. The
+# current integration is the MCP server in `mcp-server/`; do not configure
+# new integrations from this schema.
 #
-# Paste this file into the "Actions" section of a Custom GPT:
-#   https://chatgpt.com/gpts/editor
+# ROUTING NOTE: the Firebase backend deploys each handler as a SEPARATE named
+# Cloud Function (no rewrites/router prefix). Card/deck/session ids are path
+# suffixes on the function URLs. Server URL:
+#   https://us-central1-cuelingua.cloudfunctions.net
 #
-# ROUTING NOTE — matches the Firebase backend exactly:
-#   The backend (functions/src/index.ts) deploys each handler as a SEPARATE
-#   named Cloud Function (no rewrites/router prefix):
-#     health, createFlashcardHandler, bulkCreateFlashcardsHandler,
-#     bulkEnrollCardsHandler, enrollmentStatusHandler,
-#     listFlashcardsHandler, dueFlashcardsHandler, reviewFlashcardHandler,
-#     getFlashcardHandler, updateFlashcardHandler, deleteFlashcardHandler,
-#     bulkUpdateFlashcardsHandler, bulkDeleteFlashcardsHandler,
-#     createDeckHandler, listDecksHandler, getDeckHandler, updateDeckHandler,
-#     deleteDeckHandler, migrateDecksHandler,
-#     attachImageHandler, uploadImageHandler, listImagesHandler, removeImageHandler,
-#     startReviewSessionHandler, getReviewSessionHandler,
-#     submitSessionReviewHandler, endReviewSessionHandler
-#   Card/deck/session ids are appended to the function URL path, e.g.
-#     https://us-central1-cuelingua.cloudfunctions.net/getFlashcardHandler/<id>
-#
-#   Server URL (see chatgpt/README.md):
-#     https://us-central1-cuelingua.cloudfunctions.net
-#
-#   AUTH: every handler except /health requires the shared API key as the
-#   `X-API-Key` header. The backend enforces it on ANY non-emulator runtime
-#   (FUNCTIONS_EMULATOR unset — GCF does not set NODE_ENV, so the old
-#   NODE_ENV==='production' gate failed open; see functions/src/environment.ts).
-#   Missing/invalid keys get a 401 (the per-path 401 responses below).
+# AUTH: every handler except /health requires BOTH X-API-Key and a verified
+# Auth0 RS256 Bearer JWT outside the emulator. The JWT `sub` determines owner
+# scope. Missing/invalid credentials get 401; verifier outages get generic
+# 503. Emulator calls use the fixed `emulator` owner.
 openapi: 3.1.0
 info:
   title: FSRS Flashcard API
   description: >
-    Create, list, read, update, and delete spaced-repetition flashcards for the
-    FSRS (Free Spaced Repetition Scheduler) study system. Use this action when
-    the user wants to save a new flashcard, capture knowledge as a
-    question/answer pair, organize cards into decks, tag them, review or edit
-    existing cards, retrieve cards that are due for review, record a review
-    rating, or check whether the flashcard service is reachable. The backend
-    runs the FSRS scheduler: new cards are due immediately and each review
-    (Again/Hard/Good/Easy) advances the card's next due time.
+    Superseded legacy Custom GPT Action schema. The current integration is the
+    MCP server in mcp-server/. Every protected route requires both X-API-Key
+    and a verified Auth0 RS256 Bearer token; the verified JWT sub determines
+    owner scope. /health is public.
   version: 1.0.0
 servers:
   - url: https://us-central1-cuelingua.cloudfunctions.net
     description: Deployed Firebase Functions endpoint (us-central1) for the CueLingua project.
+security:
+  - ApiKeyAuth: []
+    Auth0Bearer: []
 paths:
   /health:
     get:
+      security: []
       operationId: checkHealth
       summary: Check that the flashcard service is reachable
       description: >
@@ -109,7 +97,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -152,7 +140,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -168,15 +156,24 @@ paths:
       operationId: bulkEnrollCards
       summary: Enroll large card sets safely (up to 10,000)
       description: >
-        Enrolls a large set of flashcards in a resumable, idempotent workflow.
-        The server chunks cards into <=100-card groups stored in Firestore, each
-        processed atomically via an onDocumentWritten trigger. Each card gets a
-        deterministic document id derived from its content (front + back + tags +
-        deckId + topic + suspended), so resending the same cards after a timeout
-        resumes from the last completed chunk — never duplicates cards. Existing
-        same-owner cards are skipped (scheduling state preserved). Returns the
-        enrollment job id and progress. Use GET /enrollmentStatusHandler/{jobId}
-        to poll for progress.
+        Enrolls up to 10,000 cards in a resumable, idempotent workflow. Card
+        identity is collision-safe structured JSON over the owner, trimmed
+        front/back, resolved stable deckId, sorted exact tag strings (commas
+        are literal, not CSV), trimmed topic, and suspended state. A SHA-256
+        identity claim is private and owner-scoped; it does not determine the
+        physical flashcard document ID, which is random. Only an exact
+        same-owner legacy card may be adopted; existing matching cards retain
+        their scheduling and user state. Deck-name resolution adopts one
+        unambiguous exact owner/name legacy deck, and card writes persist the
+        deck's current validated name.
+
+        Durable chunks are bounded by both 100 cards and 700 KiB serialized;
+        chunk-write batches are bounded by 400 writes and 6 MiB. Card creation,
+        private identity claims, chunk outcomes, and job counters commit
+        atomically. Re-submitting the same owner/card set returns the same
+        content-addressed job ID, validates stored chunks, and resumes missing
+        or noncompleted chunks. Use GET /enrollmentStatusHandler/{jobId} to
+        poll owner-scoped progress and counts.
       requestBody:
         required: true
         content:
@@ -197,7 +194,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -237,7 +234,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -294,7 +291,8 @@ paths:
           required: false
           schema:
             type: string
-          description: Opaque continuation token from a previous list response (last card id of the page).
+            maxLength: 3000
+          description: Opaque owner- and filter-bound continuation token from the previous list response; pass it back unchanged.
       responses:
         "200":
           description: A page of flashcards
@@ -312,13 +310,13 @@ paths:
                     type: [string, "null"]
                     description: Present when more cards are available; pass it back as pageToken.
         "400":
-          description: Invalid query parameters
+          description: Invalid query parameters or a pageToken incompatible with the owner or selectors.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -370,10 +368,11 @@ paths:
           required: false
           schema:
             type: string
-          description: Opaque continuation token from a previous response (last card id of the page).
+            maxLength: 3000
+          description: Opaque owner- and filter-bound continuation token from the previous response; pass it back unchanged.
       responses:
         "200":
-          description: A page of due flashcards
+          description: A page of due flashcards.
           content:
             application/json:
               schema:
@@ -382,29 +381,150 @@ paths:
                 properties:
                   cards:
                     type: array
-                    items:
-                      $ref: "#/components/schemas/Flashcard"
+                    items: { $ref: "#/components/schemas/Flashcard" }
                   nextPageToken:
                     type: [string, "null"]
                     description: Present when more cards are available; pass it back as pageToken.
         "400":
-          description: Invalid query parameters
+          description: Invalid query parameters or a pageToken incompatible with the owner or selectors.
           content:
             application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+              schema: { $ref: "#/components/schemas/Error" }
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT.
           content:
             application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+              schema: { $ref: "#/components/schemas/Error" }
         "500":
-          description: Internal server error
+          description: Internal server error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /searchCardsHandler:
+    get:
+      operationId: searchCards
+      summary: Search cards with composable filters
+      description: >
+        Returns a page ordered by createdAt descending and document ID
+        ascending. Filter families intersect; values within each repeated
+        array parameter use OR, except tagsAll which uses AND. Array values
+        are exact literals: commas and leading or trailing whitespace are
+        preserved. A nextPageToken is opaque, bound to the authenticated owner and
+        canonical filters, and must be passed back unchanged with the same filters.
+      parameters:
+        - name: search
+          in: query
+          schema: { type: string, maxLength: 500 }
+          description: Case-insensitive substring match against topic, front, or back.
+        - name: tagsAny
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 20
+            items: { type: string, minLength: 1, maxLength: 50 }
+          description: Match a card carrying any repeated tag value.
+        - name: tagsAll
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 20
+            items: { type: string, minLength: 1, maxLength: 50 }
+          description: Match a card carrying every repeated tag value.
+        - name: tagsNot
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 20
+            items: { type: string, minLength: 1, maxLength: 50 }
+          description: Exclude cards carrying any repeated tag value.
+        - name: review
+          in: query
+          schema: { type: string, enum: [due, notDue, new, reviewed] }
+        - name: decks
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 20
+            items: { type: string, minLength: 1, maxLength: 100 }
+          description: Stable deck IDs; repeated values match any deck (unions with deckNames).
+        - name: deckNames
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 20
+            items: { type: string, minLength: 1, maxLength: 300 }
+          description: Exact deck names; repeated values match any deck (unions with decks).
+        - name: suspended
+          in: query
+          schema: { type: boolean }
+          description: true for suspended cards, false for active cards, absent for both.
+        - name: createdFrom
+          in: query
+          schema: { type: string, format: date-time }
+        - name: createdTo
+          in: query
+          schema: { type: string, format: date-time }
+        - name: updatedFrom
+          in: query
+          schema: { type: string, format: date-time }
+        - name: updatedTo
+          in: query
+          schema: { type: string, format: date-time }
+        - name: pageSize
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: pageToken
+          in: query
+          schema: { type: string, maxLength: 3000 }
+      responses:
+        "200":
+          description: A page of matching cards.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                type: object
+                required: [cards, nextPageToken]
+                properties:
+                  cards:
+                    type: array
+                    items: { $ref: "#/components/schemas/Flashcard" }
+                  nextPageToken:
+                    type: [string, "null"]
+        "400":
+          description: Invalid filters or a pageToken incompatible with the owner or canonical filters.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Authentication verifier unavailable; response contains no credential values.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /reviewFlashcardHandler/{id}:
     post:
       operationId: reviewFlashcard
@@ -442,6 +562,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "409":
+          description: Legacy learning progress is ambiguous; no review was recorded. Explicitly reset the card's scheduling state before reviewing again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           description: Card not found
           content:
@@ -449,7 +575,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -494,7 +620,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -548,7 +674,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -594,7 +720,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -635,7 +761,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -679,7 +805,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -720,7 +846,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -736,10 +862,10 @@ paths:
       operationId: listDecks
       summary: List decks
       description: >
-        Lists decks, most recently created first, paginated with pageSize
-        (1-100, default 20) and pageToken (pass the nextPageToken from a
-        previous response to get the next page). Use this to find a deck id for
-        filtering cards or assigning cards to a deck.
+        Lists decks ordered by createdAt descending then document ID descending,
+        paginated with pageSize (1-100, default 20) and pageToken. The opaque
+        nextPageToken is owner-bound; pass it back unchanged to get the next page.
+        Use this to find a deck id for filtering cards or assigning cards to a deck.
       parameters:
         - name: pageSize
           in: query
@@ -755,7 +881,8 @@ paths:
           required: false
           schema:
             type: string
-          description: Opaque continuation token from a previous response.
+            maxLength: 3000
+          description: Opaque owner-bound continuation token from a previous response; pass it back unchanged.
       responses:
         "200":
           description: A page of decks
@@ -773,13 +900,13 @@ paths:
                     type: [string, "null"]
                     description: Present when more decks are available.
         "400":
-          description: Invalid query parameters
+          description: Invalid query parameters or a pageToken incompatible with the owner.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -824,7 +951,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -878,7 +1005,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -921,7 +1048,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/DeleteDeckResult"
         "400":
-          description: Missing deck id
+          description: Missing deck id or attempted deletion of the system-protected "Uncategorized" deck
           content:
             application/json:
               schema:
@@ -933,13 +1060,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "400":
-          description: Cannot delete the system-protected "Uncategorized" deck
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -973,7 +1094,7 @@ paths:
                     type: integer
                     description: Number of cards assigned in this call.
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1007,7 +1128,7 @@ paths:
                     type: integer
                     description: Number of cards backfilled in this call.
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1063,7 +1184,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1084,10 +1205,11 @@ paths:
         types: image/jpeg, image/png, image/gif, image/webp, image/avif,
         image/bmp — SVG is NOT accepted for upload), writes them to Firebase
         Storage under a card-scoped sanitized path, and persists metadata on
-        the card: id, storagePath, downloadUrl (signed URL), contentType,
-        sizeBytes, alt, addedAt. A card can hold at most 5 images. Does not
-        affect FSRS scheduling. Returns the updated card and the uploaded
-        image with its cloud metadata.
+        the card: id, storagePath, downloadUrl (short-lived signed URL),
+        contentType, sizeBytes, alt, addedAt. Owned card/image reads refresh
+        the persisted URL as it nears expiry; use the latest returned URL.
+        A card can hold at most 5 images. Does not affect FSRS scheduling.
+        Returns the updated card and the uploaded image with its cloud metadata.
       parameters:
         - name: cardId
           in: path
@@ -1121,7 +1243,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1163,7 +1285,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1179,11 +1301,11 @@ paths:
       operationId: removeImage
       summary: Remove an image from a flashcard (by URL)
       description: >
-        Removes an image attachment from a flashcard by its URL. The URL must
-        exactly match an attached image's url. Returns { cardId, removed } —
-        removed is false when no image with that URL was attached. Only the
-        card's reference is removed; the externally hosted image file is NOT
-        deleted.
+        Removes an image attachment from a flashcard by URL. External URL
+        references must match exactly and their source is not deleted. An
+        owned Storage image may be matched using an older signed URL for the
+        same configured bucket/object; its Storage object is deleted after
+        the card-reference transaction commits. Returns { cardId, removed }.
       parameters:
         - name: cardId
           in: path
@@ -1217,7 +1339,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1233,23 +1355,23 @@ paths:
       operationId: startReviewSession
       summary: Start a persistent review session
       description: >
-        Starts a persistent review session: the backend snapshots EVERY
-        matching card into the session queue (never capped, no pagination).
-        NO selectors -> the standard DUE queue (new + scheduled cards,
-        ordered earliest due first). Optional selectors (any combination):
-        deckId (stable id) and/or deck (legacy name; deckId wins), tags
-        (ANY-of), cardIds (explicit allowlist, deduped, every id must exist;
-        combined with deck/tags by INTERSECTION). Selector-defined sessions
-        may include NON-due cards; the selector query is authoritative.
-        Persists the session source metadata ('due' | 'deck' | 'custom').
-        Returns
-        the session (id, status, mode spaced_repetition, dueCount — the EXACT
-        number of cards snapshotted at start — cardIds, currentIndex,
-        reviewedCount, remainingCount, ratingCounts, timestamps) plus
-        the FIRST card to review (card is null when nothing is due). The
-        queue is stable across retries; cards that become due later are not
-        added. Sessions are scoped to the API key that starts them — only
-        that key can get/submit/end them.
+        Starts a persistent review session with a stable snapshot of every
+        selected card, ordered by due time. With no selectors, the selection
+        is the standard due queue; optional deckId/deck/tags/cardIds selectors
+        define the set and may include non-due cards. Tags use ANY-of semantics;
+        deck and card-id selectors combine by intersection. Session cardType
+        and name are presentation/display metadata, not selection filters.
+        New v2 sessions store the full queue in queueChunks (200 positions per
+        chunk), while responses expose only the current card and bounded
+        queueWindow/preloaded data; root and response cardIds/source.cardIds
+        arrays are omitted. Legacy v1/no-version sessions retain their full
+        array response shape. dueCount is the due-queue count with no
+        selectors; selector-defined sessions may include non-due cards.
+        Persists source metadata ('due' | 'deck' | 'custom'). The response
+        includes the session and first live card (null when the queue is
+        exhausted). v2 Continue copies the prior chunked snapshot using
+        repeatSessionId. Sessions are scoped to the authenticated ownerId;
+        X-API-Key verification is a separate credential gate.
       requestBody:
         required: true
         content:
@@ -1270,7 +1392,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1286,12 +1408,13 @@ paths:
       operationId: getReviewSession
       summary: Get a review session and its current card
       description: >
-        Retrieves a review session by id (any status: active, completed, or
-        ended) plus the card currently awaiting review — null when the queue
-        is exhausted or the session is finished. Includes status, reviewed and
-        current counters, rating counts (again/hard/good/easy), and the
-        remaining card ids. Only the API key that started the session can read
-        it (403 otherwise). Use this to resume an interrupted review flow.
+        Retrieves the session and current live card for its authenticated
+        ownerId; only that owner may read it (403 otherwise). New v2 responses
+        include a bounded queueWindow and preloaded card summaries, not the
+        full queue arrays; legacy v1/no-version sessions keep their array
+        response shape. Use this to resume an interrupted review flow. A v2
+        queue build that failed is not reviewable and is not returned as a
+        partial snapshot.
       parameters:
         - name: sessionId
           in: path
@@ -1313,7 +1436,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: Session started by a different API key
+          description: Session belongs to a different authenticated ownerId
           content:
             application/json:
               schema:
@@ -1325,7 +1448,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1341,17 +1464,20 @@ paths:
       operationId: submitSessionReview
       summary: Submit a rating for the current card of a review session
       description: >
-        Submits an FSRS rating (1=Again, 2=Hard, 3=Good, 4=Easy) for the
-        EXPECTED current card of a review session (the card returned by
-        startReviewSession or getReviewSession). The backend atomically
-        applies the FSRS scheduler to that card AND advances the session
-        (currentIndex, reviewedCount, ratingCounts, status) in one
-        transaction, so retries and concurrent submissions can never
-        double-apply a review or lose progress. Returns the updated session
-        and the NEXT card to review (null when the session just completed).
-        Cards deleted since the snapshot are skipped automatically. A session
-        that is already completed or ended rejects the submission (409).
-        Optionally pass reviewAt (ISO 8601); defaults to server time.
+        Submits an FSRS rating (1=Again, 2=Hard, 3=Good, 4=Easy). For v2,
+        expectedCardId without expectedPosition confirms the current live card;
+        a mismatch is a 409. A client may instead address a pending queue
+        position with expectedPosition and optionally confirm its id with
+        expectedCardId. A position already claimed by a different request or
+        outside the queue conflicts; a deleted target is skipped without
+        applying a rating. Legacy sessions retain their array-based lookup.
+        The card's FSRS state and session progress commit atomically. A
+        requestId is an idempotency receipt: retrying the same id does not
+        apply the rating twice. The response carries the updated session and
+        next live card (null when exhausted); preloaded is normally empty and
+        may be populated after bounded advancement across deleted chunks.
+        Completed or ended sessions reject ratings (409). Optionally pass
+        reviewAt (ISO 8601); defaults to server time.
       parameters:
         - name: sessionId
           in: path
@@ -1379,7 +1505,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: Session started by a different API key
+          description: Session belongs to a different authenticated ownerId
           content:
             application/json:
               schema:
@@ -1391,13 +1517,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "409":
-          description: Session is not active (completed or ended)
+          description: Session is not active or the requested card/position conflicts; no rating was applied
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1417,8 +1543,9 @@ paths:
         session status becomes ended with an endedAt timestamp and it no
         longer accepts ratings. Idempotent — ending an already-completed or
         already-ended session is a no-op that returns it unchanged. Only the
-        API key that started the session can end it (403 otherwise). Use this
-        when the user wants to stop studying before the queue is finished.
+        authenticated ownerId may end it (403 otherwise); X-API-Key verification
+        is a separate credential gate. Use this when the user wants to stop
+        studying before the queue is finished.
       parameters:
         - name: sessionId
           in: path
@@ -1440,7 +1567,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "403":
-          description: Session started by a different API key
+          description: Session belongs to a different authenticated ownerId
           content:
             application/json:
               schema:
@@ -1452,7 +1579,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
-          description: Missing or invalid API key (production only)
+          description: Missing/invalid X-API-Key or Auth0 Bearer JWT
           content:
             application/json:
               schema:
@@ -1694,6 +1821,17 @@ paths:
                 $ref: "#/components/schemas/Error"
 
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Shared Firestore API key; required together with Auth0Bearer.
+    Auth0Bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Auth0 RS256 access token; verified `sub` becomes ownerId.
   schemas:
     FlashcardCreate:
       type: object
@@ -1899,11 +2037,11 @@ components:
             $ref: "#/components/schemas/FlashcardCreate"
     BulkEnrollCardsResponse:
       type: object
-      required: [jobId, status, totalCards, totalChunks, completedChunks, createdCount, skippedCount, failedCount]
+      required: [jobId, status, totalCards, totalChunks, completedChunks, createdCount, skippedCount, failedCount, retriedChunkCount]
       properties:
         jobId:
           type: string
-          description: Content-addressable enrollment job id (SHA-256 of sorted card keys).
+          description: Content-addressable enrollment job id derived from the owner's canonical full card identities.
         status:
           type: string
           enum: [pending, processing, completed, failed]
@@ -1913,19 +2051,22 @@ components:
           description: Total number of cards in the enrollment request.
         totalChunks:
           type: integer
-          description: Total number of chunks (ceil(totalCards / 100)).
+          description: Total number of count- and serialized-byte-bounded chunks.
         completedChunks:
           type: integer
-          description: Number of chunks fully committed (0..totalChunks).
+          description: Number of chunks committed exactly once (0..totalChunks).
         createdCount:
           type: integer
           description: Number of cards successfully created across committed chunks.
         skippedCount:
           type: integer
-          description: Number of cards skipped because they already exist for this owner (idempotent re-enrollment).
+          description: Existing exact cards and repeated equivalent input entries skipped.
         failedCount:
           type: integer
-          description: Number of cards that failed validation or creation.
+          description: Card-level failures accumulated from completed chunks.
+        retriedChunkCount:
+          type: integer
+          description: Newly persisted chunks plus stored noncompleted chunks requeued by this submission.
     BulkEnrollStatusResponse:
       type: object
       required: [jobId, status, totalCards, totalChunks, completedChunks, createdCount, skippedCount, failedCount, createdAt, updatedAt]
@@ -1939,15 +2080,19 @@ components:
           type: integer
         totalChunks:
           type: integer
+          description: Number of count- and serialized-byte-bounded chunks.
         completedChunks:
           type: integer
+          description: Number of chunks committed exactly once (0..totalChunks).
         createdCount:
           type: integer
+          description: Number of cards newly created across committed chunks.
         skippedCount:
           type: integer
-          description: Cards skipped (already enrolled for this owner).
+          description: Existing exact cards and repeated equivalent input entries skipped.
         failedCount:
           type: integer
+          description: Card-level failures accumulated from completed chunks.
         createdAt:
           type: string
           format: date-time
@@ -2109,6 +2254,9 @@ components:
         lapses:
           type: integer
           description: Number of times the card was forgotten (rated Again after graduating).
+        learningSteps:
+          type: integer
+          description: Current ts-fsrs learning/relearning step when known. Absent on legacy cards where progress is not recorded.
         lastReview:
           type: object
           description: Time of the last review, if any. Same wire shape as createdAt.
@@ -2141,9 +2289,9 @@ components:
           type: string
           maxLength: 2048
           description: >
-            The image URL: the external http(s) URL for URL attachments, or
-            the signed download URL for cloud uploads. The backend never
-            stores image bytes in Firestore.
+            The exact external http(s) URL for URL attachments, or the current
+            short-lived signed URL for a cloud upload (refreshed on owned
+            reads). The backend never stores image bytes in Firestore.
         alt:
           type: string
           maxLength: 500
@@ -2167,7 +2315,7 @@ components:
           description: Firebase Storage object path (cloud uploads only), e.g. card-images/{cardId}/{imageId}.jpg.
         downloadUrl:
           type: string
-          description: Signed download URL (cloud uploads only).
+          description: Short-lived signed URL for cloud uploads; refreshed on owned reads.
         sizeBytes:
           type: integer
           description: Decoded byte size (cloud uploads only).
@@ -2252,7 +2400,7 @@ components:
           type: string
           minLength: 1
           maxLength: 2048
-          description: The exact URL of the attached image to remove.
+          description: External attachment URL (matched exactly); an owned Storage image may also be identified by an older signed URL for the same bucket/object.
     ImageRemoveResult:
       type: object
       required: [cardId, removed]
@@ -2316,6 +2464,9 @@ components:
           type: integer
         lapses:
           type: integer
+        learningStepsAfter:
+          type: integer
+          description: ts-fsrs learning/relearning step after the review when recorded.
     ReviewResult:
       type: object
       required: [card, reviewLogItem]
@@ -2352,7 +2503,7 @@ components:
             (ANY-of semantics). Combined with a deck selector by intersection.
         cardIds:
           type: array
-          maxItems: 100
+          maxItems: 5000
           items:
             type: string
             maxLength: 200
@@ -2403,26 +2554,28 @@ components:
           minLength: 8
           maxLength: 128
           description: >
-            Stable idempotency key (client-generated, e.g. a UUID). When
-            provided the backend records it and a retried submission with the
-            SAME key is a no-op returning the recorded result — background
-            retries and parallel submissions never double-apply a rating.
+            Stable idempotency key. A committed v2 request stores a private
+            per-session receipt in the same transaction as session progress;
+            replaying the same key does not apply the rating again and returns
+            current session state rather than a frozen earlier response.
         expectedCardId:
           type: string
           maxLength: 200
           description: >
-            The card id this rating applies to — any live, unrated snapshot
-            card at or after the current position (parallel submissions may
-            rate out of order). A mismatch or already-rated card fails 409.
-            Omitted falls back to the session's current card.
+            For v2, without expectedPosition this confirms the current live
+            card; a different id is a 409 conflict. With expectedPosition it
+            confirms that pending queue position. A mismatched id or a
+            position already claimed by another request conflicts. Legacy
+            sessions retain their array-based forward lookup behavior.
         expectedPosition:
           type: integer
           minimum: 0
           description: >
-            v2 bounded alternative to expectedCardId: the queue POSITION
-            (0-based) the rating applies to — for clients that do not hold
-            the full card-id queue (only currentPosition / queueWindow). A
-            claimed, skipped, or out-of-range position fails 409.
+            v2 zero-based queue position to claim, for a client using the
+            bounded queue window. It may target a pending position; a target
+            already claimed by another request or outside the queue conflicts.
+            If the selected card was deleted, the position is skipped without
+            applying a rating.
     SessionRatingCounts:
       type: object
       required: [again, hard, good, easy, ratingCounts]
@@ -2448,14 +2601,14 @@ components:
             3=Good, 4=Easy) for machine-friendly access.
     ReviewSession:
       type: object
-      required: [id, apiKeyName, status, mode, limit, dueCount, currentIndex, reviewedCount, truncated, continuationAvailable, ratingCounts, startedAt]
+      required: [id, ownerId, status, mode, limit, dueCount, currentIndex, reviewedCount, truncated, continuationAvailable, ratingCounts, startedAt]
       properties:
         id:
           type: string
           description: Server-assigned session id.
-        apiKeyName:
+        ownerId:
           type: string
-          description: The API key name that started the session (ownership; only that key can get/submit/end it).
+          description: Verified owner identity that owns this session.
         status:
           type: string
           enum: [active, completed, ended, failed]
@@ -2522,11 +2675,11 @@ components:
         source:
           type: object
           description: >
-            Persisted provenance of the session's card set: what selectors
-            defined the snapshot ('due' | 'deck' | 'custom') plus the
-            selector details (deck id/name, tags, explicit card ids). The
-            widget shows 'due' as "Due cards", 'deck' as the deck name, and
-            'custom' as "Custom"; Continue replays the exact selection.
+            Persisted provenance of the session's card set: source type
+            ('due' | 'deck' | 'custom') and available selector details (deck
+            id/name and tags). V2 responses omit source.cardIds; Continue
+            copies the chunked snapshot by repeatSessionId. Legacy sessions
+            may retain selector card ids for replay.
           properties:
             type:
               type: string
@@ -2543,25 +2696,26 @@ components:
               type: array
               items:
                 type: string
+              description: Present only on legacy session responses; v2 omits source.cardIds.
         limit:
           type: integer
-          description: Number of cards snapshotted into the session (always equals cardIds.length).
+          description: >
+            Total number of positions in the snapshot. For v1 this equals
+            cardIds.length; for v2 it is the total queued positions.
         dueCount:
           type: integer
           description: >
-            Exact number of cards that were due when the session started,
-            counted with the same due query (deck filter included). Always
-            equals cardIds.length for sessions started after the cap was
-            removed.
+            Snapshot count. With no selectors this is the exact due-queue
+            count; selector-defined sessions may include non-due cards, so
+            dueCount is not necessarily the number that were due.
         cardIds:
           type: array
           items:
             type: string
           description: >
-            Snapshot of the matching card ids (LEGACY v1/no-version sessions
-            ONLY — v2 roots deliberately OMIT this array; the queue lives in
-            queueChunks child documents and responses carry the bounded
-            currentPosition + queueWindow instead).
+            Snapshot ids for legacy v1/no-version sessions only. V2 roots and
+            responses omit this array; the complete queue lives in
+            queueChunks and responses carry only currentPosition/queueWindow.
         currentPosition:
           type: integer
           description: >
@@ -2581,13 +2735,13 @@ components:
                 type: string
         currentIndex:
           type: integer
-          description: Index into cardIds (v1) / current queue position (v2) of the card awaiting the next rating.
+          description: v1 index into cardIds; v2 current stable queue position.
         reviewedCount:
           type: integer
           description: Number of cards successfully rated in this session.
         remainingCount:
           type: integer
-          description: Number of cards still awaiting review (cardIds.length - currentIndex).
+          description: Number of live cards still awaiting review (v1 is computed from arrays; v2 uses remainingQueueCount).
         truncated:
           type: boolean
           description: True only on legacy sessions started while the old 100-card cap was in place (new sessions never truncate).
@@ -2647,6 +2801,9 @@ components:
               tags:
                 type: array
                 items: { type: string }
+              position:
+                type: integer
+                description: Stable v2 queue position when returned by the backend.
           description: >
             Upcoming cards (after the current card), up to the bounded
             SESSION_PRELOAD window.

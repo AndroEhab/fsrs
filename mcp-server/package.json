@@ -5,7 +5,7 @@
   "description": "MCP server (ChatGPT Apps SDK platform) bridging ChatGPT to the deployed FSRS flashcard Firebase Functions API. Tools: create/list/get/update/delete flashcard + health.",
   "type": "module",
   "engines": {
-    "node": ">=20.9"
+    "node": ">=22"
   },
   "main": "dist/index.js",
   "scripts": {
@@ -15,17 +15,17 @@
     "start:stdio": "node --env-file-if-exists=.env scripts/launch-local.mjs stdio",
     "start:http:local": "node --env-file-if-exists=.env scripts/launch-local.mjs http",
     "dev": "npm run build && node --env-file-if-exists=.env dist/index.js",
-    "test": "jest",
+    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js",
     "smoke": "npm run build && node scripts/smoke.mjs && node scripts/check-widget-runtime.mjs",
     "smoke:forwarded-token": "npm run build && node scripts/forwarded-token-smoke.mjs",
-    "inspect":"npx @modelcontextprotocol/inspector@latest",
-    "preview":"npm run build && node scripts/widget-preview.mjs",
-    "preview:watch":"npm run build && node scripts/widget-preview.mjs --watch"
+    "inspect": "npx @modelcontextprotocol/inspector@latest",
+    "preview": "npm run build && node scripts/widget-preview.mjs",
+    "preview:watch": "npm run build && node scripts/widget-preview.mjs --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "jose": "^6.2.10",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",

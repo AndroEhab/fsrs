@@ -13,6 +13,33 @@
  * the service layer runs without an authenticated key) stays open because
  * the emulator sets the marker.
  */
+
+const LOOPBACK_EMULATOR_HOST = /^(localhost|127\.0\.0\.1|\[::1\]):([1-9]\d{0,4})$/;
+
+function isLoopbackEmulatorHost(host: string | undefined): boolean {
+  if (host === undefined) return false;
+  const match = LOOPBACK_EMULATOR_HOST.exec(host);
+  return match !== null && Number(match[2]) <= 65535;
+}
+
+/**
+ * Prevent the Functions emulator from using live Firestore or Storage.
+ * Admin SDK emulator routing is opt-in via endpoint environment variables.
+ */
+export function assertLocalEmulatorDatastores(): void {
+  if (process.env.FUNCTIONS_EMULATOR !== 'true') return;
+
+  const storageHost = process.env.FIREBASE_STORAGE_EMULATOR_HOST;
+  const storageOverride = process.env.STORAGE_EMULATOR_HOST;
+  if (!isLoopbackEmulatorHost(process.env.FIRESTORE_EMULATOR_HOST)
+      || !isLoopbackEmulatorHost(storageHost)
+      || (storageOverride !== undefined && storageOverride !== `http://${storageHost}`)) {
+    throw new Error(
+      'Functions emulator requires loopback Firestore and Storage emulator endpoints.',
+    );
+  }
+}
+
 export function isProductionRuntime(): boolean {
   return process.env.FUNCTIONS_EMULATOR !== 'true';
 }

@@ -105,17 +105,20 @@ card's next due time.
     bytes — so the URL must be `http(s)` and point to an allowed image type
     (`.jpg/.jpeg/.png/.gif/.webp/.avif/.bmp/.svg` or a declared `mimeType`).
     A card holds at most 5 images. To see what is attached, call `listImages`;
-    to remove one, call `removeImage` with the card id and the exact URL (only
-    the card's reference is removed, not the hosted file).
+    to remove one, call `removeImage` with the card id and its URL. External
+    URL references must match exactly and their source is never deleted; an
+    owned Storage image also accepts an older signed URL for the same object,
+    and its Storage object is deleted after the card reference is committed.
 12. When the user provides an image file or embedded/base64 image data, call
     `uploadImage` with the card id, `data` (base64), `fileName`, and
     `contentType`. The backend decodes the bytes (max 10 MiB), validates the
     content type (allowed raster types: jpeg/png/gif/webp/avif/bmp — SVG is
     not accepted for upload), stores the bytes in Firebase Storage under a
     card-scoped path, and records cloud metadata on the card (id,
-    storagePath, downloadUrl, contentType, sizeBytes, alt, addedAt). The
-    returned `downloadUrl` is what the user can view. Removing a cloud image
-    also deletes the stored object (best-effort).
+    storagePath, downloadUrl, contentType, sizeBytes, alt, addedAt). Signed
+    URLs are short-lived and refreshed on owner-scoped reads; use the latest
+    URL returned by the backend. Removing a cloud image also deletes its
+    owned Storage object (best-effort).
 
 **Additional Notes**:
 

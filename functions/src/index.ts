@@ -1,30 +1,32 @@
+import { LearningProgressUnavailableError } from './flashcards/scheduler';
 import { onRequest } from 'firebase-functions/v2/https';
 import { onDocumentWritten } from 'firebase-functions/v2/firestore';
 import { initializeApp } from 'firebase-admin/app';
 import {
   verifyRequest, type RequestIdentity,
 } from './identity';
-import { isProductionRuntime } from './environment';
+import { assertLocalEmulatorDatastores, isProductionRuntime } from './environment';
 import {
   createFlashcard, getFlashcard, updateFlashcard, deleteFlashcard, listFlashcards,
   dueFlashcards, reviewFlashcard, verifyApiKey,
   resetFlashcards, setFlashcardDueDate, suspendFlashcards, unsuspendFlashcards,
   bulkCreateFlashcards, bulkUpdateFlashcards, bulkDeleteFlashcards,
-  createDeck, getDeck, updateDeck, deleteDeck, listDecks, migrateLegacyDeckNames,
-  assignDecklessToDefault,
   listTags, renameTag, deleteTag, mergeTags,
-  attachImage, listImages, removeImage, uploadImage,
+  attachImage, listImages, removeImage, uploadImage, refreshOwnedCardImageUrls,
   startReviewSession, getReviewSession, submitSessionReview, endReviewSession,
   searchCards, countFlashcards,
-  DeckNotFoundError, DeckNameConflictError, CardDeckRequiredError, ProtectedDeckError, ImageValidationError,
+  CardDeckRequiredError, ImageValidationError,
   ReviewSessionNotActiveError, ReviewSessionForbiddenError, ReviewExpectedCardMismatchError,
-  ReviewSessionCardNotFoundError, ReviewSessionBuildFailedError, ReviewSessionSelectionTooLargeError,
+  ReviewSessionCardNotFoundError, ReviewSessionBuildFailedError, ReviewSessionRetryHistoryUnavailableError, ReviewSessionSelectionTooLargeError,
 } from './flashcards/service';
 import {
-  bulkEnrollCards, getEnrollmentStatus,
-  EnrollmentValidationError,
-  onEnrollmentChunkWritten,
-} from './flashcards/enrollment';
+  createDeck, getDeck, updateDeck, deleteDeck, listDecks, migrateLegacyDeckNames,
+  assignDecklessToDefault,
+  DeckNotFoundError, DeckNameConflictError, ProtectedDeckError,
+  AmbiguousDeckNameError, DeckNameReservationError,
+} from './flashcards/decks';
+import { InvalidPageTokenError, isValidFirestoreDocumentId } from './flashcards/documentPageTokens';
+import { getEnrollmentStatus, bulkEnrollCards, EnrollmentValidationError, onEnrollmentChunkWritten } from './flashcards/enrollment';
 import {
   getReviewHistory, getStudyStats, getTopLapsedCards, migrateLegacyReviewEvents,
 } from './flashcards/reviewHistory';
@@ -48,6 +50,7 @@ import {
   safeValidateBulkEnrollCards,
 } from './flashcards/validators';
 
+assertLocalEmulatorDatastores();
 initializeApp();
 
 function corsHeaders(): Record<string, string> {
@@ -64,12 +67,18 @@ function errorResponse(res: any, message: string, status = 400, issues?: unknown
   res.status(status).json({ error: message, issues });
 }
 
+function invalidPageTokenResponse(res: any, err: unknown): boolean {
+  if (!(err instanceof InvalidPageTokenError)) return false;
+  errorResponse(res, err.message, 400);
+  return true;
+}
+
 /**
  * Maps service errors to client-visible statuses:
  *  - DeckNotFoundError  -> 404 (a referenced deckId does not exist)
  *  - DeckNameConflictError -> 400 (duplicate deck name)
  *  - ImageValidationError -> 400 (invalid image URL/MIME/count)
- *  - anything else      -> 500
+ *  - LearningProgressUnavailableError -> 409 (legacy scheduling state requires an explicit reset)
  * Returns true when the response was written (i.e. the error was handled).
  */
 function deckErrorResponse(res: any, err: unknown, logPrefix: string): boolean {
@@ -79,6 +88,10 @@ function deckErrorResponse(res: any, err: unknown, logPrefix: string): boolean {
   }
   if (err instanceof DeckNameConflictError) {
     errorResponse(res, err.message, 400);
+    return true;
+  }
+  if (err instanceof AmbiguousDeckNameError || err instanceof DeckNameReservationError) {
+    errorResponse(res, err.message, 409);
     return true;
   }
   if (err instanceof CardDeckRequiredError) {
@@ -117,8 +130,16 @@ function deckErrorResponse(res: any, err: unknown, logPrefix: string): boolean {
     errorResponse(res, err.message, 409);
     return true;
   }
+  if (err instanceof ReviewSessionRetryHistoryUnavailableError) {
+    errorResponse(res, err.message, 409);
+    return true;
+  }
   if (err instanceof ReviewSessionSelectionTooLargeError) {
     errorResponse(res, err.message, 400);
+    return true;
+  }
+  if (err instanceof LearningProgressUnavailableError) {
+    errorResponse(res, err.message, 409);
     return true;
   }
   console.error(logPrefix, err);
@@ -139,16 +160,17 @@ function deckErrorResponse(res: any, err: unknown, logPrefix: string): boolean {
  *  - In the emulator, requests stay open but resolve to the fixed
  *    `'emulator'` owner (scoped dev data, never global).
  *
- * Returns `{ identity, apiKeyName, error }`. On error the caller writes a
- * 401 with the error's message. `identity` is null only in the error case;
- * production calls always carry a real ownerId before reaching services.
+ * Returns `{ identity, apiKeyName, error }`. Invalid/missing credentials
+ * return a 401; Firestore/JWKS infrastructure failures are caught by
+ * `requireIdentity`, which returns a generic 503 without logging secrets.
+ * Production handlers reach services only with a verified owner identity.
  */
 async function authenticateRequest(req: any): Promise<{
   identity: RequestIdentity | null;
   apiKeyName: string | null;
   error: string | null;
 }> {
-  const apiKey = req.headers.get?.('X-API-Key') || req.headers['x-api-key'];
+  const apiKey = req.get('X-API-Key');
   const apiKeyName = apiKey ? await verifyApiKey(apiKey) : null;
   const production = isProductionRuntime();
 
@@ -156,7 +178,7 @@ async function authenticateRequest(req: any): Promise<{
     return { identity: null, apiKeyName: null, error: 'Invalid or missing API key' };
   }
 
-  const bearer = req.headers.get?.('authorization') || req.headers['authorization'];
+  const bearer = req.get('authorization');
   const { identity, error } = await verifyRequest(bearer);
   if (error) {
     if (!production) {
@@ -171,26 +193,87 @@ async function authenticateRequest(req: any): Promise<{
 }
 
 /**
- * Auth gate used inside handlers that already handled OPTIONS/method checks:
- * returns the request identity, or writes the 401 and returns null.
+ * Auth gate after OPTIONS/method checks. Invalid or missing credentials get
+ * 401; verifier infrastructure failures get a secret-safe generic 503.
  */
-async function identityOr401(req: any, res: any): Promise<RequestIdentity | null> {
-  const auth = await authenticateRequest(req);
-  if (auth.error) {
-    errorResponse(res, auth.error, 401);
+async function requireIdentity(req: any, res: any): Promise<RequestIdentity | null> {
+  try {
+    const auth = await authenticateRequest(req);
+    if (auth.error) {
+      errorResponse(res, auth.error, 401);
+      return null;
+    }
+    return auth.identity;
+  } catch {
+    // API-key document paths contain the raw key; never log the request or
+    // Firestore error object/message/stack at this authentication boundary.
+    console.error('Authentication credential verification unavailable');
+    errorResponse(res, 'Authentication service unavailable', 503);
     return null;
   }
-  return auth.identity;
 }
-
 function parseBody(req: any): Promise<unknown> {
-  return req.rawBody ? Promise.resolve(JSON.parse(req.rawBody.toString())) : Promise.resolve(req.body || {});
+  const body = req.body;
+  const rawBody = req.rawBody;
+  const contentType = req.headers?.['content-type'];
+  const isJson = typeof contentType === 'string'
+    && /^application\/(?:[^;]+\+)?json(?:\s*;|$)/i.test(contentType);
+
+  if (isJson) {
+    if (Buffer.isBuffer(body)) {
+      return Promise.resolve(body.length === 0 ? {} : body.toString());
+    }
+    if (body !== undefined) return Promise.resolve(body);
+    return Promise.resolve(Buffer.isBuffer(rawBody) && rawBody.length > 0 ? rawBody.toString() : {});
+  }
+
+  if (Buffer.isBuffer(rawBody)) {
+    return Promise.resolve(rawBody.length === 0 && !contentType ? {} : rawBody.toString());
+  }
+  if (typeof rawBody === 'string') return Promise.resolve(rawBody.length === 0 && !contentType ? {} : rawBody);
+  if (typeof body === 'string') return Promise.resolve(body);
+  if (Buffer.isBuffer(body)) return Promise.resolve(body.length === 0 && !contentType ? {} : body.toString());
+  if (body !== undefined) return Promise.resolve(body === null || typeof body !== 'object' ? body : '');
+  return Promise.resolve({});
 }
 
 function getPathId(req: any): string | null {
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  return url.pathname.split('/').pop() || null;
+  const url = new URL(req.url, 'https://functions.invalid');
+  const encodedId = url.pathname.split('/').pop();
+  if (!encodedId) return null;
+  let id: string;
+  try {
+    id = decodeURIComponent(encodedId);
+  } catch {
+    return null;
+  }
+  return isValidFirestoreDocumentId(id) ? id : null;
 }
+
+function parseSearchQuery(searchParams: URLSearchParams) {
+  const repeated = (key: string): string[] | undefined => {
+    const values = searchParams.getAll(key);
+    return values.length === 0 ? undefined : values;
+  };
+  return {
+    search: searchParams.get('search') || undefined,
+    tagsAny: repeated('tagsAny'),
+    tagsAll: repeated('tagsAll'),
+    tagsNot: repeated('tagsNot'),
+    review: searchParams.get('review') || undefined,
+    decks: repeated('decks'),
+    deckNames: repeated('deckNames'),
+    // Pass RAW input so invalid boolean spellings fail validation.
+    suspended: searchParams.get('suspended') || undefined,
+    createdFrom: searchParams.get('createdFrom') || undefined,
+    createdTo: searchParams.get('createdTo') || undefined,
+    updatedFrom: searchParams.get('updatedFrom') || undefined,
+    updatedTo: searchParams.get('updatedTo') || undefined,
+    pageSize: searchParams.get('pageSize') ? parseInt(searchParams.get('pageSize')!, 10) : undefined,
+    pageToken: searchParams.get('pageToken') || undefined,
+  };
+}
+
 
 export const health = onRequest({ cors: true }, async (_req, res) => {
   res.set(corsHeaders());
@@ -208,7 +291,7 @@ export const createFlashcardHandler = onRequest({ cors: true }, async (req, res)
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -220,7 +303,7 @@ export const createFlashcardHandler = onRequest({ cors: true }, async (req, res)
   try {
     const card = await createFlashcard(validation.data, identity.ownerId);
     res.set(corsHeaders());
-    res.status(201).json(card);
+    res.status(201).json(await refreshOwnedCardImageUrls(card, identity.ownerId));
   } catch (err) {
     if (deckErrorResponse(res, err, 'Create flashcard error:')) return;
   }
@@ -237,7 +320,7 @@ export const getFlashcardHandler = onRequest({ cors: true }, async (req, res) =>
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -251,7 +334,7 @@ export const getFlashcardHandler = onRequest({ cors: true }, async (req, res) =>
       return errorResponse(res, 'Flashcard not found', 404);
     }
     res.set(corsHeaders());
-    res.json(card);
+    res.json(await refreshOwnedCardImageUrls(card, identity.ownerId));
   } catch (err) {
     console.error('Get flashcard error:', err);
     errorResponse(res, 'Internal server error', 500);
@@ -269,7 +352,7 @@ export const updateFlashcardHandler = onRequest({ cors: true }, async (req, res)
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -289,7 +372,7 @@ export const updateFlashcardHandler = onRequest({ cors: true }, async (req, res)
       return errorResponse(res, 'Flashcard not found', 404);
     }
     res.set(corsHeaders());
-    res.json(card);
+    res.json(await refreshOwnedCardImageUrls(card, identity.ownerId));
   } catch (err) {
     if (deckErrorResponse(res, err, 'Update flashcard error:')) return;
   }
@@ -306,7 +389,7 @@ export const deleteFlashcardHandler = onRequest({ cors: true }, async (req, res)
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -338,10 +421,10 @@ export const listFlashcardsHandler = onRequest({ cors: true }, async (req, res) 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
 
   const query = {
     deckId: url.searchParams.get('deckId') || undefined,
@@ -359,8 +442,9 @@ export const listFlashcardsHandler = onRequest({ cors: true }, async (req, res) 
   try {
     const result = await listFlashcards(validation.data, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
+    if (invalidPageTokenResponse(res, err)) return;
     console.error('List flashcards error:', err);
     errorResponse(res, 'Internal server error', 500);
   }
@@ -377,10 +461,10 @@ export const dueFlashcardsHandler = onRequest({ cors: true }, async (req, res) =
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
   const query = {
     deckId: url.searchParams.get('deckId') || undefined,
     deck: url.searchParams.get('deck') || undefined,
@@ -396,8 +480,9 @@ export const dueFlashcardsHandler = onRequest({ cors: true }, async (req, res) =
   try {
     const result = await dueFlashcards(validation.data, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
+    if (invalidPageTokenResponse(res, err)) return;
     console.error('Due flashcards error:', err);
     errorResponse(res, 'Internal server error', 500);
   }
@@ -437,10 +522,10 @@ export const countFlashcardsHandler = onRequest({ cors: true }, async (req, res)
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
   const query = {
     deckId: url.searchParams.get('deckId') || undefined,
     deck: url.searchParams.get('deck') || undefined,
@@ -469,24 +554,22 @@ export const countFlashcardsHandler = onRequest({ cors: true }, async (req, res)
  * Query params (all optional, combined by INTERSECTION / AND across
  * families):
  *   search        free text; matches case-insensitively against topic OR front OR back
- *   tagsAny       comma-separated tags; a card must carry at least one
- *   tagsAll       comma-separated tags; a card must carry every one
- *   tagsNot       comma-separated tags; a card must carry none
+ *   tagsAny       repeated tags; a card must carry at least one
+ *   tagsAll       repeated tags; a card must carry every one
+ *   tagsNot       repeated tags; a card must carry none
  *                 (tagsAny / tagsAll / tagsNot are mutually exclusive)
  *   review        due | notDue | new | reviewed
- *   decks         comma-separated stable deck ids (ANY-of; unions with deckNames)
- *   deckNames     comma-separated legacy deck names (ANY-of)
+ *   decks         repeated stable deck ids (ANY-of; unions with deckNames)
+ *   deckNames     repeated exact deck names (ANY-of)
  *   suspended     true | false (absent = both states)
  *   createdFrom / createdTo / updatedFrom / updatedTo
  *                 inclusive ISO 8601 date-time or YYYY-MM-DD bounds
  *   pageSize      1-100 (default 20)
- *   pageToken     opaque cursor from a previous response (must pair with the
- *                 exact same filters)
+ *   pageToken     opaque, owner- and filter-bound cursor from a previous response
  *
  * Response: { cards: Flashcard[], nextPageToken: string | null } — cards
- * ordered createdAt desc (ties by document id ASC — Firestore's native
- * tie-break); nextPageToken resumes after the
- * last card with the SAME filters.
+ * ordered createdAt desc, then explicitly ordered document id ASC;
+ * nextPageToken resumes after the last card with the same owner and filters.
  */
 export const searchCardsHandler = onRequest({ cors: true }, async (req, res) => {
   if (req.method === 'OPTIONS') {
@@ -499,34 +582,11 @@ export const searchCardsHandler = onRequest({ cors: true }, async (req, res) => 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  const parseCsv = (key: string): string[] | undefined => {
-    const v = url.searchParams.get(key);
-    if (v === null || v === '') return undefined;
-    return v.split(',').map((s) => s.trim()).filter(Boolean);
-  };
-  const query = {
-    search: url.searchParams.get('search') || undefined,
-    tagsAny: parseCsv('tagsAny'),
-    tagsAll: parseCsv('tagsAll'),
-    tagsNot: parseCsv('tagsNot'),
-    review: url.searchParams.get('review') || undefined,
-    decks: parseCsv('decks'),
-    deckNames: parseCsv('deckNames'),
-    // Pass the RAW string to validation: suspendedBoolSchema accepts only
-    // boolean/true/false, so garbage like suspended=yes fails with a 400
-    // (instead of being silently coerced to false).
-    suspended: url.searchParams.get('suspended') || undefined,
-    createdFrom: url.searchParams.get('createdFrom') || undefined,
-    createdTo: url.searchParams.get('createdTo') || undefined,
-    updatedFrom: url.searchParams.get('updatedFrom') || undefined,
-    updatedTo: url.searchParams.get('updatedTo') || undefined,
-    pageSize: url.searchParams.get('pageSize') ? parseInt(url.searchParams.get('pageSize')!, 10) : undefined,
-    pageToken: url.searchParams.get('pageToken') || undefined,
-  };
+  const url = new URL(req.url, 'https://functions.invalid');
+  const query = parseSearchQuery(url.searchParams);
 
   const validation = safeValidateSearchCardsQuery(query);
   if (!validation.success) {
@@ -536,8 +596,9 @@ export const searchCardsHandler = onRequest({ cors: true }, async (req, res) => 
   try {
     const result = await searchCards(validation.data, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
+    if (invalidPageTokenResponse(res, err)) return;
     console.error('Search flashcards error:', err);
     errorResponse(res, 'Internal server error', 500);
   }
@@ -554,7 +615,7 @@ export const reviewFlashcardHandler = onRequest({ cors: true }, async (req, res)
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -574,8 +635,12 @@ export const reviewFlashcardHandler = onRequest({ cors: true }, async (req, res)
       return errorResponse(res, 'Flashcard not found', 404);
     }
     res.set(corsHeaders());
-    res.status(201).json(result);
+    res.status(201).json({ ...result, card: await refreshOwnedCardImageUrls(result.card, identity.ownerId) });
   } catch (err) {
+    if (err instanceof LearningProgressUnavailableError) {
+      errorResponse(res, err.message, 409);
+      return;
+    }
     console.error('Review flashcard error:', err);
     errorResponse(res, 'Internal server error', 500);
   }
@@ -605,7 +670,7 @@ export const resetFlashcardsHandler = onRequest({ cors: true }, async (req, res)
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -617,7 +682,7 @@ export const resetFlashcardsHandler = onRequest({ cors: true }, async (req, res)
   try {
     const result = await resetFlashcards(validation.data.ids, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
     console.error('Reset flashcards error:', err);
     errorResponse(res, 'Internal server error', 500);
@@ -645,7 +710,7 @@ export const setFlashcardDueDateHandler = onRequest({ cors: true }, async (req, 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -657,7 +722,7 @@ export const setFlashcardDueDateHandler = onRequest({ cors: true }, async (req, 
   try {
     const result = await setFlashcardDueDate(validation.data.ids, validation.data.due, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
     console.error('Set flashcard due date error:', err);
     errorResponse(res, 'Internal server error', 500);
@@ -686,7 +751,7 @@ export const suspendFlashcardsHandler = onRequest({ cors: true }, async (req, re
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -698,7 +763,7 @@ export const suspendFlashcardsHandler = onRequest({ cors: true }, async (req, re
   try {
     const result = await suspendFlashcards(validation.data.ids, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
     console.error('Suspend flashcards error:', err);
     errorResponse(res, 'Internal server error', 500);
@@ -725,7 +790,7 @@ export const unsuspendFlashcardsHandler = onRequest({ cors: true }, async (req, 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -737,7 +802,7 @@ export const unsuspendFlashcardsHandler = onRequest({ cors: true }, async (req, 
   try {
     const result = await unsuspendFlashcards(validation.data.ids, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
     console.error('Unsuspend flashcards error:', err);
     errorResponse(res, 'Internal server error', 500);
@@ -755,7 +820,7 @@ export const bulkCreateFlashcardsHandler = onRequest({ cors: true }, async (req,
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -767,7 +832,7 @@ export const bulkCreateFlashcardsHandler = onRequest({ cors: true }, async (req,
   try {
     const result = await bulkCreateFlashcards(validation.data, identity.ownerId);
     res.set(corsHeaders());
-    res.status(201).json(result);
+    res.status(201).json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
     if (deckErrorResponse(res, err, 'Bulk create flashcards error:')) return;
   }
@@ -784,7 +849,7 @@ export const bulkUpdateFlashcardsHandler = onRequest({ cors: true }, async (req,
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -796,7 +861,7 @@ export const bulkUpdateFlashcardsHandler = onRequest({ cors: true }, async (req,
   try {
     const result = await bulkUpdateFlashcards(validation.data, identity.ownerId);
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, cards: await Promise.all(result.cards.map((card) => refreshOwnedCardImageUrls(card, identity.ownerId))) });
   } catch (err) {
     if (deckErrorResponse(res, err, 'Bulk update flashcards error:')) return;
   }
@@ -813,7 +878,7 @@ export const bulkDeleteFlashcardsHandler = onRequest({ cors: true }, async (req,
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -843,7 +908,8 @@ export const bulkDeleteFlashcardsHandler = onRequest({ cors: true }, async (req,
  *  atomically. Content-addressable: identical card sets produce the same
  *  jobId, so retrying after a timeout resumes from the last completed
  *  chunk — never duplicates cards. Existing same-owner cards are skipped
- *  (scheduling state preserved). Returns the enrollment progress report. */
+ *  (scheduling state preserved). Chunk/card counters commit once with card creation.
+ *  Returns the enrollment progress report. */
 export const bulkEnrollCardsHandler = onRequest({ cors: true, timeoutSeconds: 600 }, async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.set(corsHeaders());
@@ -855,7 +921,7 @@ export const bulkEnrollCardsHandler = onRequest({ cors: true, timeoutSeconds: 60
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -891,7 +957,7 @@ export const enrollmentStatusHandler = onRequest({ cors: true }, async (req, res
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const jobId = getPathId(req);
@@ -927,7 +993,7 @@ export const createDeckHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -956,7 +1022,7 @@ export const getDeckHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -988,7 +1054,7 @@ export const updateDeckHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -1025,7 +1091,7 @@ export const deleteDeckHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -1057,10 +1123,10 @@ export const listDecksHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
   const query = {
     pageSize: url.searchParams.get('pageSize') ? parseInt(url.searchParams.get('pageSize')!, 10) : undefined,
     pageToken: url.searchParams.get('pageToken') || undefined,
@@ -1076,6 +1142,7 @@ export const listDecksHandler = onRequest({ cors: true }, async (req, res) => {
     res.set(corsHeaders());
     res.json(result);
   } catch (err) {
+    if (invalidPageTokenResponse(res, err)) return;
     console.error('List decks error:', err);
     errorResponse(res, 'Internal server error', 500);
   }
@@ -1096,7 +1163,7 @@ export const migrateDecksHandler = onRequest({ cors: true }, async (req, res) =>
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
   if (!identity.isOperator) {
     return errorResponse(res, 'Forbidden: operator role required', 403);
@@ -1127,7 +1194,7 @@ export const assignDecklessHandler = onRequest({ cors: true }, async (req, res) 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   try {
@@ -1164,10 +1231,10 @@ export const listTagsHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
   const query = {
     pageSize: url.searchParams.get('pageSize') ? parseInt(url.searchParams.get('pageSize')!, 10) : undefined,
     pageToken: url.searchParams.get('pageToken') || undefined,
@@ -1207,7 +1274,7 @@ export const renameTagHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -1244,7 +1311,7 @@ export const deleteTagHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -1283,7 +1350,7 @@ export const mergeTagsHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -1318,7 +1385,7 @@ export const attachImageHandler = onRequest({ cors: true }, async (req, res) => 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const cardId = getPathId(req);
@@ -1356,7 +1423,7 @@ export const listImagesHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const cardId = getPathId(req);
@@ -1377,7 +1444,11 @@ export const listImagesHandler = onRequest({ cors: true }, async (req, res) => {
   }
 });
 
-/** DELETE /removeImageHandler/{cardId} — body { url } -> 200 { cardId, removed }. */
+/**
+ * DELETE /removeImageHandler/{cardId} — body { url } -> { cardId, removed }.
+ * External URLs match exactly; owned Storage URLs can match across signature
+ * refreshes by bucket/object, and committed removal deletes that owned object.
+ */
 export const removeImageHandler = onRequest({ cors: true }, async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.set(corsHeaders());
@@ -1389,7 +1460,7 @@ export const removeImageHandler = onRequest({ cors: true }, async (req, res) => 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const cardId = getPathId(req);
@@ -1432,7 +1503,7 @@ export const uploadImageHandler = onRequest({ cors: true }, async (req, res) => 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const cardId = getPathId(req);
@@ -1481,7 +1552,7 @@ export const startReviewSessionHandler = onRequest({ cors: true }, async (req, r
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -1493,7 +1564,7 @@ export const startReviewSessionHandler = onRequest({ cors: true }, async (req, r
   try {
     const result = await startReviewSession(validation.data, identity.ownerId);
     res.set(corsHeaders());
-    res.status(201).json(result);
+    res.status(201).json({ ...result, card: result.card ? await refreshOwnedCardImageUrls(result.card, identity.ownerId) : null });
   } catch (err) {
     if (deckErrorResponse(res, err, 'Start review session error:')) return;
   }
@@ -1513,7 +1584,7 @@ export const getReviewSessionHandler = onRequest({ cors: true }, async (req, res
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -1527,7 +1598,7 @@ export const getReviewSessionHandler = onRequest({ cors: true }, async (req, res
       return errorResponse(res, 'Review session not found', 404);
     }
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, card: result.card ? await refreshOwnedCardImageUrls(result.card, identity.ownerId) : null });
   } catch (err) {
     if (deckErrorResponse(res, err, 'Get review session error:')) return;
   }
@@ -1552,7 +1623,7 @@ export const submitSessionReviewHandler = onRequest({ cors: true }, async (req, 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -1572,7 +1643,7 @@ export const submitSessionReviewHandler = onRequest({ cors: true }, async (req, 
       return errorResponse(res, 'Review session not found', 404);
     }
     res.set(corsHeaders());
-    res.json(result);
+    res.json({ ...result, card: result.card ? await refreshOwnedCardImageUrls(result.card, identity.ownerId) : null });
   } catch (err) {
     if (deckErrorResponse(res, err, 'Submit session review error:')) return;
   }
@@ -1591,7 +1662,7 @@ export const endReviewSessionHandler = onRequest({ cors: true }, async (req, res
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const id = getPathId(req);
@@ -1648,10 +1719,10 @@ export const getReviewHistoryHandler = onRequest({ cors: true }, async (req, res
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
   // ratings accepts repeated ?ratings=N params AND/OR a comma-separated
   // ?ratings=1,2 (the bridge convention). Each value must parse as 1..4.
   const rawRatings: number[] = [];
@@ -1716,10 +1787,10 @@ export const getStudyStatsHandler = onRequest({ cors: true }, async (req, res) =
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
   const query = {
     from: url.searchParams.get('from') || undefined,
     to: url.searchParams.get('to') || undefined,
@@ -1768,10 +1839,10 @@ export const getTopLapsedCardsHandler = onRequest({ cors: true }, async (req, re
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
+  const url = new URL(req.url, 'https://functions.invalid');
   const query = {
     deckId: url.searchParams.get('deckId') || undefined,
     limit: url.searchParams.get('limit') ? parseInt(url.searchParams.get('limit')!, 10) : undefined,
@@ -1820,21 +1891,50 @@ export const migrateReviewEventsHandler = onRequest({ cors: true }, async (req, 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
   if (!identity.isOperator) {
     return errorResponse(res, 'Forbidden: operator role required', 403);
   }
 
-  const body = await parseBody(req) as { pageSize?: unknown; resumeAfterCardId?: unknown };
+  const parsedBody = await parseBody(req);
+  if (
+    parsedBody === null
+    || typeof parsedBody !== 'object'
+    || Array.isArray(parsedBody)
+    || Buffer.isBuffer(parsedBody)
+    || (Object.getPrototypeOf(parsedBody) !== Object.prototype && Object.getPrototypeOf(parsedBody) !== null)
+  ) {
+    return errorResponse(res, 'Validation failed', 400, [{ path: [], message: 'Body must be a JSON object' }]);
+  }
+  const body = parsedBody as Record<string, unknown>;
+  const unexpectedField = Object.keys(body).find((key) => key !== 'pageSize' && key !== 'resumeAfterCardId');
+  if (unexpectedField !== undefined) {
+    return errorResponse(res, 'Validation failed', 400, [{ path: [unexpectedField], message: 'Unexpected field' }]);
+  }
+
   let parsedPageSize: number | undefined;
   if (body.pageSize !== undefined) {
-    parsedPageSize = typeof body.pageSize === 'number' ? body.pageSize : parseInt(String(body.pageSize), 10);
-    if (!Number.isInteger(parsedPageSize) || parsedPageSize < 1 || parsedPageSize > 100) {
+    if (typeof body.pageSize !== 'number' && typeof body.pageSize !== 'string') {
       return errorResponse(res, 'Validation failed', 400, [{ path: ['pageSize'], message: 'pageSize must be an integer between 1 and 100' }]);
     }
+    const pageSizeValidation = safeValidateReviewHistoryQuery({ pageSize: body.pageSize });
+    if (!pageSizeValidation.success) {
+      return errorResponse(res, 'Validation failed', 400, pageSizeValidation.error.issues);
+    }
+    parsedPageSize = pageSizeValidation.data.pageSize;
   }
-  const resumeAfterCardId = typeof body?.resumeAfterCardId === 'string' && body.resumeAfterCardId !== '' ? body.resumeAfterCardId : undefined;
+
+  let resumeAfterCardId: string | undefined;
+  if (body.resumeAfterCardId !== undefined) {
+    if (!isValidFirestoreDocumentId(body.resumeAfterCardId)) {
+      return errorResponse(res, 'Validation failed', 400, [{
+        path: ['resumeAfterCardId'],
+        message: 'resumeAfterCardId must be a valid Firestore document ID',
+      }]);
+    }
+    resumeAfterCardId = body.resumeAfterCardId;
+  }
 
   try {
     const result = await migrateLegacyReviewEvents({
@@ -1859,8 +1959,10 @@ export const migrateReviewEventsHandler = onRequest({ cors: true }, async (req, 
  * collection.anki2) into the library: note models/cards become flashcards
  * (front/back as plain text, tags, deck found-or-created). Limits: package
  * ≤ 20 MiB decoded, ≤ 1000 cards imported (extra notes reported in
- * skippedOverLimit), every note validated (malformed → 400, never partial
- * writes below the 500-card single-batch ceiling). */
+ * skippedOverLimit). The complete import and response budget are validated
+ * before writes. Card writes use count- and byte-bounded transactions;
+ * multiple transactions may commit partially if a later one fails. An
+ * over-budget response is rejected with typed HTTP 400 before writes. */
 export const importApkgHandler = onRequest({ cors: true }, async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.set(corsHeaders());
@@ -1872,7 +1974,7 @@ export const importApkgHandler = onRequest({ cors: true }, async (req, res) => {
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -1908,7 +2010,7 @@ export const exportApkgHandler = onRequest({ cors: true, timeoutSeconds: 120 }, 
     return errorResponse(res, 'Method not allowed', 405);
   }
 
-  const identity = await identityOr401(req, res);
+  const identity = await requireIdentity(req, res);
   if (!identity) return;
 
   const body = await parseBody(req);
@@ -1932,13 +2034,11 @@ export const exportApkgHandler = onRequest({ cors: true, timeoutSeconds: 120 }, 
 
 /** Firestore onDocumentWritten trigger on
  * `bulkEnrollmentJobs/{jobId}/chunks/{chunkIndex}`.
- * Reads current chunk state; if already completed, no-ops. Otherwise
- * processes cards via WriteBatch (outside the transaction, idempotent),
- * then runs a metadata-only transaction that marks chunk completed and
- * atomically increments job counters. All reads precede all writes in
- * the transaction. Idempotent: duplicate events see status='completed'
- * and no-op. On failure, the chunk and parent job are marked failed;
- * exact re-submission retriggers non-completed chunks.
+ * One bounded transaction validates owner-scoped logical claims, creates new
+ * cards without overwriting incumbent user state, and atomically commits the
+ * chunk outcome and root progress counters exactly once. Duplicate events
+ * observe the completed chunk and no-op; exact resubmission retries only
+ * noncompleted chunks.
  *
  * Config: 512 MiB memory (prevents OOM from concurrent chunk invocations),
  * concurrency 1 (sequential processing per instance), maxInstances 2

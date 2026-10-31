@@ -2,7 +2,7 @@
  * Review-session UI widget (Apps SDK `ui://` resource) for the FSRS MCP
  * server.
  *
- * Registers a self-contained HTML resource at `ui://review-session-v5` that
+ * Registers a self-contained HTML resource at `ui://review-session-v6` that
  * renders an Anki-like review card: front visible, tap to flip, then
  * Again/Hard/Good/Easy rating buttons wired to the `submit_review` tool via
  * the host bridge. The widget reads a JSON bootstrap (session + card +
@@ -17,20 +17,20 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { z } from 'zod';
 import type { FirebaseBridge } from './bridge.js';
 import type { ReviewSessionWithCardSummary } from './tools.js';
+const INTER_FONT_BASE64 = readFileSync(join(process.cwd(), 'fonts', 'Inter-latin.woff2')).toString('base64');
 
 /** Widget resource URI, namespaced under the Apps SDK `ui://` scheme.
  *
- * Versioned (v5): the ChatGPT connector caches the widget resource by URI, so
- * every release that changes the widget code bumps the URI (v4 → v5) with NO
- * alias on the previous version — clients are forced to fetch the new code.
- * v5 renders v2 (bounded-root) review sessions: the widget no longer needs
- * the full cardIds/reviewedCardIds root arrays (queueWindow + currentPosition
- * carry the bounded state). Only the current URI is served and only
- * start_review_session links it. */
-export const REVIEW_WIDGET_URI = 'ui://review-session-v5';
+ * Versioned (v6): this release makes the widget font self-contained so the
+ * Apps SDK host never needs an unsupported relative asset route. The previous
+ * URI remains unregistered; clients fetch the new resource by its version.
+ */
+export const REVIEW_WIDGET_URI = 'ui://review-session-v6';
 
 /**
  * Apps SDK (MCP Apps) UI resource MIME type. The CURRENT connector contract
@@ -73,8 +73,8 @@ export interface ReviewWidgetBootstrap {
 }
 
 export const reviewWidgetBootstrapSchema = z.object({
-  session: z.record(z.unknown()),
-  card: z.record(z.unknown()).nullable(),
+  session: z.record(z.string(), z.unknown()),
+  card: z.record(z.string(), z.unknown()).nullable(),
   submitTool: z.string().min(1),
   startTool: z.string().min(1),
   endTool: z.string().min(1),
@@ -124,7 +124,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   /* Inter — locally vendored from Google Fonts (woff2, variable weight
      400–700). No runtime network dependency. */
   @font-face { font-family:'Inter'; font-style:normal; font-weight:400 700; font-display:swap;
-               src:url('./fonts/Inter-latin.woff2') format('woff2'); }
+               src:url('data:font/woff2;base64,${INTER_FONT_BASE64}') format('woff2'); }
   :root {
     --bg:#f8fafc; --card:#fff; --ink:#16213a; --muted:#5d6b82; --line:#e5eaf2;
     --accent:#2563eb; --accent-strong:#1d4ed8; --accent-ink:#fff;
@@ -392,23 +392,17 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // exact next card) refreshes it — the queue never fabricates completion.
   var queue = [];
   var ending = false;              // an end-session request is in flight: no new ratings
-  var requestSeq = 0;              // stable per-rating request id
-  var generation = 0;              // bumped when the session ends: stale submit callbacks no-op
+  var continuing = false;          // a Continue request is in flight: prevent duplicate starts
+  var submissionUncertain = false; // authority could not identify a pending rating result
+  var generation = 0;              // bumped whenever the active session changes or ends
   var renderedCardId = null;       // id of the card currently rendered; flip resets only on card change
   var ratedCardIds = {};           // card ids the user has rated (in-flight or committed), id -> true
-  var inflightByCard = {};         // card id → pending rating item (prevents same-card double-submit)
-  var inflightByRequest = {};      // requestId → pending rating item (response correlation)
-  var ratingQueue = [];            // FIFO queue of pending rating items awaiting serial submit
-  // Count-based optimistic delta: tracks how many ratings this widget
-  // session has submitted minus how many the server has acknowledged via
-  // session.reviewedCount.  This avoids the stale-visibleStatus trap where
-  // the pre-computed server string doesn't reflect in-flight ratings.
-  var totalRatedCount = 0;         // ratings submitted since session adopt
-  var baselineReviewedCount = 0;   // session.reviewedCount at session start (never advanced)
+  var inflightByCard = {};          // card id → pending rating item (prevents same-card double-submit)
+  var inflightByRequest = {};       // requestId → pending rating item (response correlation)
   var adoptedIndex = (data.session && typeof data.session.currentIndex === 'number') ? data.session.currentIndex : 0;  // highest currentIndex seen (adopted or optimistically set)
-  var pendingSubmits = [];          // FIFO queue of rating items awaiting serial network submit
+  var pendingSubmits = [];           // FIFO queue of rating items awaiting serial network submit
+  var activeSubmitItem = null;
   var submitInFlight = false;       // true while one submit_item is in-flight (serial drain gate)
-  var maxOptimisticReviewed = (data.session && typeof data.session.reviewedCount === 'number') ? data.session.reviewedCount : 0; // highest displayed reviewed count (monotonic floor)
 
   // True when a card object is MINIMAL — only an id (no renderable content).
   // Some hosts strip the hidden _meta and return { session, card: { id } }.
@@ -499,7 +493,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
       if (s.status === 'completed' || s.status === 'ended') return true;
       var idsV2 = sessionQueueIds(s);
       var remainV2 = s.remainingQueueCount != null ? s.remainingQueueCount : (s.remainingCount != null ? s.remainingCount : (idsV2.length || 0));
-      if (remainV2 - optimisticReviewDelta() <= 0) return true;
+      if (remainV2 - pendingReviewCount() <= 0) return true;
       return false;
     }
     var ids = sessionQueueIds(s);
@@ -638,58 +632,47 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   //    next-card state — a stale response for an already-rated card keeps
   //    the done panel (no blank/disabled card).
   function adoptServerState(session, card, preloaded, recovery) {
-    // Monotonic session reconciliation: NEVER regress authoritative session
-    // counters. A stale or out-of-order snapshot that arrives after the
-    // widget has advanced (via optimistic rating or a newer response) must
-    // not overwrite reviewedCount, remainingCount, or position with lower
-    // values. Only strictly-advancing snapshots are adopted.
+    // Keep only server-observed counters monotonic. Local rating intents are
+    // tracked independently and never used to reject authoritative recovery.
     var prev = data.session || {};
     var prevSessionId = prev.id;
     var prevReviewed = prev.reviewedCount || 0;
     var prevRemaining = prev.remainingCount != null ? prev.remainingCount : Infinity;
-    var prevIndex = prev.currentIndex || 0;
     var newReviewed = session.reviewedCount || 0;
     var newRemaining = session.remainingCount != null ? session.remainingCount : Infinity;
     var newIndex = session.currentIndex || 0;
-    // A new session (id changed) is always adopted (counters reset to 0).
     var isNewSession = session.id && session.id !== prevSessionId;
-    // Stale-snapshot guard: a response whose currentIndex is strictly less
-    // than the highest adopted/optimistic index is stale — it predates a
-    // newer state the widget has already advanced past.  Skip session adopt
-    // to prevent seedQueueFromSession from rebuilding the queue from stale
-    // cardIds (the rapid-click freeze).  Equal-index responses are ALLOWED
-    // through: they carry the authoritative counters + next card for the
-    // current position and must reconcile even if the index matches an
-    // optimistic advance.  Only merge additive preloads (never shrink).
-    if (!isNewSession && prev.id && session.id === prev.id) {
+    if (isNewSession) {
+      generation += 1;
+      cardCache = {};
+      queue = [];
+      renderedCardId = null;
+      ratedCardIds = {};
+      inflightByCard = {};
+      inflightByRequest = {};
+      pendingSubmits = [];
+      activeSubmitItem = null;
+      submitInFlight = false;
+      ending = false;
+      continuing = false;
+      submissionUncertain = false;
+      optimisticDone = false;
+    }
+    // A locally optimistic card advance is allowed, but it must not mask
+    // regressions in the server-observed state. Recovery always adopts the
+    // returned authoritative state.
+    if (!isNewSession && prev.id && session.id === prevSessionId) {
       if (!recovery && newIndex < adoptedIndex) {
         if (Array.isArray(preloaded)) mergeQueueCards(preloaded);
         return;
       }
-      // Also block regressions in reviewedCount/remainingCount, and in the
-      // optimistic displayed reviewed count (the monotonic floor).  A stale
-      // snapshot whose reviewedCount + totalRatedCount would drop the
-      // displayed reviewed below the highest value already shown is rejected
-      // so that rapid clicks can never regress the counter.  Recovery
-      // responses (sync-after-failure) bypass this guard — the backend's
-      // current state is authoritative.
-      if (!recovery && (newReviewed < prevReviewed || newRemaining > prevRemaining ||
-          (newReviewed + totalRatedCount) < maxOptimisticReviewed)) {
+      if (!recovery && (newReviewed < prevReviewed || newRemaining > prevRemaining)) {
         if (Array.isArray(preloaded)) mergeQueueCards(preloaded);
         return;
       }
     }
     data.session = session;
     adoptedIndex = newIndex;
-    // baselineReviewedCount: set ONCE at session start to the session's
-    // reviewedCount. Never advanced by same-session adoptions — the delta
-    // formula totalRatedCount - max(0, curReviewed - baseline) naturally
-    // drops to 0 as curReviewed rises. Only reset on session ID change.
-    if (isNewSession) {
-      baselineReviewedCount = newReviewed;
-      totalRatedCount = 0;
-      adoptedIndex = newIndex;
-    }
     // v2: track the current card's stable queue position from the adopted
     // session (currentPosition) or its bounded queueWindow; the widget never
     // holds the full queue, so this position is the claim target for submits.
@@ -791,43 +774,33 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // card/queue are cleared and the widget renders the hidden ended state.
   // Used by both the active End Session button and the completed-panel Finish.
   function adoptEndResult(res) {
-    if (!res) return;
+    if (!res) return false;
     var sc = res.structuredContent || (res.content && res.content[0] && res.content[0].structuredContent);
     if (sc && sc.id && (sc.status === 'ended' || sc.status === 'completed')) {
       data.session = sc;
       adoptedIndex = -1;
-      // Only advance baseline upward — never regress.
-      if ((sc.reviewedCount || 0) > (baselineReviewedCount || 0)) {
-        baselineReviewedCount = sc.reviewedCount || 0;
-      }
+      submitInFlight = false;
+      activeSubmitItem = null;
       data.card = null;
       queue = [];
+      ratedCardIds = {};
       optimisticDone = false;
       inflightByCard = {};
       inflightByRequest = {};
       pendingSubmits = [];
       ending = false;
+      submissionUncertain = false;
       render();
+      return true;
     }
-  }
+    return false;
 
-  // Optimistic counter projection: ratings submitted by this widget session
-  // minus ratings acknowledged by the server via session.reviewedCount.
-  // The count-based approach works uniformly for both v1 and v2 sessions
-  // without needing per-item acknowledgment.  baselineReviewedCount is set
-  // ONCE at session start (= reviewedCount when the session began) and
-  // never advanced by same-session adoptions.  totalRatedCount is the
-  // widget's local submit count since that baseline; it is decremented on
-  // failed/empty responses so only acknowledged ratings inflate the delta.
-  // Synchronous: called from render, so a rating bumps the display
-  // immediately.  Never mutates the authoritative session.
-  function optimisticReviewDelta() {
-    // Server-acknowledged count since baseline: how many of the baseline's
-    // reviewedCount have been eaten by the current session's reviewedCount.
-    var cur = data.session || {};
-    var curReviewed = cur.reviewedCount || 0;
-    var serverAcked = Math.max(0, curReviewed - (baselineReviewedCount || 0));
-    return Math.max(0, totalRatedCount - serverAcked);
+  }
+  // The server's reviewed/remaining counters remain authoritative. Local
+  // submissions stay separately visible as pending until a correlated submit
+  // response or exact recovery evidence resolves each request.
+  function pendingReviewCount() {
+    return Object.keys(inflightByRequest).length;
   }
 
   function render() {
@@ -838,24 +811,13 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     var modeText = src && src.type === 'custom' ? 'Custom' : 'Due cards';
     sessionTypeLabel.textContent = 'Session type: Spaced repetition';
     modeLabel.textContent = 'Mode: ' + modeText;
-    // Projected counters: the server-authoritative reviewed count (no
-    // inflation), with the optimistic delta applied only to remaining
-    // (widget-submitted minus server-acknowledged) for forward-progress
-    // display. A rating bumps remaining synchronously; an acknowledged
-    // response never double-counts.
-    var optimistic = optimisticReviewDelta();
-    // Apply the optimistic delta to BOTH reviewed and remaining: each
-    // locally-accepted rating immediately advances the visible progress
-    // (the serial FIFO ensures one network submit at a time, so the
-    // optimistic projection is safe). Server responses reconcile via
-    // adoptServerState without regressions (monotonic guard).
-    var reviewed = Math.max(maxOptimisticReviewed, (s.reviewedCount || 0) + optimistic);
-    if (reviewed > maxOptimisticReviewed) maxOptimisticReviewed = reviewed;
-    var remaining = s.remainingCount != null ? Math.max(0, s.remainingCount - optimistic) : s.remainingCount;
-    // Always use computed counters — never stale visibleStatus (a pre-baked
-    // server string that doesn't account for optimistic deltas or monotonic
-    // session reconciliation).
-    progress.textContent = s.status + ' \u00b7 ' + reviewed + ' reviewed, ' + (remaining != null ? remaining : '?') + ' remaining';
+    // In-flight local requests are visible as a separate pending count; they
+    // never alter the server-reported counters.
+    var reviewed = s.reviewedCount || 0;
+    var remaining = s.remainingCount;
+    var pending = pendingReviewCount();
+    progress.textContent = s.status + ' \u00b7 ' + reviewed + ' reviewed, ' + (remaining != null ? remaining : '?') + ' remaining' +
+      (pending ? ' \u00b7 ' + pending + ' pending' : '');
     // Progress denominator: v1 sessions carry the full root cardIds; v2 roots
     // are BOUNDED so the total queue size is the persisted limit (or the
     // bounded window length as a fallback - never a fabricated number).
@@ -917,7 +879,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
       // ratings never block the current card — a rating can be fired for the
       // displayed card at any time.
       var cardInFlight = card && card.id ? !!inflightByCard[card.id] : false;
-      if (cardInFlight) {
+      if (cardInFlight || ending || submissionUncertain) {
         ratings.classList.add('disabled');
         Array.prototype.forEach.call(ratings.querySelectorAll('button'), function (b) { b.disabled = true; });
         checkBtn.disabled = true;
@@ -927,16 +889,18 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         Array.prototype.forEach.call(ratings.querySelectorAll('button'), function (b) { b.disabled = false; });
         checkBtn.disabled = false;
         revealBtn.disabled = false;
-        endSessionBtn.disabled = false;
       }
+      endSessionBtn.disabled = ending || submissionUncertain;
     }
     if (doneMode) {
       doneTitle.textContent = s.continuationAvailable
         ? 'Review session complete \u2014 choose Finish or Continue review'
         : 'Review session complete \u2014 choose Finish (all due cards were reviewed)';
       continueBtn.classList.toggle('hidden', !s.continuationAvailable);
-    }
+      finishBtn.disabled = ending || submissionUncertain;
+      continueBtn.disabled = continuing || submissionUncertain;
     statusEl.textContent = '';
+  }
   }
 
   function primeFromSession() {
@@ -987,14 +951,22 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // parent window. The sandboxed widget iframe has no window.openai — the
   // host listens for ui/notifications/* messages and replies on the request id.
   var rpcSeq = 0;
-  var rpcWaiters = {};
+  var rpcWaiters = Object.create(null);
   var rpcReady = false;
+  var hostOrigin = null;
+
+  function postToHost(message) {
+    // Opaque sandbox origins cannot be named as a postMessage target; the
+    // parent-window check on inbound traffic remains the security boundary.
+    var targetOrigin = hostOrigin && hostOrigin !== 'null' ? hostOrigin : '*';
+    window.parent.postMessage(message, targetOrigin);
+  }
 
   function rpcSend(method, params) {
     var id = ++rpcSeq;
     return new Promise(function (resolve, reject) {
       rpcWaiters[id] = { resolve: resolve, reject: reject };
-      window.parent.postMessage({ jsonrpc: '2.0', id: id, method: method, params: params || {} }, '*');
+      postToHost({ jsonrpc: '2.0', id: id, method: method, params: params || {} });
       // The host may not respond (no bridge / non-OpenAI host): time out so
       // the caller can fall back gracefully instead of hanging forever.
       setTimeout(function () {
@@ -1040,19 +1012,41 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     }
   }
 
+  function validRpcId(id) {
+    return typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id));
+  }
+
+  function validRpcMessage(msg) {
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg) || msg.jsonrpc !== '2.0') return false;
+    if (Object.prototype.hasOwnProperty.call(msg, 'method')) {
+      if (typeof msg.method !== 'string' || !msg.method.length ||
+          Object.prototype.hasOwnProperty.call(msg, 'result') ||
+          Object.prototype.hasOwnProperty.call(msg, 'error') ||
+          (msg.id !== undefined && !validRpcId(msg.id)) ||
+          (msg.params !== undefined && (msg.params === null || typeof msg.params !== 'object' || Array.isArray(msg.params)))) return false;
+      if (msg.method === 'ui/notifications/tool-result' &&
+          (!msg.params || typeof msg.params !== 'object' || Array.isArray(msg.params))) return false;
+      return true;
+    }
+    if (!validRpcId(msg.id) || Object.prototype.hasOwnProperty.call(msg, 'params')) return false;
+    var hasResult = Object.prototype.hasOwnProperty.call(msg, 'result');
+    var hasError = Object.prototype.hasOwnProperty.call(msg, 'error');
+    return hasResult !== hasError && (!hasError || (msg.error && typeof msg.error === 'object' && !Array.isArray(msg.error) &&
+      Number.isInteger(msg.error.code) && typeof msg.error.message === 'string'));
+  }
+
   function rpcHandle(event) {
-    var msg = event && event.data;
-    if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') return;
+    if (!event || event.source !== window.parent || typeof event.origin !== 'string' || !event.origin) return;
+    var msg = event.data;
+    if (!validRpcMessage(msg)) return;
+    if (hostOrigin === null) hostOrigin = event.origin;
+    if (event.origin !== hostOrigin) return;
     if (msg.method === 'ui/notifications/tool-result') {
-      // Tool result delivered as a notification. Two cases:
-      //  (a) async response to a tools/call we sent: params.id matches our
-      //      request id — resolve the waiter;
-      //  (b) UNSOLICITED initial result (empty bootstrap): the host seeds the
-      //      iframe with the session tool's structuredContent — apply it so
-      //      the widget renders instead of staying blank.
-      var p = msg.params || {};
-      var w = rpcWaiters[p.id];
-      if (w) {
+      var p = msg.params;
+      if (Object.prototype.hasOwnProperty.call(p, 'id')) {
+        if (!validRpcId(p.id)) return;
+        var w = rpcWaiters[p.id];
+        if (!w) return;
         delete rpcWaiters[p.id];
         w.resolve(p.output);
         return;
@@ -1060,12 +1054,10 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
       applyToolResult(p);
       return;
     }
-    if (msg.id == null) return; // other notifications without an id
+    if (msg.id === undefined) return;
     if (msg.method) {
-      // Inbound request (e.g. ui/initialize): answer with a result echo.
-      // The host expects the initialize response to echo the protocolVersion.
       if (msg.method === 'ui/initialize') {
-        window.parent.postMessage({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: msg.params && msg.params.protocolVersion } }, '*');
+        postToHost({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: msg.params && msg.params.protocolVersion } });
       }
       return;
     }
@@ -1098,7 +1090,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
         if (handshakeDone) return;
         handshakeDone = true;
         // Notify the host the view is initialized and ready for tool input.
-        window.parent.postMessage({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
+        postToHost({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} });
       })
       .catch(function () {
         // No host bridge (standalone/preview): fall back silently.
@@ -1316,7 +1308,7 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // source of truth for session counters.
   function rate(rating) {
     if (!data.session || !data.session.id) return;
-    if (ending) return; // an end request is in flight — no new ratings
+    if (ending || submissionUncertain) return;
     if (!data.card || !data.card.id) return; // nothing displayed to rate
     var expectedCardId = data.card.id;
     // v2 sessions claim BY POSITION (the widget never holds the full queue —
@@ -1334,12 +1326,17 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     // A rapid double-click on the SAME displayed card must never double
     // submit (the per-card map is the guard — not a global inflight flag).
     if (inflightByCard[expectedCardId]) return;
+    var requestId;
+    try {
+      requestId = 'req-' + window.crypto.randomUUID();
+    } catch {
+      statusEl.textContent = 'Secure request IDs are unavailable. Reload the session before rating.';
+      return;
+    }
     // Cache the RATED card before it leaves the display (a late id-only
     // response for it still resolves full from the cache).
     cacheFullCard(data.card);
-    totalRatedCount += 1;
-    requestSeq += 1;
-    var item = { rating: rating, requestId: 'req-' + Date.now().toString(36) + '-' + requestSeq, expectedCardId: expectedCardId, expectedPosition: expectedPosition };
+    var item = { rating: rating, requestId: requestId, expectedCardId: expectedCardId, expectedPosition: expectedPosition };
     inflightByCard[expectedCardId] = item;
     inflightByRequest[item.requestId] = item;
     ratedCardIds[expectedCardId] = true;
@@ -1401,96 +1398,96 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   // completion (submitItem success/error) so items process strictly in
   // click order.
   function processNextSubmit() {
-    if (submitInFlight || !pendingSubmits.length) return;
+    if (submitInFlight || submissionUncertain || ending || !pendingSubmits.length) return;
     submitInFlight = true;
-    var next = pendingSubmits.shift();
-    submitItem(next);
+    activeSubmitItem = pendingSubmits.shift();
+    submitItem(activeSubmitItem);
   }
 
-  // Submits ONE rating. The expectedCardId is the id of the card
-  // the user was looking at when they rated — the session's authoritative
-  // target. Failures NEVER resend a stale id: on any error the widget
-  // re-syncs via get_review_session, adopts the authoritative current card,
-  // and re-enables, so the user rates whatever the backend says is current.
-  // Each in-flight item resolves INDEPENDENTLY: an out-of-order response
-  // reconciles against the authoritative session state without regressing
-  // the displayed card (see adoptServerState), and never touches another
-  // item's bookkeeping.
+  function extractWidgetState(payload) {
+    var meta = payload && payload._meta;
+    var hidden = meta && (meta['ui/widgetState'] || (meta.ui && meta.ui.widgetState));
+    if (hidden && hidden.session) return hidden;
+    var sc = extractStructuredContent(payload);
+    return sc && sc.session ? sc : null;
+  }
+
+  function recoveredItemStatus(state, item) {
+    var session = state.session || {};
+    if (Array.isArray(session.processedRequestIds) && session.processedRequestIds.indexOf(item.requestId) !== -1) {
+      return 'committed';
+    }
+    if (Array.isArray(session.reviewedCardIds) && session.reviewedCardIds.indexOf(item.expectedCardId) !== -1) {
+      return 'reviewed-elsewhere';
+    }
+    var card = state.card;
+    var preloaded = Array.isArray(state.preloaded) ? state.preloaded : [];
+    var queueWindow = state.queueWindow || session.queueWindow;
+    if (isV2SessionState(session)) {
+      var entries = queueWindow && Array.isArray(queueWindow.cardIds) ? queueWindow.cardIds : [];
+      for (var i = 0; i < entries.length; i += 1) {
+        if (entries[i].cardId === item.expectedCardId && entries[i].position === item.expectedPosition) return 'not-committed';
+      }
+      if (card && card.id === item.expectedCardId &&
+          (state.currentPosition === item.expectedPosition || session.currentPosition === item.expectedPosition ||
+            (queueWindow && queueWindow.currentPosition === item.expectedPosition))) return 'not-committed';
+      return 'unknown';
+    }
+    if (card && card.id === item.expectedCardId) return 'not-committed';
+    for (var j = 0; j < preloaded.length; j += 1) {
+      if (preloaded[j] && preloaded[j].id === item.expectedCardId) return 'not-committed';
+    }
+    return 'unknown';
+  }
+
+  // Submits ONE rating. Queue position and request id are captured at click
+  // time and remain stable across the FIFO drain.
   function submitItem(item) {
     var gen = generation;
-    // Capture the session id at send time — the session is immutable for
-    // the life of this submit.
     var sid = data.session.id;
     var submitArgs = { sessionId: sid, rating: item.rating, requestId: item.requestId, expectedCardId: item.expectedCardId };
     if (item.expectedPosition != null) submitArgs.expectedPosition = item.expectedPosition;
     callTool(data.submitTool, submitArgs)
       .then(function (res) {
-        if (gen !== generation) return; // stale: session ended while in flight
+        if (gen !== generation) return;
         var sc = res && (res.structuredContent || (res.content && res.content[0] && res.content[0].structuredContent));
         if (sc && sc.session) {
-          // Authoritative state wins: the session counters and the next card
-          // are adopted. When the response card matches the optimistically
-          // displayed next card, the full displayed card is PRESERVED (never
-          // blanked/regressed); an id-only response resolves from the cache.
-          // The committed rating leaves the in-flight maps BEFORE adopting:
-          // the authoritative counts already include it, so the count-based
-          // optimistic delta (= totalRated - max(0, curReviewed - baseline))
-          // correctly drops as curReviewed rises.
           clearInflightItem(item);
           adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded);
-        } else {
-          // No usable state in the response (e.g. a host that strips _meta):
-          // re-sync before re-enabling so the user rates the authoritative
-          // current card. The item's bookkeeping is cleared FIRST so the
-          // sync can restore the still-current card.  Decrement the local
-          // submit counter so the rating doesn't permanently inflate the
-          // optimistic delta (the server never acknowledged it).
-          clearInflightItem(item, true);
-          totalRatedCount = Math.max(0, totalRatedCount - 1);
-          syncAfterSubmit(gen);
-        }
-        // Success: the rating COMMITTED — keep ratedCardIds[cardId] true so a
-        // late/out-of-order duplicate or unsolicited response for this card
-        // can never regress the display. Only the in-flight maps are cleared
-        // (totalRatedCount stays — the rating was accepted).
-        render();
-        statusEl.textContent = '';
-        // FIFO drain: release the serial gate and fire the next queued submit.
-        submitInFlight = false;
-        processNextSubmit();
-      })
-      .catch(function () {
-        if (gen !== generation) { submitInFlight = false; processNextSubmit(); return; } // stale: session ended while in flight
-        // NO visible error/request copy: the user never sees backend work.
-        // Re-sync authoritative state, then re-enable. NEVER retry the stale
-        // item: the backend rejected it because the session advanced; the
-        // displayed card after the sync is the one to rate. CRITICAL: the
-        // item's maps AND its ratedCardIds flag are cleared BEFORE the sync —
-        // otherwise adoptServerState would suppress the failed card (it is
-        // still marked rated) and the user could never retry it.
-        // Decrement the local submit counter so the failed rating doesn't
-        // permanently inflate the optimistic delta.
-        clearInflightItem(item, true);
-        totalRatedCount = Math.max(0, totalRatedCount - 1);
-        // RECOVERY: flag the sync so adoptServerState bypasses the stale-
-        // snapshot guard (the sync response is authoritative recovery, not
-        // a stale out-of-order snapshot).  The FIFO gate stays held until
-        // the recovery sync settles — the next queued rating must not
-        // submit before the authoritative get_review_session applies.
-        item.recovery = true;
-        syncAfterSubmit(gen, item.recovery, function () {
+          activeSubmitItem = null;
+          render();
+          statusEl.textContent = '';
           submitInFlight = false;
           processNextSubmit();
-        });
+        } else {
+          recoverSubmit(item, gen, settleRecoveredSubmit);
+        }
+      })
+      .catch(function () {
+        if (gen !== generation) return;
+        recoverSubmit(item, gen, settleRecoveredSubmit);
       });
+
+    function settleRecoveredSubmit(status) {
+      if (status === 'unknown') {
+        submissionUncertain = true;
+        render();
+        statusEl.textContent = 'Could not verify this rating. Reconnect and reload the session before continuing.';
+        return;
+      }
+      render();
+      statusEl.textContent = status === 'not-committed'
+        ? 'Rating was not recorded. Please rate this card again.'
+        : (status === 'reviewed-elsewhere' ? 'This card was reviewed elsewhere; session state was refreshed.' : '');
+      activeSubmitItem = null;
+      submitInFlight = false;
+      processNextSubmit();
+    }
   }
 
-  // Removes an item from the in-flight maps (by card id and requestId). The
-  // ratedCardIds flag is unmarked ONLY on FAILED/empty responses (unmark ===
-  // true) so that card can be retried; a SUCCESSFUL submit keeps the card
-  // marked rated so the local flag stops a late duplicate from regressing
-  // the display. Other in-flight items' cards stay marked (never
-  // double-rated).
+  // Remove only this item's request/card bookkeeping. A successful or
+  // externally reviewed card stays marked locally; a confirmed pending card
+  // is unmarked so the authoritative view can restore it for retry.
   function clearInflightItem(item, unmark) {
     if (!item) return;
     if (item.requestId && inflightByRequest[item.requestId] === item) {
@@ -1504,40 +1501,35 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     }
   }
 
-  // Re-sync the authoritative session state after a failed/empty submit
-  // result, then re-enable the rating controls for the displayed card.
-  // Parallel-safe: clears ONLY this item's bookkeeping (other in-flight
-  // items are untouched) and reconciles the displayed card against the
-  // authoritative current card.  When onDone is provided (FIFO drain),
-  // it is called AFTER the sync settles (success or error) so the next
-  // queued rating does not submit before recovery applies.
-  function syncAfterSubmit(gen, recovery, onDone) {
-    function done() { if (onDone) onDone(); }
+  // Recovery never infers that THIS request committed from unrelated counter,
+  // position, card, or terminal-session movement. It requires the exact v1
+  // request receipt, or recognizes an exact live queue entry as not committed.
+  // Without request-specific/queue evidence it remains unknown and FIFO stays
+  // blocked.
+  function recoverSubmit(item, gen, onDone) {
     if (!data.getTool || !data.session || !data.session.id) {
-      render();
-      done();
+      onDone('unknown');
       return;
     }
-    callTool(data.getTool, { sessionId: data.session.id })
+    var sid = data.session.id;
+    callTool(data.getTool, { sessionId: sid })
       .then(function (syncRes) {
-        if (gen !== generation) { done(); return; } // session ended while syncing
-        var sc = syncRes && (syncRes.structuredContent || (syncRes.content && syncRes.content[0] && syncRes.content[0].structuredContent));
-        if (sc && sc.session) {
-          // Authoritative card restored: adopt the session's current card
-          // (full from cache or preloaded; id-only resolved from cache).
-          adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded, recovery);
-        } else {
-          // No usable sync state: keep the displayed card (full or minimal)
-          // so the user can still rate or reveal — never a blank card.
-          render();
+        if (gen !== generation || !data.session || data.session.id !== sid) return;
+        var state = extractWidgetState(syncRes);
+        if (!state || !state.session || state.session.id !== sid) {
+          onDone('unknown');
+          return;
         }
-        statusEl.textContent = '';
-        done();
+        var outcome = recoveredItemStatus(state, item);
+        if (outcome === 'committed') clearInflightItem(item);
+        else if (outcome === 'reviewed-elsewhere' || outcome === 'not-committed') clearInflightItem(item, true);
+        if (outcome === 'unknown') submissionUncertain = true;
+        adoptServerState(state.session, state.card !== undefined ? state.card : null, state.preloaded, true);
+        onDone(outcome);
       })
       .catch(function () {
-        if (gen !== generation) { done(); return; }
-        render();
-        done();
+        if (gen !== generation || !data.session || data.session.id !== sid) return;
+        onDone('unknown');
       });
   }
 
@@ -1586,43 +1578,74 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
   });
 
   function requestEnd() {
-    if (!data.session || !data.session.id) return;
-    if (ending) return; // already ending — no double request
+    if (!data.session || !data.session.id || ending || submissionUncertain) return;
     ending = true;
-    // Bump the generation: any in-flight submit callback becomes stale and
-    // no-ops, so the end result stays authoritative and a late submit
-    // response can never resurrect the card.
+    var endSessionId = data.session.id;
     generation += 1;
-    // No new ratings while the end request is in flight; any in-flight rating
-    // is abandoned (the session is being ended, not reviewed).
-    inflightByCard = {};
-    inflightByRequest = {};
+    var endGeneration = generation;
+    var interrupted = activeSubmitItem;
+    var cancelled = pendingSubmits.slice();
     pendingSubmits = [];
+    for (var ci = 0; ci < cancelled.length; ci += 1) clearInflightItem(cancelled[ci], true);
+    activeSubmitItem = null;
+    submitInFlight = false;
     disableControls();
-    // No request-state wording: the user never sees that a backend call is
-    // in flight. The end result renders the ended state.
-    callTool(data.endTool, { sessionId: data.session.id })
+    endSessionBtn.disabled = true;
+    finishBtn.disabled = true;
+    continueBtn.disabled = true;
+
+    function keepUnknown(message) {
+      if (endGeneration !== generation || !data.session || data.session.id !== endSessionId) return;
+      ending = false;
+      submissionUncertain = true;
+      render();
+      statusEl.textContent = message;
+    }
+    function recoverEnd() {
+      if (!data.getTool) {
+        keepUnknown('Could not verify whether the session ended. Reconnect and reload before continuing.');
+        return;
+      }
+      callTool(data.getTool, { sessionId: endSessionId })
+        .then(function (syncRes) {
+          if (endGeneration !== generation || !data.session || data.session.id !== endSessionId) return;
+          var state = extractWidgetState(syncRes);
+          if (!state || !state.session || state.session.id !== endSessionId) {
+            keepUnknown('Could not verify whether the session ended. Reconnect and reload before continuing.');
+            return;
+          }
+          if (state.session.status === 'ended' || state.session.status === 'completed') {
+            if (adoptEndResult({ structuredContent: state.session })) statusEl.textContent = 'Session ended.';
+            else keepUnknown('Could not verify whether the session ended. Reconnect and reload before continuing.');
+            return;
+          }
+          var outcome = interrupted ? recoveredItemStatus(state, interrupted) : 'not-committed';
+          if (interrupted && outcome === 'committed') clearInflightItem(interrupted);
+          else if (interrupted && (outcome === 'not-committed' || outcome === 'reviewed-elsewhere')) clearInflightItem(interrupted, true);
+          ending = false;
+          activeSubmitItem = null;
+          submitInFlight = false;
+          submissionUncertain = outcome === 'unknown';
+          adoptServerState(state.session, state.card !== undefined ? state.card : null, state.preloaded, true);
+          render();
+          statusEl.textContent = submissionUncertain
+            ? 'Session is active, but a rating result is unknown. Reconnect and reload before continuing.'
+            : 'Session is still active. Unsent ratings were canceled.';
+        })
+        .catch(function () {
+          keepUnknown('Could not verify whether the session ended. Reconnect and reload before continuing.');
+        });
+    }
+
+    callTool(data.endTool, { sessionId: endSessionId })
       .then(function (res) {
-        adoptEndResult(res);
-        statusEl.textContent = 'Session ended.';
+        if (endGeneration !== generation || !data.session || data.session.id !== endSessionId) return;
+        if (adoptEndResult(res)) statusEl.textContent = 'Session ended.';
+        else recoverEnd();
       })
       .catch(function () {
-        // End failed: re-sync the authoritative session state so a rating
-        // that was already committed before the end request is reflected
-        // (never silently lost), then restore the pipeline safely.
-        ending = false;
-        enableControls();
-        endSessionBtn.disabled = false;
-        if (data.getTool && data.session && data.session.id) {
-          callTool(data.getTool, { sessionId: data.session.id })
-            .then(function (syncRes) {
-              var sc = syncRes && (syncRes.structuredContent || (syncRes.content && syncRes.content[0] && syncRes.content[0].structuredContent));
-              if (sc && sc.session) {
-                adoptServerState(sc.session, sc.card !== undefined ? sc.card : null, sc.preloaded);
-              }
-            })
-            .catch(function () { /* keep the error message; sync is best-effort */ });
-        }
+        if (endGeneration !== generation || !data.session || data.session.id !== endSessionId) return;
+        recoverEnd();
       });
   }
 
@@ -1630,20 +1653,14 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
 
   finishBtn.addEventListener('click', requestEnd);
   continueBtn.addEventListener('click', function () {
-    // Start a NEW spaced-repetition session covering the remaining due cards,
-    // carrying the deck filter, presentation cardType, and name from the
-    // finished session so the mode does not silently change, then render the
-    // returned session + first card.
+    if (continuing || submissionUncertain || !data.session || !data.session.id) return;
+    continuing = true;
+    continueBtn.disabled = true;
+    var continueGeneration = generation;
     var args = {};
     var s = data.session || {};
     var src = s.source;
     var v2 = isV2SessionState(s);
-    // Continue a FINISHED session.
-    //  - v2 sessions: pass repeatSessionId ONLY — the backend COPIES the
-    //    finished session's chunked queue verbatim (exact snapshot replay,
-    //    never a fresh query that could differ from what was reviewed).
-    //  - legacy v1/no-version sessions (no chunked queue to copy): replay the
-    //    selector provenance through the normal start path.
     if (v2 && s.id) {
       args.repeatSessionId = s.id;
     } else {
@@ -1661,8 +1678,31 @@ export function buildReviewWidgetHtml(bootstrap: ReviewWidgetBootstrapInput): st
     }
     if (s.cardType) args.cardType = s.cardType;
     if (s.name) args.name = s.name;
-    callTool(data.startTool, args).then(applyToolResult);
+    var previousSessionId = s.id;
+    function continueFailed() {
+      if (continueGeneration !== generation || !data.session || data.session.id !== previousSessionId) return;
+      continuing = false;
+      continueBtn.disabled = false;
+      render();
+      statusEl.textContent = 'Could not continue the review. Please try again.';
+    }
+    callTool(data.startTool, args)
+      .then(function (result) {
+        if (continueGeneration !== generation) return;
+        var nextState = extractWidgetState(result);
+        if (!nextState || !nextState.session || !nextState.session.id || nextState.session.id === previousSessionId) {
+          continueFailed();
+          return;
+        }
+        continuing = false;
+        applyToolResult(result);
+        if (!data.session || data.session.id !== nextState.session.id) continueFailed();
+      })
+      .catch(function () {
+        continueFailed();
+      });
   });
+
   // Render the bootstrap state first, then let the host's published tool
   // output (Apps SDK toolOutput) replace it when present.
   render();

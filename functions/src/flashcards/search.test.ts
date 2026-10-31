@@ -1,14 +1,12 @@
 /**
- * Unit tests for the pure rich-query helpers (search.ts): filter matching
- * across every requested family, tag semantics (ANY/ALL/NOT), review states,
- * deck combinations, suspended state, date ranges, deterministic ordering,
- * and cursor (de)serialization.
+ * Unit tests for pure rich-query helpers: filter matching across every
+ * requested family, date ranges, cursor token validation, and filter equality.
  */
 
 import {
-  SearchFilters, cardAfterCursor, cardMatchesFilters, compareCardsDesc,
-  makeSearchPageToken, normalizeSearchFilters, parseSearchBound,
-  readSearchPageToken, searchFiltersEqual, searchFiltersKey,
+  SearchFilters, cardMatchesFilters,
+  normalizeSearchFilters, parseSearchBound,
+  readSearchPageToken, searchFiltersEqual,
   SearchableCard,
 } from './search';
 import { SearchCardsQuery } from './types';
@@ -45,6 +43,25 @@ describe('parseSearchBound', () => {
     expect(parseSearchBound(undefined)).toBeUndefined();
     expect(parseSearchBound('not-a-date')).toBeUndefined();
   });
+  it('parses years 0001–0099 without Date.UTC remapping and respects Firestore bounds', () => {
+    const yearOne = new Date(0);
+    yearOne.setUTCFullYear(1, 0, 1);
+    yearOne.setUTCHours(0, 0, 0, 0);
+    const yearNinetyNine = new Date(0);
+    yearNinetyNine.setUTCFullYear(99, 0, 1);
+    yearNinetyNine.setUTCHours(0, 0, 0, 0);
+    expect(parseSearchBound('0001-01-01')).toBe(yearOne.getTime());
+    expect(parseSearchBound('0099-01-01')).toBe(yearNinetyNine.getTime());
+    expect(parseSearchBound('0000-01-01')).toBeUndefined();
+    expect(parseSearchBound('0001-01-01T00:00:00+01:00')).toBeUndefined();
+  });
+
+  it('accepts only calendar-valid ISO date-times', () => {
+    expect(parseSearchBound('2026-02-31T00:00:00.000Z')).toBeUndefined();
+    expect(parseSearchBound('August 1, 2026')).toBeUndefined();
+    expect(parseSearchBound('2026-08-05T10:30:00.000Z')).toBe(Date.parse('2026-08-05T10:30:00.000Z'));
+  });
+
 
   it('upper bounds given as YYYY-MM-DD mean end of that UTC day', () => {
     expect(parseSearchBound('2026-08-31', true)).toBe(Date.UTC(2026, 7, 31) + 86_400_000 - 1);
@@ -235,37 +252,9 @@ describe('cross-family AND', () => {
   });
 });
 
-describe('deterministic ordering', () => {
-  it('orders createdAt desc, ties by id asc (Firestore native tie-break)', () => {
-    const a = card({ id: 'a', createdAt: D('2026-08-01T00:00:00Z') });
-    const b = card({ id: 'b', createdAt: D('2026-08-02T00:00:00Z') });
-    const c1 = card({ id: 'c1', createdAt: D('2026-08-02T00:00:00Z') });
-    const c2 = card({ id: 'c2', createdAt: D('2026-08-02T00:00:00Z') });
-    const sorted = [a, b, c1, c2].sort(compareCardsDesc).map((x) => x.id);
-    // Aug 2 group (b, c1, c2) sorts before Aug 1 (a); within the group id asc.
-    expect(sorted).toEqual(['b', 'c1', 'c2', 'a']);
-  });
-});
-
 describe('pagination cursors', () => {
-  it('mints a token that resumes after the cursor card', () => {
-    const f = filters({ search: 'paris' });
-    const token = makeSearchPageToken(f, 'card-9', D('2026-08-10T00:00:00Z'));
-    const payload = readSearchPageToken(token);
-    expect(payload).toEqual({ filtersKey: searchFiltersKey(f), lastId: 'card-9', lastCreatedAtMs: D('2026-08-10T00:00:00Z') });
-  });
-
-  it('token filtersKey mismatches when the filter set changes', () => {
-    const fParis = filters({ search: 'paris' });
-    const token = makeSearchPageToken(fParis, 'c1', 1);
-    expect(readSearchPageToken(token)!.filtersKey).toBe(searchFiltersKey(fParis));
-    expect(readSearchPageToken(token)!.filtersKey).not.toBe(searchFiltersKey(filters({ search: 'lyon' })));
-  });
-
-  it('rejects malformed tokens', () => {
-    expect(readSearchPageToken('not-base64!!')).toBeNull();
-    expect(readSearchPageToken('')).toBeNull();
-    expect(readSearchPageToken(Buffer.from('{"lastId":1}').toString('base64'))).toBeNull();
+  it('rejects malformed cursor data', () => {
+    expect(readSearchPageToken('not-a-cursor')).toBeNull();
   });
 
   it('filters equality is canonical (order/dup-insensitive, case-normalized)', () => {
@@ -276,14 +265,5 @@ describe('pagination cursors', () => {
     expect(searchFiltersEqual(a, c)).toBe(false);
   });
 
-  it('cardAfterCursor: createdAt desc with id asc tiebreak', () => {
-    const after = (created: number, id: string) => cardAfterCursor(card({ id, createdAt: created }), 'mid', D('2026-08-10T00:00:00Z'));
-    // Strictly AFTER in createdAt-desc + id-asc order: older createdAt, or
-    // equal createdAt with a LARGER id.
-    expect(after(D('2026-08-09T00:00:00Z'), 'aaa')).toBe(true);
-    expect(after(D('2026-08-10T00:00:00Z'), 'zzz')).toBe(true);
-    expect(after(D('2026-08-10T00:00:00Z'), 'mid')).toBe(false); // the cursor card itself
-    expect(after(D('2026-08-10T00:00:00Z'), 'aaa')).toBe(false); // sorts before cursor (same ts, smaller id)
-    expect(after(D('2026-08-11T00:00:00Z'), 'zzz')).toBe(false); // newer → already shown
-  });
 });
+

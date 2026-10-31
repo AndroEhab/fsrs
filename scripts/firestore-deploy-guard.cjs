@@ -10,15 +10,14 @@
  *   2. firestore.indexes.json is missing or not valid JSON;
  *   3. the indexes file is missing the `indexes` array or `fieldOverrides`
  *      (firebase-tools would fail the release anyway - fail faster, locally);
- *   4. the rules file does not parse (checked with firebase-tools' rules
- *      parser when the CLI is resolvable, otherwise with a structural check).
+ *   4. the rules file fails an offline structural sanity check for its
+ *      rules_version = '2' directive, balanced braces, comments, or strings.
  *
- * The parser used by firebase-tools' own deploy (RulesDeploy.compile) calls
- * the RULES API (testRuleset) - a network round-trip. The local ruleset
- * module in firebase-tools is a thin API client, NOT an offline parser, so
- * this guard performs a no-network structural check of the rules syntax
- * (balanced braces/quotes, rules_version present) plus the same JSON
- * structural checks - it never contacts the network and never deploys.
+ * This is intentionally not a Firestore Rules grammar parser and does not
+ * establish that a ruleset is semantically valid. firebase-tools' own deploy
+ * parser (RulesDeploy.compile) calls the RULES API (testRuleset), a network
+ * round-trip. The local ruleset module in firebase-tools is a thin API client,
+ * NOT an offline parser. This guard never contacts the network and never deploys.
  *
  * This prevents the two silent foot-guns of a firestore-only deploy:
  *   - rules/indexes files missing from the tree at deploy time (which
@@ -68,63 +67,101 @@ const failRulesSyntax = (message) => {
 if (typeof rulesSource !== 'string' || rulesSource.trim().length === 0) {
   failRulesSyntax('file is empty');
 }
-if (!/rules_version\s*=\s*['"]?2['"]?;/i.test(rulesSource)) {
-  // rules_version = '2' is required for modern Firestore rules; its absence
-  // usually means a truncated/corrupted file (or an accidental rules wipe).
-  failRulesSyntax('missing "rules_version = \'2\';" header');
-}
 
-// Token-level balance check: strips comments/strings, then requires every
-// opening brace to have a matching close (a truncated rules file would pass
-// the header check but fail here).
-function stripCommentsAndStrings(src) {
-  let out = '';
+// Scan only enough Rules tokens to find the version directive and balance
+// braces. This deliberately is not a Firestore Rules grammar/parser.
+function scanRulesSource(src) {
+  const tokens = [];
+  let depth = 0;
+  let hasVersionHeader = false;
   let i = 0;
+
+  const remember = (type, value) => {
+    if (tokens.length === 4) return;
+    tokens.push({ type, value });
+    if (tokens.length === 4 &&
+        tokens[0].type === 'identifier' && tokens[0].value === 'rules_version' &&
+        tokens[1].value === '=' &&
+        (tokens[2].type === 'string' || tokens[2].type === 'number') && tokens[2].value === '2' &&
+        tokens[3].value === ';') {
+      hasVersionHeader = true;
+    }
+  };
+
   while (i < src.length) {
     const ch = src[i];
+    if (/\s/.test(ch)) {
+      i += 1;
+      continue;
+    }
     if (ch === '/' && src[i + 1] === '/') {
+      i += 2;
       while (i < src.length && src[i] !== '\n') i += 1;
       continue;
     }
     if (ch === '/' && src[i + 1] === '*') {
       i += 2;
       while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i += 1;
+      if (i >= src.length) failRulesSyntax('unterminated block comment');
       i += 2;
       continue;
     }
     if (ch === '"' || ch === "'") {
       const quote = ch;
+      let value = '';
+      let closed = false;
       i += 1;
       while (i < src.length) {
         if (src[i] === '\\') {
+          if (i + 1 >= src.length) break;
+          value += `\\${src[i + 1]}`;
           i += 2;
           continue;
         }
         if (src[i] === quote) {
           i += 1;
+          closed = true;
           break;
         }
+        value += src[i];
         i += 1;
       }
+      if (!closed) failRulesSyntax('unterminated string literal');
+      remember('string', value);
       continue;
     }
-    out += ch;
+
+    if (/[A-Za-z_]/.test(ch)) {
+      const start = i;
+      i += 1;
+      while (i < src.length && /[A-Za-z0-9_]/.test(src[i])) i += 1;
+      remember('identifier', src.slice(start, i));
+      continue;
+    }
+    if (/[0-9]/.test(ch)) {
+      const start = i;
+      i += 1;
+      while (i < src.length && /[0-9]/.test(src[i])) i += 1;
+      remember('number', src.slice(start, i));
+      continue;
+    }
+
+    remember('punctuation', ch);
+    if (ch === '{') depth += 1;
+    else if (ch === '}') depth -= 1;
+    if (depth < 0) failRulesSyntax('unbalanced braces: more "}" than "{"');
     i += 1;
   }
-  return out;
-}
 
-const stripped = stripCommentsAndStrings(rulesSource);
-let depth = 0;
-for (const ch of stripped) {
-  if (ch === '{') depth += 1;
-  else if (ch === '}') depth -= 1;
-  if (depth < 0) {
-    failRulesSyntax('unbalanced braces: more "}" than "{"');
+  if (!hasVersionHeader) {
+    failRulesSyntax('missing "rules_version = \'2\';" header');
+  }
+  if (depth !== 0) {
+    failRulesSyntax(`unbalanced braces: ${depth} unclosed "{"`);
   }
 }
-if (depth !== 0) {
-  failRulesSyntax(`unbalanced braces: ${depth} unclosed "{"`);
-}
+
+scanRulesSource(rulesSource);
+
 
 console.log('[firestore predeploy guard] OK: firestore.rules present and structurally sound; firestore.indexes.json is well-formed.');

@@ -26,10 +26,10 @@ This is the **primary** ChatGPT integration. The Custom GPT Action in
 | `bulk_create_flashcards` | `POST /bulkCreateFlashcardsHandler` | Atomically create up to 100 cards in one request (single Firestore batch, all-or-nothing) |
 | `list_flashcards` | `GET /listFlashcardsHandler` | List with `deckId`/`deck`/`tags` (ANY-of) filters + `pageSize`/`pageToken` pagination |
 | `get_due_flashcards` | `GET /dueFlashcardsHandler` | Active cards due for review now (new + scheduled; suspended cards excluded), earliest due first, optional `deckId`/`deck` + pagination |
-| `search_cards` | `GET /searchCardsHandler` | Rich query: combined filters (AND across families) — `search` (topic/front/back, case-insensitive), `tagsAny`/`tagsAll`/`tagsNot` (one of three), `review` (due/notDue/new/reviewed), `decks` + `deckNames` (ANY-of union), `suspended`, `createdFrom`/`createdTo`/`updatedFrom`/`updatedTo` (inclusive date bounds) — ordered createdAt desc (id asc ties), opaque cursor `pageToken`/`nextPageToken` (must pair with identical filters). Cards carry optional `topic` (label) and `suspended` (default false) fields set via create/update/bulk |
+| `search_cards` | `GET /searchCardsHandler` | Rich query: combined filters (AND across families) — `search` (topic/front/back, case-insensitive), one of `tagsAny`/`tagsAll`/`tagsNot`, `review`, `decks` + `deckNames` (ANY-of union), `suspended`, and inclusive date bounds. Array filters use up to 20 repeated literal values (tags 1–50 chars, deck IDs 1–100, deck names 1–300); commas and surrounding whitespace are preserved, never CSV-split or trimmed. Results use createdAt desc/id asc order and an opaque filter-bound cursor resumed at its exact createdAt timestamp and document-ID position. |
 | `count_flashcards` | `GET /countFlashcardsHandler` | Lightweight deck statistics — counts WITHOUT fetching card records (Firestore count() aggregations): `total`/`new`/`learning`/`mature`/`due`, optional `deckId`/`deck`/`tags` filters (AND; deckId wins over the legacy `deck` name, answers "how many cards are in Spanish?"), or a standalone whole-library `groupBy=deck` breakdown (per deck entity + deck-less remainder; cannot be combined with the filters) |
 | `start_review_session` | `POST /startReviewSessionHandler` | Start a persistent review session: the backend snapshots EVERY matching card into the session queue (never capped — v2 storage pages the snapshot into bounded `queueChunks` documents, 200 positions per chunk). **NO selectors → the standard DUE queue** (new + scheduled, earliest due first). Optional selectors (any combination): `deckId` (stable id) and/or `deck` (legacy name; `deckId` wins), `tags` (ANY-of), `cardIds` (explicit allowlist, deduped, every id must exist; combined with deck/tags by INTERSECTION). Selector-defined sessions may include NON-due cards; REVIEW_TEST_MODE only widens the DEFAULT due filter, never an explicit selection. Persists the session `source` metadata (`due` / `deck` name / `custom` — v2 provenance never carries card ids) + `cardType`/`name` (presentation-only); reports mode, dueCount, remainingCount, and the bounded `currentPosition`/`queueWindow` (v2 roots never carry a full `cardIds` snapshot); a client-supplied `limit` is rejected |
-| `get_review_session` | `GET /getReviewSessionHandler/{sessionId}` | Resume/read a session (any status) plus its current card (null when exhausted) and a BOUNDED `preloaded` window (up to SESSION_PRELOAD upcoming cards, each with its stable queue position) plus `currentPosition`/`queueWindow`; carries the session `cardType`/`name`; only the starting API key can read it |
+| `get_review_session` | `GET /getReviewSessionHandler/{sessionId}` | Resume/read a session plus current card and bounded preload; carries cardType/name; only the authenticated `ownerId` can read it (403 otherwise) |
 | `submit_review` | `POST /submitSessionReviewHandler/{sessionId}` | Rate the session's expected current card (1–4, optional `reviewAt`); optional `requestId` (idempotency key — same-key retries are no-ops) and `expectedCardId` (mismatch/already-rated → 409); atomically applies FSRS and advances the session — returns the updated session, next card, `requestId` echo, and an EMPTY `preloaded` array (the widget already holds the full monotonic buffer) |
 | `end_review_session` | `POST /endReviewSessionHandler/{sessionId}` | Abandon an active session without rating the rest (idempotent; status → `ended`) |
 | `get_flashcard` | `GET /getFlashcardHandler/{id}` | Read one card |
@@ -47,27 +47,33 @@ This is the **primary** ChatGPT integration. The Custom GPT Action in
 | `update_deck` | `PATCH /updateDeckHandler/{id}` | Rename/describe a deck; rename rewrites the name on its cards |
 | `delete_deck` | `DELETE /deleteDeckHandler/{id}` | Delete a deck — destructive to the deck but NOT its cards (cards are detached, preserved) |
 | `attach_image` | `POST /attachImageHandler/{cardId}` | Attach an image to a card by URL (validated http(s), allowed MIME/extension, ≤5 per card) |
-| `upload_image` | `POST /uploadImageHandler/{cardId}` | Upload an image (base64) to Firebase Storage; persists cloud metadata (id/storagePath/downloadUrl/contentType/sizeBytes), ≤10 MiB, raster MIME only (no SVG) |
-| `list_card_images` | `GET /listImagesHandler/{cardId}` | List a card's image attachments (URL refs and cloud metadata: id, storagePath, downloadUrl, sizeBytes) |
-| `remove_image` | `DELETE /removeImageHandler/{cardId}` | Remove an image attachment by its URL (removes only the card's reference, not the external file) |
+| `upload_image` | `POST /uploadImageHandler/{cardId}` | Upload an image (base64) to Firebase Storage; persists cloud metadata (id/storagePath/downloadUrl/contentType/sizeBytes), ≤10 MiB, raster MIME only (no SVG); signed URLs refresh on owner reads |
+| `list_card_images` | `GET /listImagesHandler/{cardId}` | List a card's image attachments (URL refs and cloud metadata: id, storagePath, downloadUrl, sizeBytes); returns current usable signed URLs for owned uploads |
+| `remove_image` | `DELETE /removeImageHandler/{cardId}` | Remove an image by URL; direct URLs match exactly and retain their external source, while the owned cloud object is deleted after committed removal (older signatures identify the same object) |
 | `list_tags` | `GET /listTagsHandler` | List the DISTINCT tags in the whole library (exact, case-sensitive names derived from cards — no tag collection), each with its card count, sorted by name ascending, `pageSize`/`pageToken` pagination (token = last tag name of the page). Read-only |
 | `rename_tag` | `POST /renameTagHandler` | Rename a tag whole-library: replace `from` with `to` on every card carrying `from` (exact, case-sensitive; dedup when `to` already present; `from`/`to` must differ, 1–50 chars, spaces allowed). Missing `from` → no-op (`affectedCards: 0`); returns `{ affectedCards }` |
 | `delete_tag` | `POST /deleteTagHandler` | Delete a tag whole-library: remove `name` from every card carrying it (exact, case-sensitive) — cards themselves untouched. **Destructive/irreversible**; missing name → no-op (`affectedCards: 0`); returns `{ affectedCards }` |
 | `merge_tags` | `POST /mergeTagsHandler` | Merge a tag whole-library (UNION): remove `from` and ensure `to` on every card carrying `from` (deduped). `from` disappears; missing `from` → no-op (`affectedCards: 0`); returns `{ affectedCards }` |
 
-| `get_review_history` | `GET /getReviewHistoryHandler` | Read the CURRENT API KEY's review-event history (actor-scoped), newest first: each event = id, cardId, actorId, rating, stateBefore, reviewedAt/recordedAt (ISO), stabilityAfter/difficultyAfter/repsAfter/lapsesAfter, dueBefore/dueAfter (ISO), deckId/deckName, cardFrontSnapshot (≤300), sessionId. Filters `from` (inclusive) / `to` (EXCLUSIVE — `[from, to)`) / `cardId` / `deckId` / `ratings` (array of 1=Again..4=Easy, ANY-of), `pageSize` (1–100, default 50), opaque `pageToken` (must pair with the same filters). Read-only |
-| `get_study_stats` | `GET /getStudyStatsHandler` | FLAT read-time study statistics for the current API key within a REQUIRED reviewedAt window `from`/`to` (`[from, to)`, from inclusive, to exclusive; ISO 8601 or YYYY-MM-DD), optional `deckId`, optional `topLimit` (1–25, default 10): from, to, totalReviews, ratingCounts + ratingPercentages (again/hard/good/easy), observedRetention (successful 2/3/4 ÷ total), matureReviews (pre-state Review/Relearning), matureRatingCounts, matureRetention, topLapsedCards. LAPSE DEFINITION: ratingCounts.again counts EVERY Again; persisted `lapses`/topLapsedCards count only FSRS mature failures (Again from Review state). Read-only |
+| `get_review_history` | `GET /getReviewHistoryHandler` | Read the authenticated owner's review-event history (scoped by `ownerId`), newest first: each event = id, cardId, actorId, rating, stateBefore, reviewedAt/recordedAt (ISO), stabilityAfter/difficultyAfter/repsAfter/lapsesAfter, dueBefore/dueAfter (ISO), deckId/deckName, cardFrontSnapshot (≤300), sessionId. Filters `from` (inclusive) / `to` (EXCLUSIVE — `[from, to)`) / `cardId` / `deckId` / `ratings` (array of 1=Again..4=Easy, ANY-of), `pageSize` (1–100, default 50), opaque `pageToken` (must pair with the same filters). Read-only |
+| `get_study_stats` | `GET /getStudyStatsHandler` | FLAT read-time study statistics for the authenticated owner (`ownerId`) within a REQUIRED reviewedAt window `from`/`to` (`[from, to)`, from inclusive, to exclusive; ISO 8601 or YYYY-MM-DD), optional `deckId`, optional `topLimit` (1–25, default 10): from, to, totalReviews, ratingCounts + ratingPercentages (again/hard/good/easy), observedRetention (successful 2/3/4 ÷ total), matureReviews (pre-state Review/Relearning), matureRatingCounts, matureRetention, topLapsedCards. LAPSE DEFINITION: ratingCounts.again counts EVERY Again; persisted `lapses`/topLapsedCards count only FSRS mature failures (Again from Review state). Read-only |
 | `get_top_lapsed_cards` | `GET /getTopLapsedCardsHandler` | Rank the library's cards by CURRENT all-time lapse count: persisted `lapses` counts ONLY FSRS mature failures (Again from the Review state, the ts-fsrs rule — Learning/New/Relearning Agains never increment it), read at request time; zero-lapse excluded; indexed query; `limit` 1–25, default 10; optional `deckId`): cardId, lapses, reps, front, deckId/deckName, lastReview. Read-only |
 | `migrate_review_events` | `POST /migrateReviewEventsHandler` | EXPLICIT operator maintenance migration: backfill `reviewEvents` from pre-event card-embedded reviewLog (newest-100 window; older trimmed entries unrecoverable). Requires `legacyActorId` (operator-supplied; never hardcoded); optional `pageSize`, `resumeAfterCardId`. Idempotent (deterministic ids + existence checks); returns `nextResumeAfterCardId` — pass it as `resumeAfterCardId` to continue exactly. NEVER automatic |
-| `import_apkg` | `POST /importApkgHandler` | Import a standard Anki `.apkg` (base64-encoded ZIP containing a SQLite `collection.anki2`): each note → one flashcard (Front/Back or Cloze fields HTML→plain text, tags ≤30, deck found-or-created, nested names like `Spanish::Verbs` supported). `package` ≤ 20 MiB decoded, ≤ 1000 cards imported; malformed packages are rejected with NO partial writes (≤500 cards commit in one atomic batch); 0/2+ card notes and empty-field notes are skipped and reported (`skippedNotes`/`skippedEmpty`); optional `deckPath` overrides every card's deck. Returns imported cards + skip counts + `atomic`/`batchCount` |
-| `export_apkg` | `POST /exportApkgHandler` | Export flashcards to a valid Anki `.apkg`: response `package` is the base64 .apkg (decode + save as `*.apkg`). No args → newest 1000 cards; `deck` (exact name/path) or `cardIds` (≤1000, deduped; missing ids omitted → `filteredCards`) select a subset (mutually exclusive). Review cards carry scheduling where Anki-compatible (type/queue/due day-ordinal, reps/lapses, FSRS reviewLog → revlog); cloze fronts (`[answer]`) export as Anki cloze notes; stored images are embedded only from PUBLIC https URLs (server fetches are DNS-pinned to public addresses, refuse private/link-local/metadata/loopback targets and plaintext http, and never auto-follow a redirect to them), bounded (4 MiB/file, 100 files, 8 MiB total) else reported in `mediaSkipped` with reasons. Content round-trips as TEXT (formatting is not preserved) |
+| `import_apkg` | `POST /importApkgHandler` | Import a standard Anki `.apkg` (base64 ZIP containing SQLite `collection.anki2`; ≤20 MiB decoded, ≤1000 cards). Notes with 0 or multiple generated cards, or invalid/empty required fields, are skipped and reported. The model’s Front/Back or Cloze Text/Extra fields are selected; HTML becomes plain text, tags are retained (≤20), and decks are found-or-created (including nested names). For Cloze models, Anki card ordinal + 1 selects the active deletion: its answer becomes `[answer]`, other deletion answers remain visible, and Extra becomes Back. Hints, nested/malformed clozes, empty or missing active deletions, and literal square brackets return a typed format error (HTTP 400); Basic-model braces remain literal. The package is parsed/validated before writes. Writes use count- and byte-bounded transactions; each transaction is atomic, but a multi-transaction import may partially commit if a later transaction fails. `atomic` is true only for a single transaction; `batchCount` reports the transaction count. If the complete serialized JSON HTTP response body would exceed 32,000,000 bytes, import fails with a typed error before deck/card writes rather than truncating; reduce package/card content and retry. Optional `deckPath` overrides every card’s deck. |
+| `export_apkg` | `POST /exportApkgHandler` | Export flashcards to a valid Anki `.apkg`: response `package` is the base64 .apkg (decode + save as `*.apkg`). No args → newest 1000 cards; `deck` (exact name/path) or `cardIds` (≤1000, deduped; missing ids omitted → `filteredCards`) select a subset (mutually exclusive). Review cards carry scheduling where Anki-compatible (type/queue/due day-ordinal, reps/lapses, FSRS reviewLog → revlog); cloze fronts (`[answer]`) export as Anki cloze notes; stored images are embedded only from PUBLIC https URLs (server fetches are DNS-pinned to public addresses, refuse private/link-local/metadata/loopback targets and plaintext http, and never auto-follow a redirect to them), bounded (4 MiB/file, 100 files, 8 MiB total) else reported in `mediaSkipped` with reasons. If the complete serialized JSON HTTP response body would exceed 32,000,000 bytes, export is rejected with a typed error rather than truncated; reduce the selected cards or image references and retry. Content round-trips as TEXT (formatting is not preserved) |
 
 
 
-## Review widget (`ui://review-session-v5`)
+**Path IDs.** When calling a path-based handler directly, encode each opaque
+Firestore ID as one URL path segment (for example, `encodeURIComponent(id)`);
+the server decodes that segment exactly once. Unicode, spaces, and literal
+percent signs round-trip. Slash-containing IDs are rejected, including an
+encoded slash; a literal `%2F` in an ID must be sent as `%252F`.
 
-The server also registers a self-contained **Apps SDK review widget** as the
-resource `ui://review-session-v5` (MIME `text/html;profile=mcp-app`): an
+## Review widget
+
+The server also registers a self-contained **Apps SDK review widget** as a
+versioned `ui://` resource (MIME `text/html;profile=mcp-app`): an
 Anki-like card UI — front visible, tap to flip, then
 **Again / Hard / Good / Easy** buttons wired to `submit_review` — with the
 session's `modeTag` (e.g. `[Spaced repetition review · 12 cards due]`),
@@ -134,6 +140,13 @@ explanations. The session's persisted `cardType` is the sole
 presentation config: a caller cannot change the mode per answer. This is a
 **presentation** feature: the stored card `front`/`back` are never modified.
 
+**Session ownership.** New review sessions are assigned the authenticated
+backend `ownerId`; only that same `ownerId` may read, submit reviews to, or end
+a session. Legacy persisted roots without `ownerId` remain ownerless and
+quarantined, never falling back to an API-key identity. `apiKeyName` is not a
+public session field or an ownership key. The `X-API-Key` credential gate is
+distinct from owner authorization.
+
 **Optimistic preloaded queue.** Every session response carries the next-card
 `preloaded` window — up to SESSION_PRELOAD upcoming cards after the current
 one (the SESSION queue itself is uncapped; each `submit` response also
@@ -199,12 +212,11 @@ debugging the review backend. Confirm that `tools/list` exposes
 `_meta.ui.resourceUri` for `start_review_session` and that `resources/read`
 returns `text/html;profile=mcp-app`.
 
-The widget resource URI is **versioned and bumped on every widget release**
-(currently `ui://review-session-v5`, with NO alias on `…-v4`): because the
-connector caches the widget code by URI, a bump forces ChatGPT to fetch the new
-widget. **If you see TWO review widgets after a session action**, the connector
-is still holding the cached tool schema from before the single-widget
-decoupling (only `start_review_session` may mount the widget;
+The widget resource URI is **versioned and bumped on every widget release**:
+because the connector caches widget code by URI, a bump forces ChatGPT to fetch
+the current widget. **If you see TWO review widgets after a session action**,
+the connector is still holding the cached tool schema from before the single-
+widget decoupling (only `start_review_session` may mount the widget;
 `get_review_session`/`submit_review` are data-only): remove the connector,
 re-add it, and confirm `tools/list` shows the updated metadata.
 
@@ -256,8 +268,8 @@ in-root arrays) keep their old storage and are read/advanced unchanged.
    needs the `due + __name__` composite set.
 2. Deploy the backend functions.
 3. Deploy/restart the MCP server.
-4. Reconnect the widget host (the widget URI is bumped per release; cached
-   clients must re-fetch `ui://review-session-v5`).
+4. Reconnect the widget host after a widget update so it fetches the current
+   versioned resource URI.
 
 **Rollback**
 - Only LEGACY (v1/no-version) sessions are readable/advanceable by the
@@ -281,6 +293,7 @@ bulk operation is bounded at **100 items** (`BULK_LIMIT` in
 
 **Explicit scheduling management (reset / set-due / suspend / unsuspend).** Four dedicated tools mutate card lifecycle/scheduling state by explicit card id (`{ ids }`, 1–100 unique ids per call — the same cap as the bulk APIs; duplicate ids are rejected). They all commit atomically in one Firestore transaction and OMIT ids that do not exist from the result (never an error — the established bulk convention): the response is `{ ids, count, cards }` with the changed cards in input order.
 - `reset_flashcards` — resets FSRS scheduling to a brand-new state: New, due immediately (server now), zeroed stability/difficulty/reps/lapses, empty `reviewLog`, `lastReview` removed. Content, deck, tags, topic, images and suspension are untouched. The card reads as new/due everywhere (due queues, review sessions, search facets, counts). Scheduling history is cleared, not archived.
+- Legacy Learning/Relearning cards without recoverable short-term progress reject reviews with HTTP 409 and record nothing. The error explains that an explicit scheduling reset is required. Confirm with the user before calling `reset_flashcards`: reset deliberately clears FSRS scheduling state and the embedded review log; it is never automatic. New reviews preserve `learningSteps` and `learningStepsAfter` so future transitions do not infer progress from total reps.
 - `set_due_date` — writes the exact `due` instant (`due` = full ISO 8601 date-time or `YYYY-MM-DD` → UTC midnight). ONLY `due` changes: the FSRS state fields and reviewLog are preserved, so the next `review_flashcard` schedules from the persisted state with the new due time.
 - `suspend_flashcards` / `unsuspend_flashcards` — set / remove the persisted `suspended` flag. Suspension keeps content + scheduling untouched. `get_due_flashcards` excludes suspended cards; `list_flashcards` and review-session endpoints do not filter them. `search_cards` supports `suspended: true|false`, and suspended cards never match its `review` facet.
 
@@ -289,12 +302,15 @@ stores validated metadata (`url`, optional `alt`/`mimeType`, `addedAt`) —
 never the image bytes; the URL must be `http(s)` and either declare an allowed
 MIME type or end in a matching extension. (2) Cloud uploads via `upload_image`
 (base64): bytes go to Firebase Storage under a card-scoped path and the card
-stores `id`, `storagePath`, `downloadUrl` (signed URL), `contentType`,
-`sizeBytes`, `alt`, `addedAt` — up to **10 MiB** decoded, raster MIME only
-(jpeg/png/gif/webp/avif/bmp; SVG is not accepted for upload). A card holds at
-most **5 images** (`MAX_CARD_IMAGES`). `remove_image` matches by URL and
-removes only the card's reference (for cloud images the Storage object is
-deleted); the externally hosted file is untouched.
+stores `id`, `storagePath`, `downloadUrl` (short-lived signed URL),
+`contentType`, `sizeBytes`, `alt`, `addedAt` — up to **10 MiB** decoded,
+raster MIME only (jpeg/png/gif/webp/avif/bmp; SVG is not accepted for upload).
+Owner-scoped card/image reads refresh near-expiry URLs; use the latest URL
+returned by the backend. A card holds at most **5 images**
+(`MAX_CARD_IMAGES`). `remove_image` matches external URLs exactly, while an
+owned Storage URL can identify the same bucket/object across signature
+refreshes; it deletes that object's file only after the card reference commits.
+The externally hosted file for a direct URL attachment is untouched.
 
 **Count semantics (`count_flashcards`).** The backend counts with Firestore
 `count()` aggregations — it never fetches a single flashcard document, so the
@@ -333,21 +349,24 @@ everything at review time and leave the stored originals unchanged.
 **Tag management is whole-library derived-tag rewrites.** Tags are NOT an
 entity collection: every tag operation reads the stored `tags` arrays of the
 flashcards themselves. `list_tags` scans the whole library (paged by document
-id, aggregated in memory) and returns the DISTINCT tags with per-tag card
-counts, sorted by name ASCENDING and paginated with the listDecks convention
+id, projecting only `tags` and aggregating distinct names/counts in memory),
+then sorts by name ASCENDING and paginates with the listDecks convention
 (`nextPageToken` = the last tag name of the page — pass it back to resume
 strictly after). Matching for all operations is EXACT and CASE-SENSITIVE:
 the backend never normalizes, lowercases, or trims tag names, so the tools do
 not either (a name differing by whitespace is a different, valid tag — use
 `list_tags` to see the exact stored names). Each name is 1–50 characters and
-may contain spaces; rename/merge require `from`/`to` to differ. Every
-mutation returns `{ affectedCards }` — the number of CARD documents whose
-`tags` array was rewritten — and commits in chunked batches (≤500 writes),
-refreshing `updatedAt` on each rewritten card while preserving everything
-else (content, deck, topic, images, suspension, FSRS scheduling). A tag name
-that no card carries is a SUCCESSFUL NO-OP (`affectedCards: 0`), never an
-error. `rename_tag` replaces `from` with `to` per card (deduped when `to`
-already present — the outcome equals `merge_tags` for that card);
+may contain spaces; rename/merge require `from`/`to` to differ. Mutations scan
+matching cards in document-ID pages of at most 400 and transactionally
+re-read each page's current owner/tags before writing only changed tag arrays
+and `updatedAt`. Concurrent tag actions on the same cards therefore compose
+on current arrays; bounded pages may commit progressively if a later page
+fails. Every mutation returns `{ affectedCards }` — the number of cards
+actually changed and committed — while preserving all other card fields,
+including content, deck, topic, images, suspension, and FSRS scheduling. A
+tag name that no card carries is a SUCCESSFUL NO-OP (`affectedCards: 0`),
+never an error. `rename_tag` replaces `from` with `to` per card (deduped when
+`to` already present — removing `from` still changes the card).
 `delete_tag` removes `name` everywhere (**destructive and irreversible**,
 annotated `destructiveHint`, and cards keep an empty `tags` array when that
 was their only tag); `merge_tags` unions `from` into `to` (remove `from`,
@@ -384,7 +403,7 @@ backend. The server never stores, logs, or prints the API key.
 
 ## Requirements
 
-- Node.js **20.9+** (tested on 22)
+- Node.js **22** (the Docker build and deployed runtime use Node.js 22).
 - `CUELINGUA_API_KEY` — the API key for the deployed backend, from the
   environment only. The backend enforces it in production (missing/invalid →
   `401`); keys live in the Firestore `apiKeys` collection (see
@@ -432,9 +451,8 @@ node --env-file-if-exists=.env scripts/launch-local.mjs stdio
 ```bash
 npm test           # unit tests: bridge URL/headers/errors + tool definitions
                    # (no live HTTP; fetch is mocked)
-npm run smoke      # starts the server, drives it over Streamable HTTP:
-                   # tools/list, health, missing-key and validation errors
-                   # (no live writes)
+npm run smoke      # builds, drives Streamable HTTP, and tests large tool bodies
+                   # against a loopback mock (no production backend or writes)
 ```
 
 You can also use the official MCP Inspector:
@@ -500,12 +518,16 @@ http://127.0.0.1:8787/mcp
 Do not run both transports under the same connector. STDIO is the simplest
 local test; Streamable HTTP is useful for exercising the HTTP connector and
 metadata path. Keep the HTTP server bound to `127.0.0.1` for local testing.
+The Streamable HTTP body limit is derived from the largest declared tool input:
+the 20 MiB decoded `.apkg` import base64 bound plus 4 KiB for JSON-RPC framing.
+The HTTP host, origin, and authentication gates run before the SDK parses a
+request body; rejected requests do not reach the tool handlers or backend.
 
 ## Deploying the MCP server to a public HTTPS endpoint
 
 For a hosted/web connector, use a **public HTTPS URL ending in `/mcp`**. The
 local desktop connector can use the loopback URL above. The server is plain
-Node (no framework), so it runs anywhere that can host Node 20.9+.
+Node (no framework), so it runs anywhere that can host Node.js 22.
 
 1. **Cloud Run (recommended)**: build a container image (Dockerfile below),
    push to Artifact Registry, deploy with `PORT` set by Cloud Run and
@@ -517,18 +539,20 @@ Node (no framework), so it runs anywhere that can host Node 20.9+.
    `https://<subdomain>.ngrok.app/mcp` in ChatGPT's developer-mode connector.
 
 ```dockerfile
-# mcp-server/Dockerfile — build with Node 20, run as non-root
-FROM node:20-slim AS build
+# mcp-server/Dockerfile — build and run on Node.js 22, as non-root
+FROM node:22-slim AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
 RUN npm run build && npm prune --omit=dev
 
-FROM node:20-slim
+FROM node:22-slim
 ENV NODE_ENV=production
 WORKDIR /app
+COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/fonts ./fonts
 COPY --from=build /app/node_modules ./node_modules
 EXPOSE 8080
 USER node
@@ -590,15 +614,18 @@ local tools and debugging do not require any Auth0 configuration.
 
 An HTTP server whose backend is a REMOTE origin (the default
 `https://us-central1-cuelingua.cloudfunctions.net`, or any non-loopback
-`FSRS_API_BASE_URL`) **refuses to start without an authentication
-mechanism**: Auth0 (`AUTH0_ISSUER` + `AUTH0_AUDIENCE`) or the static
-`MCP_AUTH_TOKEN` bearer gate. This prevents an accidental public deployment
-from exposing the server-held backend key (`CUELINGUA_API_KEY`) with no
-authentication. Loopback-only development, stdio, and the local emulator/mock
-backends never require auth. The explicit local override is
-`MCP_AUTH_OPT_OUT=true` (also silences the startup warning) — use it only for
-local desktop connectors / tunnels, never for a public deployment. The
-launcher (`scripts/launch-local.mjs http`) sets this override automatically
+FSRS_API_BASE_URL`) **refuses to start without exactly one coherent authentication
+mode**: Auth0 (`AUTH0_ISSUER` + `AUTH0_AUDIENCE`) for per-user
+identity, or `MCP_AUTH_TOKEN` for a trusted single-user connector. Never set
+both: startup rejects the ambiguous configuration rather than bypassing the
+Auth0 gate. Issuer and audience must also be set together. Auth0-only mode
+forwards only the verified request token to backend calls. Static/stdio access
+to a remote backend additionally requires `MCP_BACKEND_AUTH_TOKEN` as a trusted
+single-user backend identity; this process-scoped credential is never used in
+Auth0 mode. Remote backend access also requires `CUELINGUA_API_KEY`.
+The local HTTP launcher opts out of MCP's static gate because it binds to
+loopback, but still requires both backend credentials for remote calls.
+The launcher (`scripts/launch-local.mjs http`) sets this override automatically
 because it binds to 127.0.0.1.
 
 ### Auth0 tenant prerequisites
@@ -683,16 +710,19 @@ the operation to the caller's verified `sub` (multi-tenant ownership).
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `CUELINGUA_API_KEY` | *(none)* | Backend API key → `X-API-Key` header. **Never committed.** The verified incoming Auth0 token is forwarded automatically as `Authorization` per request (no env var needed). |
+| `CUELINGUA_API_KEY` | *(none)* | Backend API key → `X-API-Key`; required for remote backend tools. Never committed. |
 | `FSRS_API_BASE_URL` | `https://us-central1-cuelingua.cloudfunctions.net` | Deployed backend base URL |
 | `MCP_PORT` | `8787` | HTTP port (falls back to `PORT`) |
 | `MCP_HOST` | `0.0.0.0` | HTTP bind host |
 | `MCP_TRANSPORT` | `http` | `http` (Streamable HTTP `/mcp`) or `stdio` |
-| `MCP_AUTH_TOKEN` | *(none)* | Optional static `Bearer` gate on `/mcp` (defense in depth behind a tunnel). Counts as an auth mechanism for the deploy-time guard. |
-| `MCP_AUTH_OPT_OUT` | *(unset)* | Explicit override allowing an HTTP server to run with NO auth against a REMOTE backend. Local tunnels / desktop connectors only (`scripts/launch-local.mjs` sets it). Never set on a public deployment. |
-| `FSRS_REQUEST_TIMEOUT_MS` | `15000` | Fetch timeout to the backend |
-| `AUTH0_ISSUER` | *(none)* | Auth0 tenant URL (e.g. `https://andrewehab.eu.auth0.com/`). **Required for Auth0 enforcement on HTTP /mcp.** |
-| `AUTH0_AUDIENCE` | *(none)* | Expected audience (the MCP resource URI, e.g. `https://cuelingua-mcp-767542644824.us-central1.run.app/mcp`). **Required for Auth0 enforcement.** |
+| `MCP_AUTH_TOKEN` | *(none)* | Static trusted-client gate for HTTP single-user mode. Mutually exclusive with Auth0 issuer/audience. Not forwarded to the backend. |
+| `MCP_BACKEND_AUTH_TOKEN` | *(none)* | Trusted single-user Bearer identity for remote-backend stdio, static HTTP, or local-tunnel mode. Required with `CUELINGUA_API_KEY`; never used in Auth0 HTTP mode. |
+| `MCP_ALLOWED_HOSTS` | Public resource host plus loopback authorities | Comma-separated exact Host header additions (including port); additions preserve defaults. |
+| `MCP_ALLOWED_ORIGINS` | ChatGPT origins | Optional comma-separated browser origins added to `https://chatgpt.com` and `https://chat.openai.com`. Other browser origins receive 403. |
+| `MCP_AUTH_OPT_OUT` | *(unset)* | Local-tunnel override for MCP-layer auth only; remote backend calls still need backend identity. Never set on a public deployment. |
+| `FSRS_REQUEST_TIMEOUT_MS` | `15000` | Fetch timeout to the backend (positive integer milliseconds, max 2,147,483,647) |
+| `AUTH0_ISSUER` | *(none)* | Auth0 tenant URL; must be configured with `AUTH0_AUDIENCE` and is mutually exclusive with `MCP_AUTH_TOKEN`. |
+| `AUTH0_AUDIENCE` | *(none)* | Expected audience (the MCP resource URI); must be configured with `AUTH0_ISSUER`. |
 | `MCP_RESOURCE_URL` | `https://cuelingua-mcp-767542644824.us-central1.run.app/mcp` | Public HTTPS URL of this MCP server's `/mcp` endpoint. Used in RFC 9728 protected-resource metadata and `WWW-Authenticate` challenge. |
 | `REVIEW_TEST_MODE` | *(unset)* | **Temporary widget-testing mode.** Must mirror the backend flag. When `true`: sessions queue ALL cards (not only due — a query override, no card mutations) and `submit_review` advances the session but SKIPS the card FSRS scheduling/reviewLog write. Session results carry `testMode: true` / `_meta['review/testMode']`. **Disable by unsetting/`false` on BOTH the Firebase function and the MCP server, then redeploy.** Never enable it by editing `functions/.env` — firebase-tools loads that file into every functions deploy, so a stale `true` silently deploys the non-mutating mode. Toggle it with explicit `gcloud functions deploy --set-env-vars` / `--remove-env-vars` instead, and keep `functions/.env` at `false`. |
 
@@ -720,8 +750,7 @@ the operation to the caller's verified `sub` (multi-tenant ownership).
   (Again/Hard/Good/Easy) advance each card's due time through the FSRS
   scheduler. Card summaries include the scheduling state (`state`,
   `stability`, `difficulty`, `reps`, `lapses`, `lastReview`, `reviewLog`).
-- The package registers a self-contained review widget as the `ui://review-session-v5`
-  resource (Apps SDK `ui://`); hosts that cannot render resources keep the
-  textual tool output. Tool schemas are unchanged by the widget.
+  The package registers a self-contained review widget as a versioned Apps SDK
+  `ui://` resource; hosts that cannot render resources keep textual tool output.
 - Keep the tool contract in sync with `functions/src/index.ts`,
   `functions/src/flashcards/` (validators/service), and `chatgpt/openapi.yaml`.

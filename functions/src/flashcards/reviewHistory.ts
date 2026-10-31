@@ -9,8 +9,8 @@
  * and session review therefore also appends ONE immutable `reviewEvents`
  * document, written in the SAME Firestore transaction that applies the FSRS
  * scheduling — the event log and the card state can never diverge. Session
- * events are keyed by the submission's requestId (`evt-<requestId>`) with a
- * merge:false set, so a retried submission can never double-write.
+ * events are keyed by a SHA-256 hash of the owner/session/request tuple so
+ * retries within one session are stable and distinct sessions never collide.
  *
  * SCOPING: every event records `actorId` = the stable immutable identity of
  * the authenticated API key that performed the review (`'unknown'` without
@@ -20,6 +20,7 @@
  * docToFlashcard) with identical read defaults.
  */
 
+import { createHash } from 'node:crypto';
 import {
   getFirestore, Firestore, Timestamp, FieldPath,
   QueryDocumentSnapshot, DocumentSnapshot, DocumentData,
@@ -80,6 +81,7 @@ export function cardFromSnapshot(doc: QueryDocumentSnapshot<DocumentData> | Docu
     difficulty: typeof data.difficulty === 'number' ? data.difficulty : 0,
     reps: typeof data.reps === 'number' ? data.reps : 0,
     lapses: typeof data.lapses === 'number' ? data.lapses : 0,
+    ...(typeof data.learningSteps === 'number' ? { learningSteps: data.learningSteps as number } : {}),
     ...(data.lastReview ? { lastReview: data.lastReview as Timestamp } : {}),
     reviewLog: Array.isArray(data.reviewLog) ? data.reviewLog as ReviewLogEntry[] : [],
     images: Array.isArray(data.images) ? data.images : [],
@@ -106,6 +108,7 @@ function eventFromSnapshot(doc: QueryDocumentSnapshot<DocumentData> | DocumentSn
     difficultyAfter: num(data.difficultyAfter ?? data.difficulty),
     repsAfter: num(data.repsAfter ?? data.reps),
     lapsesAfter: num(data.lapsesAfter ?? data.lapses),
+    ...(typeof data.learningStepsAfter === 'number' ? { learningStepsAfter: data.learningStepsAfter as number } : {}),
     reviewedAt: data.reviewedAt as Timestamp,
     // recordedAt defaults to reviewedAt only when both legacy fallbacks are
     // absent (never the epoch) — a faithful approximation for ancient docs.
@@ -129,20 +132,11 @@ export function frontSnapshot(front: string): string {
 /* Event document construction (used INSIDE the review transactions)   */
 /* ------------------------------------------------------------------ */
 
-/** Deterministic document id for a session event: `evt-<ownerId>-<requestId>`,
- *  scoped to the session owner so a requestId can never collide across
- *  tenants. New (v2) sessions always carry an owner and use this form. */
-export function sessionEventId(ownerId: string, requestId: string): string {
-  return `evt-${ownerId}-${requestId}`;
-}
 
-/** Deterministic document id for a LEGACY (v1/no-owner) session event:
- *  `evt-<requestId>` — the historical id format, preserved so retries of
- *  pre-owner-scoping sessions keep finding their recorded events. */
-export function legacySessionEventId(requestId: string): string {
-  return `evt-${requestId}`;
+/** Deterministic request identity scoped to owner and session. */
+export function sessionEventId(ownerId: string, sessionId: string, requestId: string): string {
+  return `evt-${createHash('sha256').update(JSON.stringify([ownerId, sessionId, requestId])).digest('hex')}`;
 }
-
 /** The inputs the review transactions pass to buildEventBody. */
 export interface ReviewEventContext {
   /** The owner performing the review (verified Auth0 `sub`, or `'emulator'`). */
@@ -150,7 +144,7 @@ export interface ReviewEventContext {
   rating: ReviewRating;
   card: Flashcard;
   /** FSRS scheduling fields AFTER the review. */
-  scheduling: Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'due' | 'lastReview'>;
+  scheduling: Pick<Flashcard, 'state' | 'stability' | 'difficulty' | 'reps' | 'lapses' | 'learningSteps' | 'due' | 'lastReview'>;
   reviewedAt: Timestamp;
   recordedAt: Timestamp;
   sessionId?: string;
@@ -188,6 +182,7 @@ export function buildEventBody(context: ReviewEventContext): Omit<ReviewEvent, '
     difficultyAfter: context.scheduling.difficulty,
     repsAfter: context.scheduling.reps,
     lapsesAfter: context.scheduling.lapses,
+    learningStepsAfter: context.scheduling.learningSteps,
     reviewedAt: context.reviewedAt,
     recordedAt: context.recordedAt,
     ...(card.deckId !== undefined ? { deckId: card.deckId } : {}),
@@ -509,6 +504,7 @@ export async function migrateLegacyReviewEvents(
         difficultyAfter: entry.difficulty,
         repsAfter: entry.reps,
         lapsesAfter: entry.lapses,
+        ...(typeof entry.learningStepsAfter === 'number' ? { learningStepsAfter: entry.learningStepsAfter } : {}),
         reviewedAt: entry.review,
         recordedAt: now,
         cardFrontSnapshot: typeof data?.front === 'string' ? frontSnapshot(data.front as string) : '',

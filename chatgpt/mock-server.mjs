@@ -3,7 +3,7 @@
 // which mirrors the Firebase backend (functions/src/index.ts + validators.ts):
 //   - each handler is a SEPARATE named route (no /api prefix):
 //       /health, /createFlashcardHandler, /bulkCreateFlashcardsHandler,
-//       /listFlashcardsHandler, /dueFlashcardsHandler,
+//       /listFlashcardsHandler, /searchCardsHandler, /dueFlashcardsHandler,
 //       /reviewFlashcardHandler/{id}, /getFlashcardHandler/{id},
 //       /updateFlashcardHandler/{id}, /deleteFlashcardHandler/{id},
 //       /bulkUpdateFlashcardsHandler, /bulkDeleteFlashcardsHandler,
@@ -96,7 +96,11 @@ function readBody(req) {
     req.on("end", () => {
       if (!raw) return resolve({});
       try {
-        resolve(JSON.parse(raw));
+        const body = JSON.parse(raw);
+        if (body === null || typeof body !== "object" || Array.isArray(body)) {
+          return reject(Object.assign(new Error("Invalid JSON body"), { status: 400 }));
+        }
+        resolve(body);
       } catch {
         reject(Object.assign(new Error("Invalid JSON body"), { status: 400 }));
       }
@@ -109,6 +113,9 @@ function readBody(req) {
 function validateFlashcard(body, { partial }) {
   const issues = [];
   const clean = {};
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { issues: [{ path: [], message: "Expected an object" }], data: clean };
+  }
   for (const key of Object.keys(body)) {
     if (!["front", "back", "deckId", "deck", "tags"].includes(key)) issues.push({ path: [key], message: "Unrecognized key" });
   }
@@ -243,26 +250,27 @@ const server = http.createServer(async (req, res) => {
   if (path === "/bulkCreateFlashcardsHandler" && method === "POST") {
     const body = await readBody(req).catch((e) => e);
     if (body instanceof Error) return json(res, 400, { error: "Invalid JSON body" });
-    if (!Array.isArray(body.cards) || body.cards.length < 1 || body.cards.length > 100) {
+    if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.cards) || body.cards.length < 1 || body.cards.length > 100) {
       return json(res, 400, { error: "Validation failed", issues: [{ path: ["cards"], message: "cards must be an array of 1-100 items" }] });
     }
-    // Validate EVERY item before writing any (atomic — no partial success).
+    // Validate each item and resolve deck references before writing any card.
     const validated = [];
     for (const item of body.cards) {
       const { issues, data } = validateFlashcard(item, { partial: false });
       if (issues.length) return validationErrorResponse(res, issues);
-      validated.push(data);
+      validated.push({ data, deckRef: null });
+    }
+    for (const { data } of validated) {
+      if (data.deckId !== undefined && !decks.has(data.deckId)) {
+        return json(res, 400, { error: "Validation failed", issues: [{ path: ["deckId"], message: `Deck not found: ${data.deckId}` }] });
+      }
+    }
+    for (const item of validated) {
+      item.deckRef = resolveDeckRef(item.data);
     }
     const now = nowTimestamp();
     const created = [];
-    for (const data of validated) {
-      let deckRef;
-      try {
-        deckRef = resolveDeckRef(data);
-      } catch (err) {
-        if (err.status === 400) return json(res, 400, { error: "Validation failed", issues: [{ path: ["deckId"], message: err.message }] });
-        throw err;
-      }
+    for (const { data, deckRef } of validated) {
       const id = `card_${String(nextId++).padStart(4, "0")}`;
       // Every newly created card must belong to a deck; fall back to Uncategorized.
       const resolvedDeck = deckRef ?? resolveDefaultDeck();
@@ -282,7 +290,7 @@ const server = http.createServer(async (req, res) => {
         reps: 0,
         lapses: 0,
         reviewLog: [],
-      images: [],
+        images: [],
       };
       cards.set(id, card);
       created.push(card);
@@ -309,6 +317,66 @@ const server = http.createServer(async (req, res) => {
       const idx = result.findIndex((c) => c.id === pageToken);
       if (idx !== -1) offset = idx + 1; // startAfter(tokenDoc)
     }
+    const page = result.slice(offset, offset + pageSize);
+    const nextPageToken = offset + pageSize < result.length ? page[page.length - 1].id : null;
+    return json(res, 200, { cards: page, nextPageToken });
+  }
+  if (path === "/searchCardsHandler" && method === "GET") {
+    const repeated = (name, maxLength) => {
+      const values = url.searchParams.getAll(name);
+      if (values.length > 20 || values.some((value) => value.length < 1 || value.length > maxLength)) return null;
+      return values;
+    };
+    const tagsAny = repeated("tagsAny", 50);
+    const tagsAll = repeated("tagsAll", 50);
+    const tagsNot = repeated("tagsNot", 50);
+    const deckIds = repeated("decks", 100);
+    const deckNames = repeated("deckNames", 300);
+    if ([tagsAny, tagsAll, tagsNot, deckIds, deckNames].includes(null)) {
+      return json(res, 400, { error: "Validation failed", issues: [{ path: [], message: "Repeated filters accept at most 20 literal values with their documented length limits" }] });
+    }
+    const selectedTags = [tagsAny, tagsAll, tagsNot].filter((values) => values.length > 0);
+    if (selectedTags.length > 1) {
+      return json(res, 400, { error: "Validation failed", issues: [{ path: [], message: "Use only one of tagsAny, tagsAll, or tagsNot" }] });
+    }
+    const search = url.searchParams.get("search");
+    const review = url.searchParams.get("review");
+    const suspendedParam = url.searchParams.get("suspended");
+    if (search !== null && search.length > 500) return json(res, 400, { error: "Validation failed", issues: [{ path: ["search"], message: "search must be at most 500 characters" }] });
+    if (review !== null && !["due", "notDue", "new", "reviewed"].includes(review)) return json(res, 400, { error: "Validation failed", issues: [{ path: ["review"], message: "Invalid review filter" }] });
+    if (suspendedParam !== null && suspendedParam !== "true" && suspendedParam !== "false") return json(res, 400, { error: "Validation failed", issues: [{ path: ["suspended"], message: "suspended must be true or false" }] });
+    const dateBounds = ["createdFrom", "createdTo", "updatedFrom", "updatedTo"].map((key) => {
+      const value = url.searchParams.get(key);
+      if (value === null) return null;
+      const date = new Date(value);
+      return Number.isNaN(date.valueOf()) ? NaN : date.valueOf();
+    });
+    if (dateBounds.some((value) => Number.isNaN(value))) return json(res, 400, { error: "Validation failed", issues: [{ path: [], message: "Date bounds must be valid dates" }] });
+    let result = [...cards.values()].sort((a, b) => tsToMs(b.createdAt) - tsToMs(a.createdAt) || a.id.localeCompare(b.id));
+    result = result.filter((card) => {
+      const cardTags = card.tags || [];
+      const text = `${card.topic || ""} ${card.front || ""} ${card.back || ""}`.toLocaleLowerCase();
+      const cardSuspended = card.suspended === true;
+      const due = tsToMs(card.due) <= Date.now();
+      const reviewed = (card.reps || 0) > 0 || (card.reviewLog || []).length > 0;
+      const created = tsToMs(card.createdAt);
+      const updated = tsToMs(card.updatedAt);
+      return (search === null || text.includes(search.toLocaleLowerCase())) &&
+        (!tagsAny.length || tagsAny.some((tag) => cardTags.includes(tag))) &&
+        (!tagsAll.length || tagsAll.every((tag) => cardTags.includes(tag))) &&
+        (!tagsNot.length || tagsNot.every((tag) => !cardTags.includes(tag))) &&
+        (!deckIds.length && !deckNames.length || deckIds.includes(card.deckId) || deckNames.includes(card.deck)) &&
+        (suspendedParam === null || cardSuspended === (suspendedParam === "true")) &&
+        (review === null || (review === "new" ? !reviewed : review === "reviewed" ? reviewed : review === "due" ? due && !cardSuspended : !due && !cardSuspended)) &&
+        (dateBounds[0] === null || created >= dateBounds[0]) &&
+        (dateBounds[1] === null || created <= dateBounds[1]) &&
+        (dateBounds[2] === null || updated >= dateBounds[2]) &&
+        (dateBounds[3] === null || updated <= dateBounds[3]);
+    });
+    const pageSize = Math.min(Math.max(Number(url.searchParams.get("pageSize") || 20), 1), 100);
+    const pageToken = url.searchParams.get("pageToken");
+    const tokenIndex = pageToken === null ? -1 : result.findIndex((card) => card.id === pageToken);
+    const offset = tokenIndex < 0 ? 0 : tokenIndex + 1;
     const page = result.slice(offset, offset + pageSize);
     const nextPageToken = offset + pageSize < result.length ? page[page.length - 1].id : null;
     return json(res, 200, { cards: page, nextPageToken });
@@ -433,23 +501,22 @@ const server = http.createServer(async (req, res) => {
       if (body instanceof Error) return json(res, 400, { error: "Invalid JSON body" });
       const { issues, data } = validateFlashcard(body, { partial: true });
       if (issues.length) return validationErrorResponse(res, issues);
-      for (const k of Object.keys(data)) card[k] = data[k];
-      // Deck reference handling: explicit null rejected; a value resolves to deckId+name.
       if (data.deckId === null || data.deck === null) {
         return json(res, 400, { error: "Cannot detach a card from its deck; every card must belong to a deck" });
       }
-      if (data.deckId !== undefined || data.deck !== undefined) {
-        let deckRef;
-        try {
-          deckRef = resolveDeckRef(data);
-        } catch (err) {
-          if (err.status === 400) return json(res, 400, { error: "Validation failed", issues: [{ path: ["deckId"], message: err.message }] });
-          throw err;
-        }
-        if (deckRef) {
-          card.deckId = deckRef.deckId;
-          card.deck = deckRef.deck;
-        }
+      let deckRef = null;
+      try {
+        if (data.deckId !== undefined || data.deck !== undefined) deckRef = resolveDeckRef(data);
+      } catch (err) {
+        if (err.status === 400) return json(res, 400, { error: "Validation failed", issues: [{ path: ["deckId"], message: err.message }] });
+        throw err;
+      }
+      for (const k of Object.keys(data)) {
+        if (k !== "deckId" && k !== "deck") card[k] = data[k];
+      }
+      if (deckRef) {
+        card.deckId = deckRef.deckId;
+        card.deck = deckRef.deck;
       }
       card.updatedAt = nowTimestamp();
       return json(res, 200, card);
@@ -507,43 +574,44 @@ const server = http.createServer(async (req, res) => {
   if (path === "/bulkUpdateFlashcardsHandler" && method === "POST") {
     const body = await readBody(req).catch((e) => e);
     if (body instanceof Error) return json(res, 400, { error: "Invalid JSON body" });
-    if (!Array.isArray(body.cards) || body.cards.length < 1 || body.cards.length > 100) {
+    if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.cards) || body.cards.length < 1 || body.cards.length > 100) {
       return json(res, 400, { error: "Validation failed", issues: [{ path: ["cards"], message: "cards must be an array of 1-100 items" }] });
     }
-    // Validate EVERY item (id required) before touching any card. The `id`
-    // field is extracted first — validateFlashcard only knows patch keys.
+    // Validate each item (id required) and resolve deck references before mutating cards.
     const validated = [];
     for (const item of body.cards) {
-      if (typeof item.id !== "string" || item.id.length < 1) {
+      if (!item || typeof item !== "object" || Array.isArray(item) || typeof item.id !== "string" || item.id.length < 1) {
         return json(res, 400, { error: "Validation failed", issues: [{ path: ["cards", "id"], message: "Card id is required" }] });
       }
       const patch = { ...item };
       delete patch.id;
       const { issues, data } = validateFlashcard(patch, { partial: true });
       if (issues.length) return validationErrorResponse(res, issues);
-      validated.push({ id: item.id, data });
-    }
-    const updated = [];
-    for (const { id, data } of validated) {
-      const card = cards.get(id);
-      if (!card) continue; // nonexistent ids are omitted, like the backend
-      // Deck reference handling: explicit null rejected; a value resolves to deckId+name.
       if (data.deckId === null || data.deck === null) {
         return json(res, 400, { error: "Cannot detach a card from its deck; every card must belong to a deck" });
       }
-      for (const k of Object.keys(data)) card[k] = data[k];
-      if (data.deckId !== undefined || data.deck !== undefined) {
-        let deckRef;
-        try {
-          deckRef = resolveDeckRef(data);
-        } catch (err) {
-          if (err.status === 400) return json(res, 400, { error: "Validation failed", issues: [{ path: ["deckId"], message: err.message }] });
-          throw err;
-        }
-        if (deckRef) {
-          card.deckId = deckRef.deckId;
-          card.deck = deckRef.deck;
-        }
+      validated.push({ id: item.id, data, deckRef: null });
+    }
+    for (const { data } of validated) {
+      if (data.deckId !== undefined && !decks.has(data.deckId)) {
+        return json(res, 400, { error: "Validation failed", issues: [{ path: ["deckId"], message: `Deck not found: ${data.deckId}` }] });
+      }
+    }
+    for (const item of validated) {
+      if (item.data.deckId !== undefined || item.data.deck !== undefined) {
+        item.deckRef = resolveDeckRef(item.data);
+      }
+    }
+    const updated = [];
+    for (const { id, data, deckRef } of validated) {
+      const card = cards.get(id);
+      if (!card) continue; // nonexistent ids are omitted, like the backend
+      for (const k of Object.keys(data)) {
+        if (k !== "deckId" && k !== "deck") card[k] = data[k];
+      }
+      if (deckRef) {
+        card.deckId = deckRef.deckId;
+        card.deck = deckRef.deck;
       }
       card.updatedAt = nowTimestamp();
       updated.push(card);
@@ -896,8 +964,7 @@ const server = http.createServer(async (req, res) => {
     const id = `session_${String(nextSessionId++).padStart(4, "0")}`;
     const session = {
       id,
-      apiKeyName: API_KEY ? "mock-key" : "unknown",
-      status: "active",
+      status: 'active',
       mode: "spaced_repetition",
       limit: cardIds.length,
       dueCount: due.length,

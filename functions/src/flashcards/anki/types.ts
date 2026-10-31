@@ -23,17 +23,31 @@ export const ANKI_TEXT_MAX = 10_000;
 
 /** Imported-card tag maximum length and per-card count (product limits). */
 export const ANKI_TAG_MAX_LENGTH = 50;
-export const ANKI_TAG_MAX_COUNT = 30;
+/** Extra Anki tags beyond the product's 20-tag limit are ignored on import. */
+export const ANKI_TAG_MAX_COUNT = 20;
 
 /** Imported deck name component limit (product deck-name limit, per level). */
 export const ANKI_DECK_NAME_MAX = 100;
 /** Imported deck PATH (nested `A::B::C`) maximum length. */
 export const ANKI_DECK_PATH_MAX = 300;
+/** SQLite metadata JSON cap (models and decks; 1 MiB UTF-8 bytes each). */
+export const ANKI_MAX_METADATA_BYTES = 1024 * 1024;
+/** Maximum raw note field bytes processed before product text validation. */
+export const ANKI_MAX_FIELD_SOURCE_LENGTH = 256 * 1024;
+/** Maximum raw tags bytes processed from one Anki note. */
+export const ANKI_MAX_TAG_SOURCE_LENGTH = 64 * 1024;
 
 /** Hard cap on cards accepted per import (bounded writes + request size). */
 export const ANKI_IMPORT_CARD_LIMIT = 1000;
-/** Hard cap on cards exported per package (matches the import cap). */
+/** Per-transaction Firestore write payload budget, below the 10 MiB RPC cap. */
+export const ANKI_IMPORT_TRANSACTION_MAX_BYTES = 8 * 1024 * 1024;
 export const ANKI_EXPORT_CARD_LIMIT = 1000;
+/** An exported package must remain importable under our decoded-size cap. */
+export const ANKI_MAX_EXPORTED_APKG_BYTES = 20 * 1024 * 1024;
+/** Bound SQLite collection memory/file output before ZIP assembly. */
+export const ANKI_MAX_COLLECTION_BYTES = 11 * 1024 * 1024;
+/** Conservative cap for the complete serialized APKG JSON HTTP response body. */
+export const ANKI_MAX_APKG_RESPONSE_BYTES = 32_000_000;
 
 /**
  * Maximum DECODED .apkg byte size accepted for import. A valid minimal
@@ -44,6 +58,8 @@ export const ANKI_EXPORT_CARD_LIMIT = 1000;
  * URL references only).
  */
 export const ANKI_MAX_APKG_BYTES = 20 * 1024 * 1024;
+/** Base64 request-body ceiling for a decoded APKG of ANKI_MAX_APKG_BYTES. */
+export const ANKI_MAX_APKG_BASE64_LENGTH = Math.ceil((ANKI_MAX_APKG_BYTES * 4) / 3) + 8;
 
 /**
  * Maximum single media member size embedded during EXPORT (bytes). Larger
@@ -94,12 +110,14 @@ export interface ImportedCard {
 
 /** Result of parsing + validating one .apkg payload. */
 export interface ParsedApkgImport {
-  /** Cards in deterministic note-id order (deduplicated by note guid). */
+  /** Cards in deterministic note-id order (deduplicated by note guid), capped at ANKI_IMPORT_CARD_LIMIT. */
   cards: ImportedCard[];
   /** Notes skipped because their card count was not 1. */
   skippedNotes: number;
-  /** Notes skipped because a required field was empty. */
+  /** Notes skipped for oversized/empty fields; malformed packages and unsupported cloze syntax throw typed errors. */
   skippedEmpty: number;
+  /** Otherwise-valid notes beyond the retained card limit. */
+  skippedOverLimit: number;
 }
 
 /** Import request body (base64 envelope). */
@@ -120,9 +138,9 @@ export interface ImportApkgResponse {
   skippedEmpty: number;
   /** Notes skipped because the package exceeded the card cap. */
   skippedOverLimit: number;
-  /** True when every card committed in one batch (see `batchCount`). */
+  /** True when every card committed in one write transaction (see `batchCount`). */
   atomic: boolean;
-  /** Number of Firestore write batches used (>1 only when over 500 cards). */
+  /** Number of count- and byte-bounded Firestore write transactions. */
   batchCount: number;
 }
 

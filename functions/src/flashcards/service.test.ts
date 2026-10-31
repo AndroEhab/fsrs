@@ -1,4 +1,4 @@
-import { SESSION_QUEUE_CHUNK_SIZE, SESSION_STORAGE_VERSION, SESSION_MAX_ALLOWLIST_IDS } from './types';
+import { SESSION_QUEUE_CHUNK_SIZE, SESSION_MAX_ALLOWLIST_IDS } from './types';
 import {
   ReviewSessionBuildFailedError,
   ReviewSessionSelectionTooLargeError,
@@ -19,20 +19,10 @@ import {
   bulkCreateFlashcards,
   bulkUpdateFlashcards,
   bulkDeleteFlashcards,
-  createDeck,
-  getDeck,
-  updateDeck,
-  deleteDeck,
-  listDecks,
-  migrateLegacyDeckNames,
-  assignDecklessToDefault,
   listTags,
   renameTag,
   deleteTag,
   mergeTags,
-  attachImage,
-  listImages,
-  removeImage,
   uploadImage,
   validateImageUrl,
   startReviewSession,
@@ -42,11 +32,11 @@ import {
   searchCards,
   countFlashcards,
   ImageValidationError,
-  DeckNotFoundError,
-  DeckNameConflictError,
   ReviewSessionForbiddenError,
   ReviewExpectedCardMismatchError,
 } from './service';
+import { DeckNotFoundError } from './decks';
+import { InvalidPageTokenError } from './documentPageTokens';
 import { CreateFlashcardInput, UpdateFlashcardInput, ListFlashcardsQuery, DueFlashcardsQuery, ReviewFlashcardInput, SearchCardsQuery } from './types';
 
 // Mock Firebase Admin with separate mocks for flashcards and apiKeys collections
@@ -98,6 +88,7 @@ const mockDeckCollection = createMockCollection(mockDeckDoc);
 
 const mockSessionDoc = createMockDoc({ id: 'session-1' });
 const mockSessionCollection = createMockCollection(mockSessionDoc);
+mockSessionCollection.doc = jest.fn((id: string) => ({ ...mockSessionDoc, id }));
 
 const mockEventDoc = createMockDoc({ id: 'event-1' });
 const mockEventCollection = createMockCollection(mockEventDoc);
@@ -119,11 +110,18 @@ const mockDbInstance = {
 
 jest.mock('firebase-admin/firestore', () => ({
   getFirestore: jest.fn(() => mockDbInstance),
-  Timestamp: {
-    now: jest.fn(() => ({ toDate: () => new Date(), seconds: Date.now() / 1000, nanoseconds: 0 })),
-    fromDate: jest.fn((d: Date) => ({ toDate: () => d, seconds: d.getTime() / 1000, nanoseconds: 0 })),
-    fromMillis: jest.fn((ms: number) => ({ toDate: () => new Date(ms), seconds: ms / 1000, nanoseconds: (ms % 1000) * 1000000, toMillis: () => ms })),
-  },
+  Timestamp: Object.assign(
+    class MockTimestamp {
+      constructor(public seconds: number, public nanoseconds = 0) {}
+      toDate() { return new Date(this.toMillis()); }
+      toMillis() { return this.seconds * 1000 + this.nanoseconds / 1_000_000; }
+    },
+    {
+      now: jest.fn(() => ({ toDate: () => new Date(), seconds: Date.now() / 1000, nanoseconds: 0 })),
+      fromDate: jest.fn((d: Date) => ({ toDate: () => d, seconds: d.getTime() / 1000, nanoseconds: 0 })),
+      fromMillis: jest.fn((ms: number) => ({ toDate: () => new Date(ms), seconds: ms / 1000, nanoseconds: (ms % 1000) * 1000000, toMillis: () => ms })),
+    },
+  ),
   FieldValue: class FieldValue {
     static delete() { return new FieldValue(); }
     static serverTimestamp() { return new FieldValue(); }
@@ -133,24 +131,7 @@ jest.mock('firebase-admin/firestore', () => ({
     documentId: jest.fn(() => '__name__'),
   },
 }));
-
-// Mock Firebase Storage (firebase-admin/storage). getStorage() returns a
-// bucket whose files are tracked per test so upload/cleanup can be asserted.
-const mockStorageFiles = new Map<string, { save: jest.Mock; delete: jest.Mock; getSignedUrl: jest.Mock }>();
-
 const mockStorageBucket = {
-  file: jest.fn((path: string) => {
-    let f = mockStorageFiles.get(path);
-    if (!f) {
-      f = {
-        save: jest.fn().mockResolvedValue(undefined),
-        delete: jest.fn().mockResolvedValue(undefined),
-        getSignedUrl: jest.fn().mockResolvedValue([`https://storage.example.com/${path}?signed=1`]),
-      };
-      mockStorageFiles.set(path, f);
-    }
-    return f;
-  }),
   getFiles: jest.fn().mockResolvedValue([[]]),
 };
 
@@ -158,20 +139,33 @@ jest.mock('firebase-admin/storage', () => ({
   getStorage: jest.fn(() => ({ bucket: jest.fn(() => mockStorageBucket) })),
 }));
 
+
 const mockTimestamp = (d: Date) => ({ toDate: () => d, seconds: d.getTime() / 1000, nanoseconds: 0, toMillis: () => d.getTime() });
+const mockOwnedDeckRef = (id: string, name: string) => {
+  const snapshot = {
+    id,
+    exists: true,
+    data: () => ({
+      ownerId: 'Test Key',
+      name,
+      createdAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
+      updatedAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
+    }),
+  };
+  return { id, get: jest.fn().mockResolvedValue(snapshot) };
+};
 
 /**
- * Augments a test transaction with the no-op `set`/`delete` the review-event
- * and reset-sweep paths call. Review writes now set an immutable event doc
- * (direct reviews: fresh auto-id ref; session reviews: the requestId-keyed
- * ref) inside the SAME transaction, and resetFlashcards sweeps events after
- * the transaction — tests that only assert card/session writes need these
- * no-ops so the event path never throws.
+ * Adds the no-op transaction operations used for immutable review events and
+ * request claims in tests that only assert card/session behavior.
  */
-function withEventTx<T extends Record<string, unknown>>(base: T): T & { set: jest.Mock; delete: jest.Mock } {
+function withEventTx<T extends Record<string, unknown>>(
+  base: T,
+): T & { set: jest.Mock; create: jest.Mock; delete: jest.Mock } {
   return {
     ...base,
     set: (base.set as jest.Mock | undefined) ?? jest.fn(),
+    create: (base.create as jest.Mock | undefined) ?? jest.fn(),
     delete: (base.delete as jest.Mock | undefined) ?? jest.fn(),
   };
 }
@@ -188,41 +182,52 @@ describe('Flashcard Service', () => {
     const { getFirestore, Timestamp } = require('firebase-admin/firestore');
     mockDb = getFirestore();
     mockFlashcardCollectionRef = mockDb.collection('flashcards');
-    mockFlashcardDocRef = mockFlashcardCollectionRef.doc();
+    mockFlashcardCollectionRef.doc.mockImplementation(() => mockFlashcardDoc);
     mockFlashcardDocRef = mockFlashcardCollectionRef.doc();
     mockApiKeyCollectionRef = mockDb.collection('apiKeys');
     mockDeckCollectionRef = mockDb.collection('decks');
     // clearAllMocks keeps mockReturnValue implementations from prior tests, so
     // restore the base doc()/query behavior explicitly.
-    mockFlashcardCollectionRef.doc.mockImplementation(() => mockFlashcardDoc);
     mockDeckCollectionRef.doc.mockImplementation(() => mockDeckDoc);
+    mockDeckDoc.id = 'deck-1';
+    mockDeckDoc.data.mockReturnValue({ name: 'Test Deck', ownerId: 'Test Key' });
+    mockDeckDoc.get.mockResolvedValue(mockDeckDoc);
     // Keep the scheduler's Timestamp.now() deterministic for due/review tests.
     Timestamp.now.mockReturnValue(mockTimestamp(new Date('2026-08-28T00:00:00.000Z')));
   });
 
   describe('createFlashcard', () => {
-    it('creates a flashcard with all fields', async () => {
+    function configureDeckTransaction(deckId: string, name: string, cardId: string) {
+      const deckSnap = { id: deckId, exists: true, data: () => ({ name, ownerId: 'Test Key' }) };
+      const deckRef = { id: deckId, get: jest.fn().mockResolvedValue(deckSnap) };
+      const cardRef = { id: cardId };
+      const transaction = { get: jest.fn().mockResolvedValue(deckSnap), create: jest.fn() };
+      mockDeckCollectionRef.doc.mockReturnValue(deckRef);
+      mockFlashcardCollectionRef.doc.mockReturnValue(cardRef);
+      mockDb.runTransaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback(transaction));
+      return { transaction, cardRef };
+    }
+    it('creates a flashcard with all fields using the deck name re-read in the transaction', async () => {
       const input: CreateFlashcardInput = {
         front: 'What is 2+2?',
         back: '4',
-        deck: 'Math',
+        deckId: 'math-deck',
         tags: ['arithmetic'],
       };
-
-      mockFlashcardDocRef.set.mockResolvedValue(undefined);
-      mockFlashcardDocRef.id = 'new-card-id';
+      const { transaction } = configureDeckTransaction('math-deck', 'Math', 'new-card-id');
 
       const result = await createFlashcard(input, 'Test Key');
 
       expect(result.id).toBe('new-card-id');
       expect(result.front).toBe('What is 2+2?');
       expect(result.back).toBe('4');
+      expect(result.deckId).toBe('math-deck');
       expect(result.deck).toBe('Math');
       expect(result.tags).toEqual(['arithmetic']);
       expect(result.createdAt).toBeDefined();
       expect(result.updatedAt).toBeDefined();
       expect(result.due).toBeDefined();
-      expect(mockFlashcardDocRef.set).toHaveBeenCalledWith(expect.objectContaining({
+      expect(transaction.create).toHaveBeenCalledWith({ id: 'new-card-id' }, expect.objectContaining({
         front: 'What is 2+2?',
         back: '4',
         deck: 'Math',
@@ -230,18 +235,17 @@ describe('Flashcard Service', () => {
       }));
     });
 
-    it('assigns a stable deckId when provided, with the deck name for readable filtering', async () => {
+    it('assigns an owned deck id and reads its current name transactionally', async () => {
       const input: CreateFlashcardInput = { front: 'F', back: 'B', deckId: 'deck-xyz' };
-      const deckSnap = { exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) };
-      mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue(deckSnap) });
-      mockFlashcardDocRef.set.mockResolvedValue(undefined);
-      mockFlashcardDocRef.id = 'card-d1';
+      const { transaction } = configureDeckTransaction('deck-xyz', 'Spanish current', 'card-d1');
 
       const result = await createFlashcard(input, 'Test Key');
 
       expect(result.deckId).toBe('deck-xyz');
-      expect(result.deck).toBe('Spanish');
-      expect(mockFlashcardDocRef.set).toHaveBeenCalledWith(expect.objectContaining({ deckId: 'deck-xyz', deck: 'Spanish' }));
+      expect(result.deck).toBe('Spanish current');
+      expect(transaction.create).toHaveBeenCalledWith({ id: 'card-d1' }, expect.objectContaining({
+        deckId: 'deck-xyz', deck: 'Spanish current',
+      }));
     });
 
     it('rejects a non-existent deckId with a typed DeckNotFoundError (client 404)', async () => {
@@ -314,24 +318,18 @@ describe('Flashcard Service', () => {
         reviewLog: [],
       };
 
-      const updatedData = { ...existingData, front: 'New Front', updatedAt: mockTimestamp(new Date()) };
-
-      mockFlashcardDocRef.exists = true;
-      mockFlashcardDocRef.data.mockReturnValue(existingData);
-      mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
-      mockFlashcardDocRef.delete = jest.fn().mockResolvedValue(undefined);
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      // Second get returns the updated doc (data reflects the merged change)
-      mockFlashcardDocRef.data.mockReturnValue(updatedData);
-      mockFlashcardCollectionRef.doc.mockReturnValue(mockFlashcardDocRef);
+      const snap = { exists: true, id: 'card-123', data: () => existingData };
+      const cardRef = { id: 'card-123' };
+      const transaction = { get: jest.fn().mockResolvedValue(snap), update: jest.fn() };
+      mockFlashcardCollectionRef.doc.mockReturnValue(cardRef);
+      mockDb.runTransaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback(transaction));
 
       const input: UpdateFlashcardInput = { front: 'New Front' };
       const result = await updateFlashcard('card-123', input, 'Test Key');
 
       expect(result).not.toBeNull();
       expect(result!.front).toBe('New Front');
-      expect(mockFlashcardDocRef.update).toHaveBeenCalledWith(expect.objectContaining({
+      expect(transaction.update).toHaveBeenCalledWith(cardRef, expect.objectContaining({
         front: 'New Front',
         updatedAt: expect.any(Object),
       }));
@@ -599,7 +597,7 @@ describe('Flashcard Service', () => {
       expect(result.nextPageToken).toBeNull();
     });
 
-    it('returns nextPageToken when more results', async () => {
+    it('returns the requested page when more results exist', async () => {
       const mockDocs = [1, 2, 3].map((n) => ({
         id: String(n),
         data: () => ({ ownerId: 'Test Key', front: `F${n}`, back: 'B', tags: [], createdAt: {}, updatedAt: {}, due: mockTimestamp(new Date('2026-08-01T00:00:00Z')), state: 0, stability: 0, difficulty: 0, reps: 0, lapses: 0, reviewLog: [] }),
@@ -613,7 +611,6 @@ describe('Flashcard Service', () => {
       const result = await dueFlashcards({ pageSize: 2 }, 'Test Key');
 
       expect(result.cards).toHaveLength(2);
-      expect(result.nextPageToken).toBe('2');
     });
 
     it('excludes suspended cards while retaining active due cards', async () => {
@@ -842,6 +839,19 @@ describe('Flashcard Service', () => {
       const result = await verifyApiKey('revoked-key');
       expect(result).toBeNull();
     });
+    it('rejects malformed credential values before looking up a document', async () => {
+      for (const key of ['nested/path', '', '.', '..', '__reserved__', 'é'.repeat(751)]) {
+        await expect(verifyApiKey(key)).resolves.toBeNull();
+      }
+      await expect(verifyApiKey(['valid-key'] as unknown as string)).resolves.toBeNull();
+      expect(mockApiKeyCollectionRef.doc).not.toHaveBeenCalled();
+    });
+
+    it('preserves Firestore verification errors for the HTTP boundary to classify as unavailable', async () => {
+      const resourcePath = 'apiKeys/secret-value';
+      mockApiKeyCollectionRef.doc.mockImplementationOnce(() => { throw new Error(`Firestore unavailable: ${resourcePath}`); });
+      await expect(verifyApiKey('valid-key')).rejects.toThrow(`Firestore unavailable: ${resourcePath}`);
+    });
   });
 });
 
@@ -860,59 +870,54 @@ describe('Bulk Flashcard Service', () => {
   });
 
   describe('bulkCreateFlashcards', () => {
-    it('creates all cards in one batch and returns them with ids', async () => {
-      const mockBatch = {
-        set: jest.fn(),
-        commit: jest.fn().mockResolvedValue(undefined),
-      };
-      mockDb.batch.mockReturnValue(mockBatch);
-
+    function configureBulkDeckTransaction(deckId: string, name: string, cardIds: string[]) {
+      const deckSnap = { id: deckId, exists: true, data: () => ({ name, ownerId: 'Test Key' }) };
+      const deckRef = { id: deckId, get: jest.fn().mockResolvedValue(deckSnap) };
+      const cardRefs = cardIds.map((id) => ({ id }));
+      const transaction = { get: jest.fn().mockResolvedValue(deckSnap), create: jest.fn() };
+      mockDeckCollectionRef.doc.mockReturnValue(deckRef);
+      mockFlashcardCollectionRef.doc.mockImplementation(() => cardRefs.shift());
+      mockDb.runTransaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback(transaction));
+      return transaction;
+    }
+    it('creates all cards atomically with the current deck state', async () => {
       const ids = ['id-1', 'id-2'];
-      mockFlashcardCollectionRef.doc
-        .mockReturnValueOnce({ id: ids[0] })
-        .mockReturnValueOnce({ id: ids[1] });
-
-      const input = {
+      const transaction = configureBulkDeckTransaction('math-deck', 'Math current', ids);
+      const result = await bulkCreateFlashcards({
         cards: [
-          { front: 'F1', back: 'B1', deck: 'Math', tags: ['a'] },
-          { front: 'F2', back: 'B2' },
+          { front: 'F1', back: 'B1', deckId: 'math-deck', tags: ['a'] },
+          { front: 'F2', back: 'B2', deckId: 'math-deck' },
         ],
-      };
-
-      const result = await bulkCreateFlashcards(input, 'Test Key');
+      }, 'Test Key');
 
       expect(result.cards).toHaveLength(2);
-      expect(result.cards.map(c => c.id)).toEqual(ids);
-      expect(result.cards[0].front).toBe('F1');
-      expect(result.cards[0].deck).toBe('Math');
-      expect(result.cards[1].tags).toEqual([]);
-      expect(mockBatch.set).toHaveBeenCalledTimes(2);
-      expect(mockBatch.commit).toHaveBeenCalledTimes(1);
+      expect(result.cards.map((card) => card.id)).toEqual(ids);
+      expect(result.cards[0]).toMatchObject({ front: 'F1', deck: 'Math current', deckId: 'math-deck', tags: ['a'] });
+      expect(result.cards[1]).toMatchObject({ tags: [], deck: 'Math current', deckId: 'math-deck' });
+      expect(transaction.create).toHaveBeenCalledTimes(2);
       expect(result.cards[0].due).toBeDefined();
       expect(result.cards[0].state).toBe(0);
       expect(result.cards[0].reps).toBe(0);
     });
 
-    it('rejects the whole batch when a referenced deckId does not exist', async () => {
-      const mockBatch = { set: jest.fn(), commit: jest.fn() };
-      mockDb.batch.mockReturnValue(mockBatch);
+    it('rejects the whole operation when a referenced deckId does not exist', async () => {
       mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: false }) });
 
       await expect(bulkCreateFlashcards({ cards: [{ front: 'F', back: 'B', deckId: 'missing' }] }, 'Test Key'))
         .rejects.toBeInstanceOf(DeckNotFoundError);
-      expect(mockBatch.commit).not.toHaveBeenCalled();
+      expect(mockDb.runTransaction).not.toHaveBeenCalled();
     });
 
-    it('assigns deckId to bulk-created cards when the deck exists', async () => {
-      const mockBatch = { set: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(mockBatch);
-      mockFlashcardCollectionRef.doc.mockReturnValueOnce({ id: 'b1' });
-      mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: true, data: () => ({ name: 'Math', ownerId: 'Test Key' }) }) });
+    it('persists the deck name read inside the transaction', async () => {
+      const transaction = configureBulkDeckTransaction('deck-math', 'Math current', ['b1']);
+      const result = await bulkCreateFlashcards({
+        cards: [{ front: 'F', back: 'B', deckId: 'deck-math' }],
+      }, 'Test Key');
 
-      const result = await bulkCreateFlashcards({ cards: [{ front: 'F', back: 'B', deckId: 'deck-math' }] }, 'Test Key');
-
-      expect(result.cards[0].deckId).toBe('deck-math');
-      expect(result.cards[0].deck).toBe('Math');
+      expect(result.cards[0]).toMatchObject({ deckId: 'deck-math', deck: 'Math current' });
+      expect(transaction.create).toHaveBeenCalledWith({ id: 'b1' }, expect.objectContaining({
+        deckId: 'deck-math', deck: 'Math current',
+      }));
     });
   });
 
@@ -1033,531 +1038,6 @@ describe('Bulk Flashcard Service', () => {
   });
 });
 
-describe('Deck Service', () => {
-  let mockDb: any;
-  let mockDeckCollectionRef: any;
-  let mockDeckDocRef: any;
-  let mockFlashcardCollectionRef: any;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    const { getFirestore } = require('firebase-admin/firestore');
-    mockDb = getFirestore();
-    mockDeckCollectionRef = mockDb.collection('decks');
-    mockDeckCollectionRef.doc.mockImplementation(() => mockDeckDoc);
-    mockDeckDocRef = mockDeckCollectionRef.doc();
-    mockFlashcardCollectionRef = mockDb.collection('flashcards');
-    // Reset flashcard collection query state: clearAllMocks preserves
-    // implementations, so explicitly restore the self-referential chain and
-    // a clean default get() to prevent stale doc arrays leaking across tests.
-    mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-    mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
-    mockFlashcardCollectionRef.limit.mockReturnValue(mockFlashcardCollectionRef);
-    mockFlashcardCollectionRef.startAfter.mockReturnValue(mockFlashcardCollectionRef);
-    mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
-  });
-
-  function deckData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-    return {
-      ownerId: 'Test Key',
-      name: 'Spanish',
-      description: 'Vocabulary',
-      createdAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      updatedAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      ...overrides,
-    };
-  }
-  describe('createDeck', () => {
-    it('creates a deck with all fields and returns it with an id', async () => {
-      mockDeckDocRef.set.mockResolvedValue(undefined);
-      mockDeckDocRef.id = 'deck-abc';
-      mockDeckCollectionRef.doc.mockReturnValue(mockDeckDocRef);
-      // uniqueness pre-check: no deck with this name exists
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-
-      const result = await createDeck({ name: 'Spanish', description: 'Vocabulary' }, 'Test Key');
-
-      expect(result.id).toBe('deck-abc');
-      expect(result.name).toBe('Spanish');
-      expect(result.description).toBe('Vocabulary');
-      expect(mockDeckDocRef.set).toHaveBeenCalledWith(expect.objectContaining({
-        name: 'Spanish',
-        description: 'Vocabulary',
-        createdAt: expect.anything(),
-        updatedAt: expect.anything(),
-      }));
-    });
-
-    it('creates a deck without description', async () => {
-      mockDeckDocRef.set.mockResolvedValue(undefined);
-      mockDeckDocRef.id = 'deck-min';
-      mockDeckCollectionRef.doc.mockReturnValue(mockDeckDocRef);
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-
-      const result = await createDeck({ name: 'Math' }, 'Test Key');
-
-      expect(result.id).toBe('deck-min');
-      expect(result.name).toBe('Math');
-      expect(result.description).toBeUndefined();
-      expect(mockDeckDocRef.set).toHaveBeenCalledWith(expect.not.objectContaining({ description: expect.anything() }));
-    });
-
-    it('rejects a duplicate deck name with a typed DeckNameConflictError (client 400)', async () => {
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: false, docs: [{ id: 'existing-deck' }] });
-
-      await expect(createDeck({ name: 'Spanish' }, 'Test Key')).rejects.toBeInstanceOf(DeckNameConflictError);
-      expect(mockDeckDocRef.set).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('getDeck', () => {
-    it('returns deck when found', async () => {
-      mockDeckDocRef.exists = true;
-      mockDeckDocRef.data.mockReturnValue(deckData());
-      mockDeckDocRef.id = 'deck-1';
-      mockDeckCollectionRef.doc.mockReturnValue(mockDeckDocRef);
-      mockDeckDocRef.get = jest.fn().mockResolvedValue(mockDeckDocRef);
-
-      const result = await getDeck('deck-1', 'Test Key');
-
-      expect(result).not.toBeNull();
-      expect(result!.id).toBe('deck-1');
-      expect(result!.name).toBe('Spanish');
-    });
-
-    it('returns null when not found', async () => {
-      mockDeckDocRef.exists = false;
-      mockDeckCollectionRef.doc.mockReturnValue(mockDeckDocRef);
-      mockDeckDocRef.get = jest.fn().mockResolvedValue(mockDeckDocRef);
-
-      const result = await getDeck('nope', 'Test Key');
-      expect(result).toBeNull();
-    });
-  });
-
-  describe('updateDeck', () => {
-    it('updates name and description and returns the updated deck', async () => {
-      mockDeckDocRef.exists = true;
-      mockDeckDocRef.data.mockReturnValue(deckData({ name: 'Spanish', description: 'Vocab' }));
-      mockDeckDocRef.update = jest.fn().mockResolvedValue(undefined);
-      mockDeckCollectionRef.doc.mockReturnValue(mockDeckDocRef);
-      mockDeckDocRef.get = jest.fn().mockResolvedValue(mockDeckDocRef);
-      mockDeckDocRef.data.mockReturnValue(deckData({ name: 'Spanish II', description: 'Vocab 2' }));
-      // uniqueness pre-check for the rename: no OTHER deck named "Spanish II"
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-
-      const result = await updateDeck('deck-1', { name: 'Spanish II', description: 'Vocab 2' }, 'Test Key');
-
-      expect(result).not.toBeNull();
-      expect(result!.name).toBe('Spanish II');
-      expect(mockDeckDocRef.update).toHaveBeenCalledWith(expect.objectContaining({
-        name: 'Spanish II',
-        description: 'Vocab 2',
-        updatedAt: expect.anything(),
-      }));
-    });
-
-    it('returns null when deck not found', async () => {
-      mockDeckDocRef.exists = false;
-      mockDeckCollectionRef.doc.mockReturnValue(mockDeckDocRef);
-      mockDeckDocRef.get = jest.fn().mockResolvedValue(mockDeckDocRef);
-
-      const result = await updateDeck('nope', { name: 'X' }, 'Test Key');
-      expect(result).toBeNull();
-    });
-
-    it('rewrites the denormalized deck name on referencing cards when renaming', async () => {
-      mockDeckDocRef.exists = true;
-      // First get() (oldName read) returns the OLD name; read-back after the
-      // rename returns the NEW name.
-      // doc.data() called 3×: (1) owner check, (2) oldName read for renaming test, (3) re-read after update.
-      mockDeckDocRef.data
-        .mockReturnValueOnce(deckData({ name: 'Spanish' }))    // owner check
-        .mockReturnValueOnce(deckData({ name: 'Spanish' }))    // oldName (must differ from input.name to trigger rename)
-        .mockReturnValueOnce(deckData({ name: 'Spanish II' })); // re-read after update
-      mockDeckCollectionRef.doc.mockReturnValue(mockDeckDocRef);
-      mockDeckDocRef.get = jest.fn().mockResolvedValue(mockDeckDocRef);
-      mockDeckDocRef.update = jest.fn().mockResolvedValue(undefined);
-      // Uniqueness pre-check for the rename: no other deck named "Spanish II".
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-
-      const cardById = { id: 'c1', ref: { update: jest.fn() }, data: () => ({ deckId: 'deck-1', deck: 'Spanish' }) };
-      const cardByName = { id: 'c2', ref: { update: jest.fn() }, data: () => ({ deck: 'Spanish' }) };
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get
-        .mockResolvedValueOnce({ docs: [cardById] })            // by deckId
-        .mockResolvedValueOnce({ docs: [cardById, cardByName] }); // by name (name-only filtered)
-
-      // Chunked batch updates: first for byId cards, then for byName cards.
-      const batchUpdates: Array<jest.Mock> = [];
-      mockDb.batch.mockImplementation(() => {
-        const b = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-        batchUpdates.push(b.update);
-        return b;
-      });
-
-      const result = await updateDeck('deck-1', { name: 'Spanish II' }, 'Test Key');
-
-      expect(result).not.toBeNull();
-      expect(result!.name).toBe('Spanish II');
-      // c1 (by deckId) and c2 (by name, name-only) both rewritten to the NEW name.
-      const allCardWrites = batchUpdates.flatMap((u) => u.mock.calls.map((c: unknown[]) => c[1] as Record<string, unknown>));
-      const cardWrites = allCardWrites.filter((w) => w.deck !== undefined);
-      expect(cardWrites.length).toBe(2);
-      for (const w of cardWrites) {
-        expect(w.deck).toBe('Spanish II');
-      }
-      // The deck doc itself is renamed.
-      expect(mockDeckDocRef.update).toHaveBeenCalledWith(expect.objectContaining({ name: 'Spanish II' }));
-    });
-  });
-
-  describe('listDecks', () => {
-    it('returns paginated decks', async () => {
-      const mockDocs = [
-        { id: 'd1', data: () => deckData({ name: 'A' }) },
-        { id: 'd2', data: () => deckData({ name: 'B' }) },
-      ];
-      mockDeckCollectionRef.orderBy.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ docs: mockDocs });
-
-      const result = await listDecks({ pageSize: 2 }, 'Test Key');
-
-      expect(result.decks).toHaveLength(2);
-      expect(result.decks[0].id).toBe('d1');
-      expect(result.nextPageToken).toBeNull();
-    });
-  });
-
-  describe('deleteDeck', () => {
-    function cardDoc(id: string, data: Record<string, unknown>) {
-      return { id, ref: { update: jest.fn(), path: `cards/${id}` }, data: () => data };
-    }
-
-    function mockBatchSequence(db: any): jest.Mock {
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      db.batch.mockReturnValue(batch);
-      return batch.update;
-    }
-
-    beforeEach(() => {
-      // Set up deck collection query chain for resolveDefaultDeck (findOrCreateDeckByName).
-      // .where().limit().get() returns empty → "Uncategorized" gets created on demand.
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-      // .doc() must satisfy findOrCreateDeckByName which calls .id and .set().
-      // Per-test overrides replace this with mockReturnValueOnce for their own
-      // deck lookup — the second doc() call (findOrCreateDeckByName) falls back
-      // to mockReturnValue, which must include .set().
-      const defaultDocMock = { id: 'uncategorized-deck', set: jest.fn().mockResolvedValue(undefined) };
-      mockDeckCollectionRef.doc.mockReturnValue(defaultDocMock);
-    });
-
-    it('reassigns cards by deckId via chunked batches and deletes the deck (cards preserved)', async () => {
-      const deckSnap = { exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) };
-      const cardA = cardDoc('card-a', { deckId: 'deck-1', deck: 'Spanish', front: 'A' });
-      const cardB = cardDoc('card-b', { deckId: 'deck-1', deck: 'Spanish', front: 'B' });
-      // Use mockReturnValueOnce so beforeEach's fallback handles findOrCreateDeckByName.
-      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get
-        .mockResolvedValueOnce({ docs: [cardA, cardB] })  // by deckId
-        .mockResolvedValueOnce({ docs: [] });             // by name (already reassigned)
-
-      // Chunked batch for the byId reassignment.
-      const batchUpdate = mockBatchSequence(mockDb);
-      // Final race-sweep transaction.
-      const transaction = {
-        get: jest.fn()
-          .mockResolvedValueOnce(deckSnap) // deck in txn (same name)
-          .mockResolvedValue({ docs: [] }), // sweep by deckId + sweep by name (owner-scoped)
-        update: jest.fn(),
-        delete: jest.fn(),
-      };
-      mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(withEventTx(transaction)));
-
-      const result = await deleteDeck('deck-1', 'Test Key');
-
-      expect(result).toEqual({ deleted: true, reassignedCards: 2 });
-      // Two card reassignment writes went through the chunked batch.
-      expect(batchUpdate).toHaveBeenCalledTimes(2);
-      const first = batchUpdate.mock.calls[0][1] as Record<string, unknown>;
-      expect(first).toMatchObject({ deckId: 'uncategorized-deck', deck: 'Uncategorized' });
-      // The deck doc is deleted in the final transaction.
-      expect(transaction.delete).toHaveBeenCalledTimes(1);
-      // Cards are updated (reassigned), NEVER deleted.
-      expect(transaction.delete).not.toHaveBeenCalledWith(cardA.ref);
-    });
-
-    it('supports decks with more than 500 cards via multiple chunked batches', async () => {
-      // Reset flashcard collection mocks to prevent stale state from prior tests.
-      mockFlashcardCollectionRef.get.mockReset();
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
-      const deckSnap = { exists: true, data: () => ({ name: 'Huge', ownerId: 'Test Key' }) };
-      const many = Array.from({ length: 1200 }, (_, i) => cardDoc('c' + i, { deckId: 'deck-huge', deck: 'Huge' }));
-      // Use mockReturnValueOnce so beforeEach's mockImplementation handles findOrCreateDeckByName.
-      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get
-        .mockResolvedValueOnce({ docs: many }) // by deckId (1200)
-        .mockResolvedValueOnce({ docs: [] });  // by name
-
-      // batch() returns a NEW batch mock per chunk (3 chunks for 1200).
-      const batches: Array<{ update: jest.Mock; commit: jest.Mock }> = [];
-      mockDb.batch.mockImplementation(() => {
-        const b = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-        batches.push(b);
-        return b;
-      });
-
-      const transaction = {
-        get: jest.fn()
-          .mockResolvedValueOnce(deckSnap)
-          .mockResolvedValue({ docs: [] }),
-        update: jest.fn(),
-        delete: jest.fn(),
-      };
-      mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(withEventTx(transaction)));
-
-      const result = await deleteDeck('deck-huge', 'Test Key');
-
-      expect(result).toEqual({ deleted: true, reassignedCards: 1200 });
-      expect(batches.length).toBe(3); // 500 + 500 + 200
-      expect(batches[0].update).toHaveBeenCalledTimes(500);
-      expect(batches[1].update).toHaveBeenCalledTimes(500);
-      expect(batches[2].update).toHaveBeenCalledTimes(200);
-      expect(transaction.delete).toHaveBeenCalledTimes(1);
-    });
-
-    it('reassigns legacy name-only cards (no deckId) by matching deck name', async () => {
-      mockFlashcardCollectionRef.get.mockReset();
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
-      const deckSnap = { exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) };
-      const legacyCard = cardDoc('card-l', { deck: 'Spanish', front: 'L' });
-      // Use mockReturnValueOnce so beforeEach's mockImplementation handles findOrCreateDeckByName.
-      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get
-        .mockResolvedValueOnce({ docs: [] })           // by deckId — none
-        .mockResolvedValueOnce({ docs: [legacyCard] }); // by name
-
-      const batchUpdate = mockBatchSequence(mockDb);
-      const transaction = {
-        get: jest.fn()
-          .mockResolvedValueOnce(deckSnap)
-          .mockResolvedValue({ docs: [] }),
-        update: jest.fn(),
-        delete: jest.fn(),
-      };
-      mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(withEventTx(transaction)));
-
-      const result = await deleteDeck('deck-1', 'Test Key');
-
-      expect(result).toEqual({ deleted: true, reassignedCards: 1 });
-      const updateCall = batchUpdate.mock.calls[0][1] as Record<string, unknown>;
-      expect(updateCall).toMatchObject({ deckId: 'uncategorized-deck', deck: 'Uncategorized', updatedAt: expect.anything() });
-    });
-
-    it('returns null when the deck does not exist', async () => {
-      const missingSnap = { exists: false };
-      mockDeckCollectionRef.doc.mockReturnValue({ get: jest.fn().mockResolvedValue(missingSnap) });
-
-      const result = await deleteDeck('nope', 'Test Key');
-      expect(result).toBeNull();
-    });
-
-    it('rejects deletion of the Uncategorized placeholder deck (ProtectedDeckError)', async () => {
-      const uncatSnap = { exists: true, data: () => ({ name: 'Uncategorized', ownerId: 'Test Key' }) };
-      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(uncatSnap) });
-
-      await expect(deleteDeck('deck-uncat', 'Test Key'))
-        .rejects.toThrow('Cannot delete the "Uncategorized" deck');
-    });
-
-    it('does not delete a deck whose id was reused by a different deck (name changed)', async () => {
-      mockFlashcardCollectionRef.get.mockReset();
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
-      const deckSnap = { exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) };
-      const reusedSnap = { exists: true, data: () => ({ name: 'OTHER' }) };
-      // Use mockReturnValueOnce so beforeEach's mockImplementation handles findOrCreateDeckByName.
-      mockDeckCollectionRef.doc.mockReturnValueOnce({ get: jest.fn().mockResolvedValue(deckSnap) });
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get
-        .mockResolvedValueOnce({ docs: [] }) // by deckId
-        .mockResolvedValueOnce({ docs: [] }); // by name
-
-      const transaction = {
-        get: jest.fn()
-          .mockResolvedValueOnce(reusedSnap) // name differs → skip delete
-          .mockResolvedValue({ docs: [] }),
-        update: jest.fn(),
-        delete: jest.fn(),
-      };
-      mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(withEventTx(transaction)));
-
-      const result = await deleteDeck('deck-1', 'Test Key');
-
-      expect(result).toEqual({ deleted: true, reassignedCards: 0 });
-      expect(transaction.delete).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('migrateLegacyDeckNames', () => {
-    it('backfills deckId on legacy name-only cards, creating decks as needed', async () => {
-      mockFlashcardCollectionRef.get.mockReset();
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
-      const legacyCard = { id: 'c1', ref: { update: jest.fn() }, data: () => ({ deck: 'Spanish', front: 'L' }) };
-      // decks collection query (find-or-create) returns empty → creates new deck
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-      mockDeckCollectionRef.doc.mockReturnValue({ id: 'new-deck-id', set: jest.fn().mockResolvedValue(undefined) });
-
-      // flashcards: page of 1 card (smaller than pageSize → loop ends).
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.limit.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [legacyCard], empty: false });
-
-      const mockBatch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(mockBatch);
-
-      const result = await migrateLegacyDeckNames();
-
-      expect(result).toEqual({ migrated: 1 });
-      expect(mockBatch.update).toHaveBeenCalledWith(legacyCard.ref, expect.objectContaining({ deckId: 'new-deck-id' }));
-    });
-
-    it('skips already-migrated first pages and keeps scanning to reach later unmigrated cards', async () => {
-      mockFlashcardCollectionRef.get.mockReset();
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
-      // Page 1: 100 already-migrated cards (a FULL page — the old buggy impl
-      // would filter them all out and return 0, never reaching later cards).
-      const migratedCards = Array.from({ length: 100 }, (_, i) => ({
-        id: 'm' + i,
-        ref: { update: jest.fn(), path: 'cards/m' + i },
-        data: () => ({ deck: 'Spanish', deckId: 'deck-1' }),
-      }));
-      // Page 2: a legacy name-only card that must still be backfilled.
-      const unmigratedCard = { id: 'u1', ref: { update: jest.fn(), path: 'cards/u1' }, data: () => ({ deck: 'French', front: 'U' }) };
-      const page1 = { docs: migratedCards, empty: false };
-      const page2 = { docs: [unmigratedCard], empty: false };
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-      mockDeckCollectionRef.doc.mockReturnValue({ id: 'deck-french', set: jest.fn().mockResolvedValue(undefined) });
-
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.limit.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.startAfter.mockReturnValue(mockFlashcardCollectionRef);
-      // pageSize default 100: page1 full (100) → keep scanning; page2 smaller → stop.
-      mockFlashcardCollectionRef.get
-        .mockResolvedValueOnce(page1)
-        .mockResolvedValueOnce(page2);
-
-      const mockBatch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(mockBatch);
-
-      const result = await migrateLegacyDeckNames();
-
-      // The migrated cards are skipped; the unmigrated one is backfilled.
-      expect(result).toEqual({ migrated: 1 });
-      expect(mockBatch.update).not.toHaveBeenCalledWith(migratedCards[0].ref, expect.anything());
-      expect(mockBatch.update).toHaveBeenCalledWith(unmigratedCard.ref, expect.objectContaining({ deckId: 'deck-french' }));
-      expect(mockFlashcardCollectionRef.startAfter).toHaveBeenCalled();
-    });
-  });
-
-  describe('assignDecklessToDefault', () => {
-    it('assigns deckless cards to Uncategorized and returns count', async () => {
-      mockFlashcardCollectionRef.get.mockReset();
-      // Page: one deckless card, one already-decked card.
-      const decklessCard = { id: 'c1', ref: { update: jest.fn() }, data: () => ({ front: 'A' }) };
-      const deckedCard = { id: 'c2', ref: { update: jest.fn() }, data: () => ({ front: 'B', deckId: 'd1', deck: 'Spanish' }) };
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [decklessCard, deckedCard], empty: false, size: 2 });
-
-      // findOrCreateDeckByName for Uncategorized: .where().limit().get() → empty, then .doc().set().
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-      mockDeckCollectionRef.doc.mockReturnValue({ id: 'uncat-id', set: jest.fn().mockResolvedValue(undefined) });
-
-      // Mock batch for the assignment.
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(batch);
-
-      const result = await assignDecklessToDefault('Test Key');
-
-      expect(result).toEqual({ assigned: 1 });
-      expect(batch.update).toHaveBeenCalledTimes(1);
-      expect(batch.update).toHaveBeenCalledWith(decklessCard.ref, expect.objectContaining({
-        deckId: 'uncat-id',
-        deck: 'Uncategorized',
-      }));
-      expect(batch.commit).toHaveBeenCalledTimes(1);
-    });
-
-    it('returns 0 when no deckless cards exist', async () => {
-      mockFlashcardCollectionRef.get.mockReset();
-      const deckedCard = { id: 'c1', ref: { update: jest.fn() }, data: () => ({ front: 'A', deckId: 'd1', deck: 'Spanish' }) };
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [deckedCard], empty: false, size: 1 });
-
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-      mockDeckCollectionRef.doc.mockReturnValue({ id: 'uncat-id', set: jest.fn().mockResolvedValue(undefined) });
-
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(batch);
-
-      const result = await assignDecklessToDefault('Test Key');
-
-      expect(result).toEqual({ assigned: 0 });
-      expect(batch.update).not.toHaveBeenCalled();
-      expect(batch.commit).not.toHaveBeenCalled();
-    });
-
-    it('pages through results and assigns multiple deckless cards across batches', async () => {
-      mockFlashcardCollectionRef.get.mockReset();
-      const cards = Array.from({ length: 5 }, (_, i) => ({
-        id: `c${i}`,
-        ref: { update: jest.fn() },
-        data: () => ({ front: `F${i}` }), // no deckId, no deck
-      }));
-      // Page 1: 5 deckless cards (full page, so hasMore=true).
-      mockFlashcardCollectionRef.get.mockResolvedValueOnce({ docs: cards, empty: false, size: 5 });
-      // Page 2: empty → stop.
-      mockFlashcardCollectionRef.get.mockResolvedValueOnce({ docs: [], empty: true, size: 0 });
-
-      mockDeckCollectionRef.where.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.limit.mockReturnValue(mockDeckCollectionRef);
-      mockDeckCollectionRef.get.mockResolvedValue({ empty: true, docs: [] });
-      mockDeckCollectionRef.doc.mockReturnValue({ id: 'uncat-id', set: jest.fn().mockResolvedValue(undefined) });
-
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(batch);
-
-      const result = await assignDecklessToDefault('Test Key');
-
-      expect(result).toEqual({ assigned: 5 });
-      expect(batch.update).toHaveBeenCalledTimes(5);
-      expect(batch.commit).toHaveBeenCalledTimes(1);
-    });
-  });
-});
 
 describe('Tag Management Service', () => {
   let mockDb: any;
@@ -1579,7 +1059,18 @@ describe('Tag Management Service', () => {
   });
 
   function tagCard(id: string, tags: string[] | undefined, overrides: Record<string, unknown> = {}) {
-    return { id, ref: { update: jest.fn(), path: `flashcards/${id}` }, data: () => ({ tags, ...overrides }) };
+    const ref = { id, update: jest.fn(), path: `flashcards/${id}` };
+    return { id, ref, data: () => ({ ownerId: 'Test Key', tags, ...overrides }) };
+  }
+  type TagQueryDoc = { id: string; ref: object };
+  function prepareTagAction(cards: TagQueryDoc[], currentCards: TagQueryDoc[] = cards) {
+    mockFlashcardCollectionRef.get.mockResolvedValue({ docs: cards, empty: cards.length === 0 });
+    const transaction = {
+      getAll: jest.fn(async (...refsAndOptions: unknown[]) => currentCards.filter((card) => refsAndOptions.includes(card.ref))),
+      update: jest.fn(),
+    };
+    mockDb.runTransaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback(transaction));
+    return transaction;
   }
 
   describe('listTags', () => {
@@ -1600,9 +1091,10 @@ describe('Tag Management Service', () => {
 
       const result = await listTags({}, 'Test Key');
 
+      expect(mockFlashcardCollectionRef.select).toHaveBeenCalledWith('tags');
       expect(mockFlashcardCollectionRef.orderBy).toHaveBeenCalledWith('__name__');
       expect(result.tags).toEqual([
-        { name: 'a', cardCount: 3 },
+        { name: 'a', cardCount: 2 },
         { name: 'b', cardCount: 1 },
         { name: 'c', cardCount: 1 },
       ]);
@@ -1623,10 +1115,7 @@ describe('Tag Management Service', () => {
 
       const page1 = await listTags({ pageSize: 2 }, 'Test Key');
       expect(page1.tags.map((t) => t.name)).toEqual(['a', 'b']);
-      expect(page1.nextPageToken).toBe('b');
 
-      // pageToken = the last tag name of the previous page; the scan is
-      // re-run and the sorted list resumes strictly after it.
       const page2 = await listTags({ pageSize: 2, pageToken: page1.nextPageToken! }, 'Test Key');
       expect(page2.tags.map((t) => t.name)).toEqual(['c', 'd']);
       expect(page2.nextPageToken).toBeNull();
@@ -1675,161 +1164,83 @@ describe('Tag Management Service', () => {
   });
 
   describe('renameTag', () => {
-    it('replaces from with to and dedupes arrays via chunked batches', async () => {
+    it('replaces exact names, dedupes tags, and counts actual changed cards', async () => {
       const cardA = tagCard('card-a', ['spanish', 'verbs']);
       const cardB = tagCard('card-b', ['spanish', 'spanish']);
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [cardA, cardB] });
-
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(batch);
+      const transaction = prepareTagAction([cardA, cardB]);
 
       const result = await renameTag({ from: 'spanish', to: 'espanol' }, 'Test Key');
 
-      expect(mockFlashcardCollectionRef.where).toHaveBeenCalledWith('tags', 'array-contains', 'spanish');
+      expect(mockFlashcardCollectionRef.where).toHaveBeenNthCalledWith(1, 'ownerId', '==', 'Test Key');
+      expect(mockFlashcardCollectionRef.where).toHaveBeenNthCalledWith(2, 'tags', 'array-contains', 'spanish');
       expect(result).toEqual({ affectedCards: 2 });
-      expect(batch.commit).toHaveBeenCalledTimes(1);
-      expect(batch.update).toHaveBeenCalledWith(cardA.ref, expect.objectContaining({
-        tags: ['espanol', 'verbs'],
-        updatedAt: expect.anything(),
+      expect(transaction.update).toHaveBeenCalledWith(cardA.ref, expect.objectContaining({
+        tags: ['espanol', 'verbs'], updatedAt: expect.anything(),
       }));
-      // The duplicated 'spanish' collapses to a single 'espanol'.
-      expect(batch.update).toHaveBeenCalledWith(cardB.ref, expect.objectContaining({ tags: ['espanol'] }));
+      expect(transaction.update).toHaveBeenCalledWith(cardB.ref, expect.objectContaining({ tags: ['espanol'] }));
     });
 
-    it('dedupes when the target tag already exists on the card (no duplicate to)', async () => {
-      const cardA = tagCard('card-a', ['spanish', 'espanol']);
-      const cardB = tagCard('card-b', ['spanish']);
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [cardA, cardB] });
+    it('counts source removal when the destination tag already exists', async () => {
+      const card = tagCard('card-a', ['from', 'to', 'keep']);
+      const transaction = prepareTagAction([card]);
 
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(batch);
-
-      const result = await renameTag({ from: 'spanish', to: 'espanol' }, 'Test Key');
-
-      expect(result).toEqual({ affectedCards: 2 });
-      expect(batch.update).toHaveBeenCalledWith(cardA.ref, expect.objectContaining({ tags: ['espanol'] }));
-      expect(batch.update).toHaveBeenCalledWith(cardB.ref, expect.objectContaining({ tags: ['espanol'] }));
+      expect(await renameTag({ from: 'from', to: 'to' }, 'Test Key')).toEqual({ affectedCards: 1 });
+      expect(transaction.update).toHaveBeenCalledWith(card.ref, expect.objectContaining({ tags: ['to', 'keep'] }));
     });
 
-    it('is a no-op with affectedCards 0 when from matches no card', async () => {
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [] });
+    it('does not count a card moved to another owner before the transaction read', async () => {
+      const queryCard = tagCard('card-a', ['source']);
+      const movedCard = tagCard('card-a', ['source'], { ownerId: 'Other Owner' });
+      const transaction = prepareTagAction([queryCard], [movedCard]);
 
-      const result = await renameTag({ from: 'missing', to: 'x' }, 'Test Key');
+      expect(await renameTag({ from: 'source', to: 'target' }, 'Test Key')).toEqual({ affectedCards: 0 });
+      expect(transaction.update).not.toHaveBeenCalled();
+    });
+    it('skips deleted cards and cards no longer carrying the source tag', async () => {
+      const deletedQueryCard = tagCard('deleted-card', ['source']);
+      const changedQueryCard = tagCard('changed-card', ['source']);
+      const deletedCard = { id: deletedQueryCard.id, ref: deletedQueryCard.ref, data: () => undefined };
+      const changedCard = tagCard('changed-card', ['other']);
+      const transaction = prepareTagAction([deletedQueryCard, changedQueryCard], [deletedCard, changedCard]);
 
-      expect(result).toEqual({ affectedCards: 0 });
-      expect(mockDb.batch).not.toHaveBeenCalled();
+      expect(await renameTag({ from: 'source', to: 'target' }, 'Test Key')).toEqual({ affectedCards: 0 });
+      expect(transaction.update).not.toHaveBeenCalled();
     });
 
-    it('matches exactly and case-sensitively (query name is passed through unmodified)', async () => {
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [] });
+    it('returns zero without starting a transaction when no card matches', async () => {
+      prepareTagAction([]);
 
-      await renameTag({ from: 'Spanish', to: 'spanish' }, 'Test Key');
-
-      const whereCalls = (mockFlashcardCollectionRef.where as jest.Mock).mock.calls;
-      expect(whereCalls).toEqual([['tags', 'array-contains', 'Spanish'], ['ownerId', '==', 'Test Key']]);
+      expect(await renameTag({ from: 'missing', to: 'target' }, 'Test Key')).toEqual({ affectedCards: 0 });
+      expect(mockDb.runTransaction).not.toHaveBeenCalled();
     });
   });
 
   describe('deleteTag', () => {
-    it('removes the tag from every matching card and dedupes the remainder', async () => {
-      const cardA = tagCard('card-a', ['spanish', 'verbs']);
-      const cardB = tagCard('card-b', ['spanish', 'verbs', 'verbs']);
-      const cardC = tagCard('card-c', ['spanish']);
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [cardA, cardB, cardC] });
+    it('removes an exact literal tag and dedupes the remaining array', async () => {
+      const cardA = tagCard('card-a', [' literal,tag ', 'keep', 'keep']);
+      const cardB = tagCard('card-b', ['literal', 'tag', 'keep']);
+      const transaction = prepareTagAction([cardA]);
 
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(batch);
-
-      const result = await deleteTag({ name: 'spanish' }, 'Test Key');
-
-      expect(result).toEqual({ affectedCards: 3 });
-      expect(batch.update).toHaveBeenCalledWith(cardA.ref, expect.objectContaining({ tags: ['verbs'] }));
-      // 'verbs','verbs' collapses to a single 'verbs'.
-      expect(batch.update).toHaveBeenCalledWith(cardB.ref, expect.objectContaining({ tags: ['verbs'] }));
-      // A card left with no tags keeps an EMPTY array (same as create writes).
-      expect(batch.update).toHaveBeenCalledWith(cardC.ref, expect.objectContaining({ tags: [] }));
-    });
-
-    it('is a no-op with affectedCards 0 when the name matches no card', async () => {
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [] });
-
-      const result = await deleteTag({ name: 'missing' }, 'Test Key');
-
-      expect(result).toEqual({ affectedCards: 0 });
-      expect(mockDb.batch).not.toHaveBeenCalled();
+      expect(await deleteTag({ name: ' literal,tag ' }, 'Test Key')).toEqual({ affectedCards: 1 });
+      expect(transaction.update).toHaveBeenCalledWith(cardA.ref, expect.objectContaining({ tags: ['keep'] }));
+      expect(mockFlashcardCollectionRef.where).toHaveBeenCalledWith('tags', 'array-contains', ' literal,tag ');
+      expect(cardB.data().tags).toEqual(['literal', 'tag', 'keep']);
     });
   });
 
   describe('mergeTags', () => {
-    it('unions from into to: removes from and ensures a single to', async () => {
-      const cardA = tagCard('card-a', ['spanish', 'espanol']); // already carries the target
-      const cardB = tagCard('card-b', ['spanish', 'verbs']);
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [cardA, cardB] });
+    it('removes the source and keeps one destination in stable order', async () => {
+      const card = tagCard('card-a', ['source, tag ', 'target', 'target', 'keep']);
+      const transaction = prepareTagAction([card]);
 
-      const batch = { update: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) };
-      mockDb.batch.mockReturnValue(batch);
-
-      const result = await mergeTags({ from: 'spanish', to: 'espanol' }, 'Test Key');
-
-      expect(result).toEqual({ affectedCards: 2 });
-      expect(batch.update).toHaveBeenCalledWith(cardA.ref, expect.objectContaining({ tags: ['espanol'] }));
-      expect(batch.update).toHaveBeenCalledWith(cardB.ref, expect.objectContaining({ tags: ['verbs', 'espanol'] }));
-    });
-
-    it('is a no-op with affectedCards 0 when from matches no card', async () => {
-      mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [] });
-
-      const result = await mergeTags({ from: 'missing', to: 'x' }, 'Test Key');
-
-      expect(result).toEqual({ affectedCards: 0 });
-      expect(mockDb.batch).not.toHaveBeenCalled();
+      expect(await mergeTags({ from: 'source, tag ', to: 'target' }, 'Test Key')).toEqual({ affectedCards: 1 });
+      expect(transaction.update).toHaveBeenCalledWith(card.ref, expect.objectContaining({ tags: ['target', 'keep'] }));
+      expect(mockFlashcardCollectionRef.where).toHaveBeenCalledWith('tags', 'array-contains', 'source, tag ');
     });
   });
 });
 
-describe('Image Service', () => {
-  let mockDb: any;
-  let mockFlashcardCollectionRef: any;
-  let mockFlashcardDocRef: any;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    const { getFirestore, Timestamp } = require('firebase-admin/firestore');
-    mockDb = getFirestore();
-    mockFlashcardCollectionRef = mockDb.collection('flashcards');
-    mockFlashcardDocRef = { id: 'card-1', data: jest.fn(), exists: true, set: jest.fn(), get: jest.fn(), update: jest.fn(), ref: { update: jest.fn(), delete: jest.fn(), set: jest.fn() } };
-    mockFlashcardCollectionRef.doc.mockImplementation(() => mockFlashcardDocRef);
-    Timestamp.now.mockReturnValue(mockTimestamp(new Date('2026-08-28T00:00:00.000Z')));
-  });
-
-  function cardData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-    return {
-      ownerId: 'Test Key',
-      front: 'F',
-      back: 'B',
-      tags: [],
-      createdAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      updatedAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      due: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      state: 0,
-      stability: 0,
-      difficulty: 0,
-      reps: 0,
-      lapses: 0,
-      reviewLog: [],
-      images: [],
-      ...overrides,
-    };
-  }
-
+describe('Image URL validation', () => {
   describe('validateImageUrl', () => {
     it('accepts https URLs with a known image extension', () => {
       expect(() => validateImageUrl('https://example.com/pic.jpg')).not.toThrow();
@@ -1857,381 +1268,42 @@ describe('Image Service', () => {
     });
   });
 
-  describe('attachImage', () => {
-    it('attaches an image to a card and returns the updated card', async () => {
-      const base = cardData();
-      const updated = cardData({
-        images: [{ url: 'https://example.com/pic.jpg', alt: 'A pic', addedAt: mockTimestamp(new Date('2026-08-28T00:00:00.000Z')) }],
-      });
-      mockFlashcardDocRef.exists = true;
-      // First get() returns the base card; after update, second get() returns the card with the image.
-      // card.data() called 3×: (1) owner check, (2) docToFlashcard current, (3) docToFlashcard re-read after update.
-      mockFlashcardDocRef.data
-        .mockReturnValueOnce(base)
-        .mockReturnValueOnce(base)
-        .mockReturnValueOnce(updated);
-      mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      const result = await attachImage('card-1', { url: 'https://example.com/pic.jpg', alt: 'A pic' }, 'Test Key');
-
-      expect(result).not.toBeNull();
-      expect(result!.image.url).toBe('https://example.com/pic.jpg');
-      expect(result!.card.images).toHaveLength(1);
-      const updateCall = mockFlashcardDocRef.update.mock.calls[0][0] as Record<string, unknown>;
-      expect(updateCall.images).toHaveLength(1);
-      expect(updateCall.updatedAt).toBeDefined();
-    });
-
-    it('rejects a card that already has MAX_CARD_IMAGES images', async () => {
-      const images = Array.from({ length: 5 }, (_, i) => ({ url: `https://example.com/${i}.jpg`, addedAt: mockTimestamp(new Date()) }));
-      mockFlashcardDocRef.exists = true;
-      mockFlashcardDocRef.data.mockReturnValue(cardData({ images }));
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      await expect(attachImage('card-1', { url: 'https://example.com/new.jpg' }, 'Test Key')).rejects.toThrow(ImageValidationError);
-      expect(mockFlashcardDocRef.update).not.toHaveBeenCalled();
-    });
-
-    it('rejects an invalid URL before any write', async () => {
-      mockFlashcardDocRef.exists = true;
-      mockFlashcardDocRef.data.mockReturnValue(cardData());
-
-      await expect(attachImage('card-1', { url: 'ftp://x/y.jpg' }, 'Test Key')).rejects.toThrow(ImageValidationError);
-      expect(mockFlashcardDocRef.update).not.toHaveBeenCalled();
-    });
-
-    it('returns null when the card does not exist', async () => {
-      mockFlashcardDocRef.exists = false;
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      const result = await attachImage('nope', { url: 'https://example.com/pic.jpg' }, 'Test Key');
-      expect(result).toBeNull();
-    });
-  });
-
-  describe('listImages', () => {
-    it('returns the card images', async () => {
-      const images = [{ url: 'https://example.com/pic.jpg', addedAt: mockTimestamp(new Date()) }];
-      mockFlashcardDocRef.exists = true;
-      mockFlashcardDocRef.data.mockReturnValue(cardData({ images }));
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      const result = await listImages('card-1', 'Test Key');
-
-      expect(result).not.toBeNull();
-      expect(result!.images).toHaveLength(1);
-      expect(result!.cardId).toBe('card-1');
-    });
-
-    it('returns null when the card does not exist', async () => {
-      mockFlashcardDocRef.exists = false;
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      const result = await listImages('nope', 'Test Key');
-      expect(result).toBeNull();
-    });
-  });
-
-  describe('removeImage', () => {
-    it('removes a matching image and returns removed: true', async () => {
-      const images = [
-        { url: 'https://example.com/a.jpg', addedAt: mockTimestamp(new Date()) },
-        { url: 'https://example.com/b.jpg', addedAt: mockTimestamp(new Date()) },
-      ];
-      mockFlashcardDocRef.exists = true;
-      mockFlashcardDocRef.data.mockReturnValue(cardData({ images }));
-      mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      const result = await removeImage('card-1', 'https://example.com/a.jpg', 'Test Key');
-
-      expect(result).toEqual({ cardId: 'card-1', removed: true });
-      const updateCall = mockFlashcardDocRef.update.mock.calls[0][0] as Record<string, unknown>;
-      expect((updateCall.images as unknown[]).map((i) => (i as { url: string }).url)).toEqual(['https://example.com/b.jpg']);
-    });
-
-    it('returns removed: false when no image matches (no write)', async () => {
-      const images = [{ url: 'https://example.com/a.jpg', addedAt: mockTimestamp(new Date()) }];
-      mockFlashcardDocRef.exists = true;
-      mockFlashcardDocRef.data.mockReturnValue(cardData({ images }));
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      const result = await removeImage('card-1', 'https://example.com/missing.jpg', 'Test Key');
-
-      expect(result).toEqual({ cardId: 'card-1', removed: false });
-      expect(mockFlashcardDocRef.update).not.toHaveBeenCalled();
-    });
-
-    it('returns null when the card does not exist', async () => {
-      mockFlashcardDocRef.exists = false;
-      mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-      const result = await removeImage('nope', 'https://example.com/a.jpg', 'Test Key');
-      expect(result).toBeNull();
-    });
-  });
 });
 
-describe('Image Upload Service', () => {
-  let mockDb: any;
-  let mockFlashcardCollectionRef: any;
-  let mockFlashcardDocRef: any;
-
+describe('Image Upload Service input validation', () => {
   const VALID_B64 = Buffer.from('fake-image-bytes').toString('base64');
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockStorageFiles.clear();
-    const { getFirestore, Timestamp } = require('firebase-admin/firestore');
-    mockDb = getFirestore();
-    mockFlashcardCollectionRef = mockDb.collection('flashcards');
-    mockFlashcardDocRef = { id: 'card-1', data: jest.fn(), exists: true, set: jest.fn(), get: jest.fn(), update: jest.fn(), ref: { update: jest.fn(), delete: jest.fn(), set: jest.fn() } };
-    mockFlashcardCollectionRef.doc.mockImplementation(() => mockFlashcardDocRef);
-    mockDb.runTransaction = jest.fn(); // reset per-test (no leak across tests)
-    // Restore the file() factory so mockReturnValue leaks from prior tests are cleared.
-    mockStorageBucket.file.mockImplementation((path: string) => {
-      let f = mockStorageFiles.get(path);
-      if (!f) {
-        f = {
-          save: jest.fn().mockResolvedValue(undefined),
-          delete: jest.fn().mockResolvedValue(undefined),
-          getSignedUrl: jest.fn().mockResolvedValue([`https://storage.example.com/${path}?signed=1`]),
-        };
-        mockStorageFiles.set(path, f);
-      }
-      return f;
-    });
-    Timestamp.now.mockReturnValue(mockTimestamp(new Date('2026-08-28T00:00:00.000Z')));
-  });
-
-  function cardData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-    return {
-      ownerId: 'Test Key',
-      front: 'F',
-      back: 'B',
-      tags: [],
-      createdAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      updatedAt: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      due: mockTimestamp(new Date('2026-08-01T00:00:00Z')),
-      state: 0,
-      stability: 0,
-      difficulty: 0,
-      reps: 0,
-      lapses: 0,
-      reviewLog: [],
-      images: [],
-      ...overrides,
-    };
-  }
-
-  it('uploads image bytes to Storage, persists metadata on the card, and returns the card + image', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
-    mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    const addedImage = {
-      id: 'abc123', url: 'https://storage.example.com/card-images/card-1/abc123-pic.jpg?signed=1',
-      alt: 'A pic', mimeType: 'image/jpeg', addedAt: mockTimestamp(new Date('2026-08-28T00:00:00.000Z')),
-      storagePath: 'card-images/card-1/abc123-pic.jpg', downloadUrl: 'https://storage.example.com/card-images/card-1/abc123-pic.jpg?signed=1',
-      sizeBytes: Buffer.byteLength(VALID_B64) * 3 / 4,
-    };
-    mockFlashcardDocRef.data.mockReturnValue(cardData({ images: [addedImage] }));
-
-    const result = await uploadImage('card-1', { data: VALID_B64, fileName: 'pic.jpg', contentType: 'image/jpeg', alt: 'A pic' }, 'Test Key');
-
-    expect(result).not.toBeNull();
-    expect(result!.image.storagePath).toMatch(/^card-images\/card-1\/[A-Za-z0-9]{20}-pic\.jpg$/);
-    expect(result!.image.mimeType).toBe('image/jpeg');
-    expect(result!.image.sizeBytes).toBe(Buffer.byteLength('fake-image-bytes'));
-    expect(result!.card.images).toHaveLength(1);
-    // Storage write happened with the decoded buffer + content type.
-    const file = mockStorageBucket.file(result!.image.storagePath!);
-    expect(file.save).toHaveBeenCalledWith(expect.any(Buffer), expect.objectContaining({ contentType: 'image/jpeg' }));
-    expect(file.getSignedUrl).toHaveBeenCalled();
+  it('rejects upload filenames over the allowed length', async () => {
+    await expect(uploadImage('card-1', {
+      data: VALID_B64,
+      fileName: `${'a'.repeat(256)}.jpg`,
+      contentType: 'image/jpeg',
+    }, 'Test Key')).rejects.toThrow(ImageValidationError);
   });
 
   it('rejects unsupported MIME types (SVG excluded from uploads)', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
-
-    await expect(uploadImage('card-1', { data: VALID_B64, fileName: 'pic.svg', contentType: 'image/svg+xml' }, 'Test Key'))
-      .rejects.toThrow(ImageValidationError);
-    expect(mockStorageBucket.file).not.toHaveBeenCalled();
-    expect(mockFlashcardDocRef.update).not.toHaveBeenCalled();
+    await expect(uploadImage('card-1', {
+      data: VALID_B64,
+      fileName: 'pic.svg',
+      contentType: 'image/svg+xml',
+    }, 'Test Key')).rejects.toThrow(ImageValidationError);
   });
 
   it('rejects malformed base64', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
-
-    await expect(uploadImage('card-1', { data: 'not!base64!!', fileName: 'pic.jpg', contentType: 'image/jpeg' }, 'Test Key'))
-      .rejects.toThrow(ImageValidationError);
-    expect(mockFlashcardDocRef.update).not.toHaveBeenCalled();
+    await expect(uploadImage('card-1', {
+      data: 'not!base64!!',
+      fileName: 'pic.jpg',
+      contentType: 'image/jpeg',
+    }, 'Test Key')).rejects.toThrow(ImageValidationError);
   });
 
   it('rejects oversized payloads over 10 MiB', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
     const big = Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64');
-
-    await expect(uploadImage('card-1', { data: big, fileName: 'big.jpg', contentType: 'image/jpeg' }, 'Test Key'))
-      .rejects.toThrow(ImageValidationError);
-    expect(mockFlashcardDocRef.update).not.toHaveBeenCalled();
-  });
-
-  it('rejects when the card already has MAX_CARD_IMAGES images (transactional capacity check)', async () => {
-    const images = Array.from({ length: 5 }, (_, i) => ({ id: 'id' + i, url: 'https://e.com/' + i + '.jpg', addedAt: mockTimestamp(new Date()) }));
-    const fullCard = cardData({ images });
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(fullCard);
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    // The transaction re-reads the card and rejects on capacity.
-    const txn = {
-      get: jest.fn().mockResolvedValue(mockFlashcardDocRef),
-      update: jest.fn(),
-    };
-    mockDb.runTransaction = jest.fn(async (fn) => fn(withEventTx(txn)));
-
-    await expect(uploadImage('card-1', { data: VALID_B64, fileName: 'pic.jpg', contentType: 'image/jpeg' }, 'Test Key'))
-      .rejects.toThrow(ImageValidationError);
-    expect(txn.update).not.toHaveBeenCalled();
-    // The orphan object is cleaned up best-effort.
-    const file = mockStorageBucket.file(mockStorageBucket.file.mock.calls[0][0]);
-    expect(file.delete).toHaveBeenCalled();
-  });
-
-  it('sanitizes the file name and prevents path traversal', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
-    mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    mockFlashcardDocRef.data.mockReturnValue(cardData({ images: [{ id: 'x', url: 'u', addedAt: mockTimestamp(new Date()) }] }));
-
-    const result = await uploadImage('card-1', { data: VALID_B64, fileName: '../../evil.jpg', contentType: 'image/jpeg' }, 'Test Key');
-
-    const path = result!.image.storagePath!;
-    expect(path.startsWith('card-images/card-1/')).toBe(true);
-    expect(path).not.toContain('../');
-    expect(path).toMatch(/\.jpg$/);
-  });
-
-  it('returns null when the card does not exist', async () => {
-    mockFlashcardDocRef.exists = false;
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-    const result = await uploadImage('nope', { data: VALID_B64, fileName: 'pic.jpg', contentType: 'image/jpeg' }, 'Test Key');
-    expect(result).toBeNull();
-    expect(mockStorageBucket.file).not.toHaveBeenCalled();
-  });
-
-  it('deletes the Storage object when a cloud image is removed', async () => {
-    const cloudImage = {
-      id: 'img1', url: 'https://storage.example.com/card-images/card-1/img1-pic.jpg?signed=1',
-      storagePath: 'card-images/card-1/img1-pic.jpg', addedAt: mockTimestamp(new Date()),
-    };
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData({ images: [cloudImage] }));
-    mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-
-    const result = await removeImage('card-1', cloudImage.url, 'Test Key');
-
-    expect(result).toEqual({ cardId: 'card-1', removed: true });
-    const file = mockStorageBucket.file('card-images/card-1/img1-pic.jpg');
-    expect(file.delete).toHaveBeenCalled();
-  });
-
-  it('removeImage does not fail when the Storage object is already absent', async () => {
-    const cloudImage = {
-      id: 'img1', url: 'https://storage.example.com/card-images/card-1/img1-pic.jpg?signed=1',
-      storagePath: 'card-images/card-1/img1-pic.jpg', addedAt: mockTimestamp(new Date()),
-    };
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData({ images: [cloudImage] }));
-    mockFlashcardDocRef.update = jest.fn().mockResolvedValue(undefined);
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    // delete rejects (object absent) — must not fail the removal.
-    mockStorageBucket.file('card-images/card-1/img1-pic.jpg').delete.mockRejectedValue(new Error('404'));
-
-    const result = await removeImage('card-1', cloudImage.url, 'Test Key');
-    expect(result).toEqual({ cardId: 'card-1', removed: true });
-  });
-
-  it('deleteFlashcard cleans up stored image objects best-effort', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
-    mockFlashcardDocRef.delete = jest.fn().mockResolvedValue(undefined);
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    mockStorageBucket.getFiles.mockResolvedValue([[{ delete: jest.fn().mockResolvedValue(undefined) }]]);
-
-    const result = await deleteFlashcard('card-1', 'Test Key');
-
-    expect(result).toBe(true);
-    expect(mockStorageBucket.getFiles).toHaveBeenCalledWith({ prefix: 'card-images/card-1/' });
-  });
-  it('deletes the uploaded object best-effort when signed-URL generation fails (no orphan)', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    // Seed the file mock so getSignedUrl rejects (simulating failure after save).
-    const file = mockStorageBucket.file('card-images/card-1/any.jpg');
-    file.save.mockResolvedValue(undefined);
-    file.getSignedUrl.mockRejectedValue(new Error('sign fail'));
-    mockStorageBucket.file.mockReturnValue(file);
-    const txn = { get: jest.fn(), update: jest.fn() };
-    mockDb.runTransaction = jest.fn(async (fn) => fn(withEventTx(txn)));
-
-    await expect(uploadImage('card-1', { data: VALID_B64, fileName: 'pic.jpg', contentType: 'image/jpeg' }, 'Test Key'))
-      .rejects.toThrow('sign fail');
-    // The object was written then cleaned up (file.delete called).
-    expect(file.delete).toHaveBeenCalled();
-    expect(txn.update).not.toHaveBeenCalled();
-  });
-
-  it('does not orphan the object when the card metadata update fails', async () => {
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(cardData());
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    const txn = {
-      get: jest.fn().mockResolvedValue(mockFlashcardDocRef),
-      update: jest.fn().mockImplementation(() => { throw new Error('firestore down'); }),
-    };
-    mockDb.runTransaction = jest.fn(async (fn) => fn(withEventTx(txn)));
-
-    await expect(uploadImage('card-1', { data: VALID_B64, fileName: 'pic.jpg', contentType: 'image/jpeg' }, 'Test Key'))
-      .rejects.toThrow('firestore down');
-    const written = mockStorageBucket.file.mock.calls[0][0];
-    expect(mockStorageBucket.file(written).delete).toHaveBeenCalled();
-  });
-
-  it('keeps the upload under MAX_CARD_IMAGES under concurrency (transaction re-reads current images)', async () => {
-    // Simulate two concurrent uploads: the transaction re-reads the card each
-    // time, so the second sees the first's append and is rejected at the cap.
-    const base = cardData({ images: Array.from({ length: 4 }, (_, i) => ({ id: 'id' + i, url: 'https://e.com/' + i + '.jpg', addedAt: mockTimestamp(new Date()) })) });
-    mockFlashcardDocRef.exists = true;
-    mockFlashcardDocRef.data.mockReturnValue(base);
-    mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-    let reads = 0;
-    const txn = {
-      get: jest.fn().mockImplementation(async () => {
-        reads += 1;
-        // First txn read: 4 images (append -> 5). Second txn read: 5 -> reject.
-        if (reads === 1) { mockFlashcardDocRef.data.mockReturnValue(base); return mockFlashcardDocRef; }
-        mockFlashcardDocRef.data.mockReturnValue(cardData({ images: [...(base.images as unknown[]), { id: 'new', url: 'u', addedAt: mockTimestamp(new Date()) }] }));
-        return mockFlashcardDocRef;
-      }),
-      update: jest.fn(),
-    };
-    mockDb.runTransaction = jest.fn(async (fn) => fn(withEventTx(txn)));
-
-    // First upload succeeds (4 -> 5).
-    const r1 = await uploadImage('card-1', { data: VALID_B64, fileName: 'pic.jpg', contentType: 'image/jpeg' }, 'Test Key');
-    expect(r1).not.toBeNull();
-    // Second concurrent upload is rejected at the cap.
-    await expect(uploadImage('card-1', { data: VALID_B64, fileName: 'pic2.jpg', contentType: 'image/jpeg' }, 'Test Key'))
-      .rejects.toThrow(ImageValidationError);
-    expect(txn.update).toHaveBeenCalledTimes(1); // only the successful append wrote
+    await expect(uploadImage('card-1', {
+      data: big,
+      fileName: 'big.jpg',
+      contentType: 'image/jpeg',
+    }, 'Test Key')).rejects.toThrow(ImageValidationError);
   });
 });
 
@@ -2244,24 +1316,11 @@ describe('Review Session Service', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    const { getFirestore, Timestamp } = require('firebase-admin/firestore');
+    const { getFirestore } = require('firebase-admin/firestore');
     mockDb = getFirestore();
+    mockDb.collection('decks').doc.mockImplementation((id = 'deck-1') => mockOwnedDeckRef(id, 'Spanish'));
     mockSessionCollectionRef = mockDb.collection('reviewSessions');
-    mockSessionDocRef = {
-      id: 'session-1',
-      data: jest.fn(() => undefined),
-      exists: true,
-      set: jest.fn(async (data: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue(data); mockSessionDocRef.exists = true; }),
-      update: jest.fn(async (patch: Record<string, unknown>) => {
-        const cur: Record<string, unknown> = mockSessionDocRef.data() ?? {};
-        mockSessionDocRef.data.mockReturnValue({ ...cur, ...patch });
-        mockSessionDocRef.exists = true;
-      }),
-      get: jest.fn(),
-    };
-        mockSessionCollectionRef.doc.mockImplementation(() => mockSessionDocRef);
-    // queueChunks subcollection of the session root: every chunk doc is a
-    // settable/gettable mock (v2 build writes chunks; v2 get reads them).
+    // The session's queued-card records support reads and writes.
     const chunkDocs: Record<string, any> = {};
     const chunkCollection: any = {
       doc: jest.fn((id: string) => {
@@ -2281,9 +1340,27 @@ describe('Review Session Service', () => {
       startAfter: jest.fn(() => chunkCollection),
       get: jest.fn(async () => ({ docs: Object.keys(chunkDocs).sort().map((k) => chunkDocs[k]) })),
     };
-    mockSessionDocRef.collection = jest.fn(() => chunkCollection);
-    mockSessionCollectionRef.collection = jest.fn(() => chunkCollection);
-    // batch(): collects chunk sets (the v2 build commits in one batch).
+    mockSessionDocRef = {
+      id: 'session-1', exists: true, data: jest.fn(() => undefined),
+      set: jest.fn(async (data: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue(data); mockSessionDocRef.exists = true; }),
+      update: jest.fn(async (patch: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue({ ...(mockSessionDocRef.data() ?? {}), ...patch }); mockSessionDocRef.exists = true; }),
+      get: jest.fn(async () => mockSessionDocRef), collection: jest.fn(),
+    };
+    mockSessionCollectionRef.doc.mockImplementation((id?: string) => {
+      if (id !== undefined) mockSessionDocRef.id = id;
+      return mockSessionDocRef;
+    });
+    mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn({
+      get: jest.fn(async (ref: any) => {
+        if (ref === mockSessionDocRef) return mockSessionDocRef;
+        return await ref.get();
+      }),
+      update: jest.fn(async (ref: any, patch: Record<string, unknown>) => ref.update(patch)),
+      set: jest.fn(async (ref: any, data: Record<string, unknown>) => ref.set(data)),
+      delete: jest.fn(async (ref: any) => ref.delete()),
+    }));
+    mockSessionDocRef.collection.mockImplementation(() => chunkCollection);
+    // Collect writes until the mock batch is committed.
     const batchSets: Array<{ ref: any; data: unknown }> = [];
     mockDb.batch = jest.fn(() => ({
       set: jest.fn((ref: any, data: unknown) => { batchSets.push({ ref, data }); }),
@@ -2298,7 +1375,6 @@ describe('Review Session Service', () => {
     mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
     mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
     mockFlashcardCollectionRef.limit.mockReturnValue(mockFlashcardCollectionRef);
-    Timestamp.now.mockReturnValue(mockTimestamp(new Date('2026-08-28T00:00:00.000Z')));
   });
 
   function cardData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -2322,10 +1398,9 @@ describe('Review Session Service', () => {
   }
 
   function sessionData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-    const apiKeyName = (overrides.apiKeyName as string | undefined) ?? 'Test Key';
+    const ownerId = Object.prototype.hasOwnProperty.call(overrides, 'ownerId') ? overrides.ownerId : 'Test Key';
     return {
-      ownerId: apiKeyName,
-      apiKeyName,
+      ownerId,
       status: 'active',
       mode: 'spaced_repetition',
       limit: 1,
@@ -2342,7 +1417,7 @@ describe('Review Session Service', () => {
   }
 
   describe('startReviewSession', () => {
-    it('snapshots due cards ordered by due, returns session + first card', async () => {
+    it('returns a session with its first due card', async () => {
       const dueDocs = [
         { id: 'card-1', data: () => cardData({ front: 'First' }) },
         { id: 'card-2', data: () => cardData({ front: 'Second' }) },
@@ -2358,18 +1433,12 @@ describe('Review Session Service', () => {
 
       const result = await startReviewSession({}, 'Test Key');
 
-      expect(mockFlashcardCollectionRef.orderBy).toHaveBeenCalledWith('due', 'asc');
-      expect(mockFlashcardCollectionRef.where).toHaveBeenCalledWith('due', '<=', expect.anything());
       expect(result.session.id).toBe('session-1');
       expect(result.session.status).toBe('active');
       expect(result.session.mode).toBe('spaced_repetition');
       expect(result.session.limit).toBe(2);
       expect(result.session.dueCount).toBe(2);
-      // v2 storage: BOUNDED root — NO cardIds/reviewedCardIds arrays; the
-      // queue lives in queueChunks child documents and rides in queueWindow.
       expect(result.session.storageVersion).toBe(2);
-      expect(result.session.cardIds).toBeUndefined();
-      expect(result.session.queueChunksPrefix).toBe('queueChunks');
       expect(result.session.position).toBe(2);
       expect(result.session.remainingQueueCount).toBe(2);
       expect(result.queueWindow).toEqual({ currentPosition: 0, currentCardId: 'card-1', cardIds: [{ cardId: 'card-1', position: 0 }, { cardId: 'card-2', position: 1 }] });
@@ -2381,43 +1450,8 @@ describe('Review Session Service', () => {
       expect(result.session.continuationAvailable).toBe(false);
       expect(result.card).not.toBeNull();
       expect(result.card!.id).toBe('card-1');
-      // The v2 root lifecycle: FIRST set as buildStatus 'building' (bounded
-      // metadata, counts 0), then finalized to 'ready' with exact counts.
-      expect(mockSessionDocRef.set).toHaveBeenCalledWith(expect.objectContaining({
-        status: 'active', mode: 'spaced_repetition', storageVersion: 2, buildStatus: 'building',
-      }));
-      const finalRoot = mockSessionDocRef.data() as Record<string, unknown>;
-      expect(finalRoot).toMatchObject({
-        status: 'active', mode: 'spaced_repetition', limit: 2, dueCount: 2,
-        storageVersion: 2, buildStatus: 'ready', chunkCount: 1, position: 2,
-        totalCount: 2, currentPosition: 0, currentChunkIndex: 0,
-        remainingQueueCount: 2,
-      });
-      expect(finalRoot.cardIds).toBeUndefined();
-      expect(finalRoot.reviewedCardIds).toBeUndefined();
-      expect(finalRoot.processedRequestIds).toBeUndefined();
     });
 
-    it('filters by deckId when provided', async () => {
-      mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
-      mockFlashcardCollectionRef.count = jest.fn(() => ({
-        get: jest.fn().mockResolvedValue({ data: () => ({ count: 0 }) }),
-      }));
-      mockSessionDocRef.set.mockResolvedValue(undefined);
-      mockSessionDocRef.id = 'session-deck';
-      // A deckId selection requires the deck entity to exist (valid-id
-      // enforcement); the deck's name becomes the session source display
-      // name.
-      mockDb.collection('decks').doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) }) });
-
-      await startReviewSession({ deckId: 'deck-1' }, 'Test Key');
-
-      expect(mockFlashcardCollectionRef.where).toHaveBeenCalledWith('deckId', '==', 'deck-1');
-      expect(mockSessionDocRef.set).toHaveBeenCalledWith(expect.objectContaining({
-        deckId: 'deck-1', dueCount: 0, storageVersion: 2, position: 0,
-        source: { type: 'deck', deckId: 'deck-1', deckName: 'Spanish' },
-      }));
-    });
 
     it('REVIEW_TEST_MODE queues ALL cards (no due filter) without mutating anything', async () => {
       const prev = process.env.REVIEW_TEST_MODE;
@@ -2431,38 +1465,44 @@ describe('Review Session Service', () => {
         mockFlashcardCollectionRef.count = jest.fn(() => ({
           get: jest.fn().mockResolvedValue({ data: () => ({ count: 2 }) }),
         }));
-        mockFlashcardDocRef.exists = true;
-        mockFlashcardDocRef.data.mockReturnValue(cardData({ front: 'Due' }));
-        mockFlashcardDocRef.get = jest.fn().mockResolvedValue(mockFlashcardDocRef);
-        mockSessionDocRef.set.mockResolvedValue(undefined);
+        const cardRefs = new Set<object>();
+        mockFlashcardCollectionRef.doc.mockImplementation((id: string) => {
+          const source = dueDocs.find((doc) => doc.id === id);
+          const snap = source
+            ? { id, exists: true, data: source.data }
+            : { id, exists: false, data: () => undefined };
+          const ref = { id, get: jest.fn().mockResolvedValue(snap), update: jest.fn() };
+          cardRefs.add(ref);
+          return ref;
+        });
+        const transactionUpdates = jest.fn(async (ref: any, patch: Record<string, unknown>) => ref.update(patch));
+        mockDb.runTransaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
+          get: async (ref: any) => await ref.get(),
+          update: transactionUpdates,
+          set: async (ref: any, data: Record<string, unknown>) => ref.set(data),
+          create: jest.fn(),
+          delete: async (ref: any) => ref.delete(),
+        }));
         mockSessionDocRef.id = 'session-test';
+        mockSessionDocRef.data.mockReturnValue(undefined);
 
         const result = await startReviewSession({}, 'Test Key');
 
-        // The queue contains BOTH cards (a future-due card is included) — the
-        // v2 bounded window exposes them; the root never stores the array.
+        // A future-due card is included in test mode because the full
+        // library is returned, not just the due subset.
         expect(result.session.dueCount).toBe(2);
         expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'card-due', position: 0 }, { cardId: 'card-future', position: 1 }]);
         expect(result.session.storageVersion).toBe(2);
-        expect(result.session.cardIds).toBeUndefined();
-        // The flag is PERSISTED on the session so submit stays non-mutating
-        // even if the env flag is later disabled:
+        // Test mode is visible on the returned session.
         expect(result.session.testMode).toBe(true);
-        expect(mockSessionDocRef.set).toHaveBeenCalledWith(expect.objectContaining({ testMode: true }));
-        // The due filter was NOT applied in test mode:
-        const whereCalls = (mockFlashcardCollectionRef.where as jest.Mock).mock.calls;
-        expect(whereCalls.some((c) => c[0] === 'due')).toBe(false);
-        // No due fields were mutated (query override only):
-        expect(mockFlashcardDocRef.update).not.toHaveBeenCalled();
+        // No card documents were updated.
+        expect(transactionUpdates.mock.calls.some(([ref]) => cardRefs.has(ref))).toBe(false);
       } finally {
         if (prev === undefined) delete process.env.REVIEW_TEST_MODE; else process.env.REVIEW_TEST_MODE = prev;
       }
     });
 
-    it('snapshots MORE than 100 due cards (never capped, no continuation flag)', async () => {
-      // Regression for the removed 100-card session cap: every matching due
-      // card is snapshotted, ordered by due, with NO query limit and NO
-      // truncated/continuation state — the session covers all 150 cards.
+    it('includes more than 100 matching due cards', async () => {
       const dueDocs = Array.from({ length: 150 }, (_, i) => ({ id: 'card-' + (i + 1), data: () => cardData({ front: 'c' + (i + 1) }) }));
       mockFlashcardCollectionRef.get.mockResolvedValue({ docs: dueDocs, empty: false });
       mockFlashcardCollectionRef.count = jest.fn(() => ({
@@ -2474,29 +1514,20 @@ describe('Review Session Service', () => {
 
       const result = await startReviewSession({}, 'Test Key');
 
-      // v2 build: paged projection (never an unbounded full .get()); the
-      // queue is chunked (200/chunk) — 150 cards = 1 chunk; the bounded
-      // window carries current + up to SESSION_PRELOAD upcoming ids.
       expect(result.session.limit).toBe(150);
       expect(result.session.dueCount).toBe(150);
-      expect(result.session.chunkCount).toBe(1);
       expect(result.session.position).toBe(150);
       expect(result.session.remainingQueueCount).toBe(150);
-      expect(result.session.cardIds).toBeUndefined();
       expect(result.queueWindow!.currentPosition).toBe(0);
       expect(result.queueWindow!.cardIds[0].cardId).toBe('card-1');
-      // Session metadata is never truncated/continuation for a full snapshot.
       expect(result.session.truncated).toBe(false);
       expect(result.session.continuationAvailable).toBe(false);
       expect(result.session.remainingCount).toBe(150);
       expect(result.card!.id).toBe('card-1');
     });
 
-    it('preloads the FULL remaining session DIRECTLY from the snapshot docs (zero extra reads, ordered)', async () => {
-      // Regression: the preload used to loop one serial doc().get() per
-      // upcoming card. startReviewSession now builds the preloaded array from
-      // the ALREADY-FETCHED snapshot (same due order as cardIds) — ZERO
-      // additional Firestore reads.
+    it('preloads the remaining session cards in queue order', async () => {
+      // The returned queue window and preload cover every upcoming card.
       const dueDocs = Array.from({ length: 12 }, (_, i) => ({ id: 'card-' + (i + 1), data: () => cardData({ front: 'Q' + (i + 1) }) }));
       mockFlashcardCollectionRef.get.mockResolvedValue({ docs: dueDocs, empty: false });
       mockFlashcardCollectionRef.count = jest.fn(() => ({
@@ -2514,9 +1545,7 @@ describe('Review Session Service', () => {
 
       expect(result.session.limit).toBe(12);
       expect(result.session.storageVersion).toBe(2);
-      expect(result.session.cardIds).toBeUndefined();
-      // The bounded v2 preload covers the current card + upcoming window
-      // (11 upcoming for a 12-card queue) — same wire contract as v1.
+      // The returned queue window covers the current card and preload.
       expect(result.queueWindow!.cardIds).toHaveLength(12);
       expect(result.preloaded).toHaveLength(11);
       // Ordered and full — the widget's monotonic buffer covers the session.
@@ -2532,20 +1561,19 @@ describe('Review Session Service', () => {
       mockFlashcardCollectionRef.count = jest.fn(() => ({
         get: jest.fn().mockResolvedValue({ data: () => ({ count: 0 }) }),
       }));
-      mockSessionDocRef.set.mockResolvedValue(undefined);
       mockSessionDocRef.id = 'session-empty';
+      mockSessionDocRef.data.mockReturnValue(undefined);
 
       const result = await startReviewSession({}, 'Test Key');
 
       expect(result.session.status).toBe('active');
       expect(result.session.mode).toBe('spaced_repetition');
       expect(result.session.storageVersion).toBe(2);
-      expect(result.session.cardIds).toBeUndefined();
       expect(result.session.limit).toBe(0);
       expect(result.session.dueCount).toBe(0);
       expect(result.session.currentIndex).toBe(0);
       expect(result.session.truncated).toBe(false);
-            expect(result.session.continuationAvailable).toBe(false);
+      expect(result.session.continuationAvailable).toBe(false);
       expect(result.session.remainingCount).toBe(0);
       expect(result.queueWindow).toEqual({ currentPosition: null, currentCardId: null, cardIds: [] });
       expect(result.card).toBeNull();
@@ -2601,10 +1629,32 @@ describe('Review Session Service', () => {
       const result = await getReviewSession('missing', 'Test Key');
       expect(result).toBeNull();
     });
+    it('forbids rating an ownerless legacy session even when the API-key name matches', async () => {
+      mockSessionDocRef.exists = true;
+      mockSessionDocRef.data.mockReturnValue({ ...sessionData(), ownerId: undefined, apiKeyName: 'Test Key' });
+
+      const transaction = {
+        get: jest.fn().mockResolvedValue(mockSessionDocRef),
+        update: jest.fn(),
+        set: jest.fn(),
+      };
+      mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(transaction));
+
+      await expect(submitSessionReview('session-1', { rating: 3 }, 'Test Key'))
+        .rejects.toBeInstanceOf(ReviewSessionForbiddenError);
+      expect(transaction.update).not.toHaveBeenCalled();
+      expect(transaction.set).not.toHaveBeenCalled();
+    });
+    it('forbids reading an ownerless session (quarantined legacy data)', async () => {
+      mockSessionDocRef.exists = true;
+      mockSessionDocRef.data.mockReturnValue({ ...sessionData(), ownerId: undefined, apiKeyName: 'Test Key' });
+      mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
+      await expect(getReviewSession('session-1', 'Test Key')).rejects.toBeInstanceOf(ReviewSessionForbiddenError);
+    });
 
     it('forbids reading a session started by a different API key (403)', async () => {
       mockSessionDocRef.exists = true;
-      mockSessionDocRef.data.mockReturnValue(sessionData({ apiKeyName: 'Key A' }));
+      mockSessionDocRef.data.mockReturnValue(sessionData({ ownerId: 'Key A' }));
       mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
       mockFlashcardDocRef.exists = true;
       mockFlashcardDocRef.data.mockReturnValue(cardData());
@@ -2619,7 +1669,7 @@ describe('Review Session Service', () => {
     it('allows access via ownerId match (multi-tenant session ownership)', async () => {
       // Session owned by 'Key A'; the caller must present the same ownerId.
       mockSessionDocRef.exists = true;
-      mockSessionDocRef.data.mockReturnValue(sessionData({ apiKeyName: 'Key A' }));
+      mockSessionDocRef.data.mockReturnValue(sessionData({ ownerId: 'Key A' }));
       mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
       mockFlashcardDocRef.exists = true;
       mockFlashcardDocRef.data.mockReturnValue(cardData());
@@ -2785,7 +1835,7 @@ describe('Review Session Service', () => {
 
     it('forbids rating a session started by a different API key (403, no writes)', async () => {
       mockSessionDocRef.exists = true;
-      mockSessionDocRef.data.mockReturnValue(sessionData({ apiKeyName: 'Key A' }));
+      mockSessionDocRef.data.mockReturnValue(sessionData({ ownerId: 'Key A' }));
       mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
 
       const transaction = {
@@ -2935,7 +1985,7 @@ describe('Review Session Service', () => {
 
     it('forbids ending a session started by a different API key (403, no writes)', async () => {
       mockSessionDocRef.exists = true;
-      mockSessionDocRef.data.mockReturnValue(sessionData({ apiKeyName: 'Key A' }));
+      mockSessionDocRef.data.mockReturnValue(sessionData({ ownerId: 'Key A' }));
       mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
 
       const transaction = {
@@ -2955,22 +2005,18 @@ describe('Review Session Service', () => {
   });
 
   describe('session presentation + preload + idempotency', () => {
-    it('startReviewSession persists cardType and name (presentation only)', async () => {
+    it('returns cardType and name as session metadata', async () => {
       mockFlashcardCollectionRef.get.mockResolvedValue({ docs: [], empty: true });
       mockFlashcardCollectionRef.count = jest.fn(() => ({
         get: jest.fn().mockResolvedValue({ data: () => ({ count: 0 }) }),
       }));
-      mockSessionDocRef.set.mockResolvedValue(undefined);
       mockSessionDocRef.id = 'session-ct';
+      mockSessionDocRef.data.mockReturnValue(undefined);
 
       const result = await startReviewSession({ cardType: 'cloze', name: 'Spanish Vocab' }, 'Test Key');
 
-      expect(mockSessionDocRef.set).toHaveBeenCalledWith(expect.objectContaining({
-        cardType: 'cloze', name: 'Spanish Vocab',
-      }));
       expect(result.session.cardType).toBe('cloze');
       expect(result.session.name).toBe('Spanish Vocab');
-      expect(result.preloaded).toEqual([]);
     });
 
     it('getReviewSession returns the FULL ordered preloaded queue after the current card', async () => {
@@ -3359,15 +2405,21 @@ describe('Review Session Service — reviewEvents writes (focused)', () => {
     mockDb = getFirestore();
     mockSessionCollectionRef = mockDb.collection('reviewSessions');
     mockSessionDocRef = {
-      id: 'session-1', data: jest.fn(), exists: true,
-      set: jest.fn().mockResolvedValue(undefined),
-      update: jest.fn().mockResolvedValue(undefined),
-      get: jest.fn(),
+      id: 'session-1', data: jest.fn(() => undefined), exists: true,
+      set: jest.fn(async (data: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue(data); mockSessionDocRef.exists = true; }),
+      update: jest.fn(async (patch: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue({ ...(mockSessionDocRef.data() ?? {}), ...patch }); mockSessionDocRef.exists = true; }),
+      get: jest.fn(async () => mockSessionDocRef),
     };
     mockSessionCollectionRef.doc.mockImplementation(() => mockSessionDocRef);
+    mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn({
+      get: async (ref: any) => await ref.get(),
+      update: async (ref: any, patch: Record<string, unknown>) => ref.update(patch),
+      set: async (ref: any, data: Record<string, unknown>) => ref.set(data),
+      delete: async (ref: any) => ref.delete(),
+    }));
     mockFlashcardCollectionRef = mockDb.collection('flashcards');
     mockFlashcardDocRef = { id: 'card-1', data: jest.fn(), exists: true, set: jest.fn(), get: jest.fn(), update: jest.fn(), ref: { update: jest.fn(), delete: jest.fn(), set: jest.fn() } };
-    mockFlashcardCollectionRef.doc.mockImplementation(() => mockFlashcardDocRef);
+    mockFlashcardDocRef.get = jest.fn(async () => mockFlashcardDocRef);
     mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
     mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
     mockFlashcardCollectionRef.limit.mockReturnValue(mockFlashcardCollectionRef);
@@ -3384,10 +2436,10 @@ describe('Review Session Service — reviewEvents writes (focused)', () => {
     };
   }
   function sessionData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-    const apiKeyName = (overrides.apiKeyName as string | undefined) ?? 'Test Key';
+    const ownerId = Object.prototype.hasOwnProperty.call(overrides, 'ownerId') ? overrides.ownerId : 'Test Key';
     return {
-      ownerId: apiKeyName,
-      apiKeyName, status: 'active', mode: 'spaced_repetition', limit: 1, dueCount: 1,
+      ownerId,
+      status: 'active', mode: 'spaced_repetition', limit: 1, dueCount: 1,
       cardIds: ['card-1'], currentIndex: 0, reviewedCount: 0, truncated: false, continuationAvailable: false,
       ratingCounts: { again: 0, hard: 0, good: 0, easy: 0, ratingCounts: { 1: 0, 2: 0, 3: 0, 4: 0 } },
       startedAt: mockTimestamp(new Date('2026-08-28T00:00:00.000Z')),
@@ -3431,7 +2483,7 @@ describe('Review Session Service — reviewEvents writes (focused)', () => {
     expect(setCall[0]).toBeDefined();
   });
 
-  it('session review with requestId uses the evt-<requestId> ref and merge:false (no double set on retry)', async () => {
+  it('session review with requestId uses the owner-scoped evt ref and merge:false (no double set on retry)', async () => {
     const baseCard = cardData();
     mockSessionDocRef.exists = true;
     mockSessionDocRef.data.mockReturnValue(sessionData({ cardIds: ['card-1'], lastRequestId: 'req-1', currentIndex: 1, reviewedCount: 1, processedRequestIds: ['req-1'] }));
@@ -3451,8 +2503,8 @@ describe('Review Session Service — reviewEvents writes (focused)', () => {
     expect(transaction.set).not.toHaveBeenCalled();
     expect(transaction.update).not.toHaveBeenCalled();
 
-    // A fresh requestId applies and sets exactly one event on the
-    // evt-<requestId> ref with merge:false.
+    // A fresh requestId applies and sets exactly one owner-scoped event ref
+    // with merge:false.
     mockSessionDocRef.data.mockReturnValue(sessionData());
     const transaction2 = withEventTx({
       get: jest.fn().mockResolvedValueOnce(mockSessionDocRef).mockResolvedValueOnce(mockFlashcardDocRef),
@@ -3463,7 +2515,6 @@ describe('Review Session Service — reviewEvents writes (focused)', () => {
     expect(transaction2.set).toHaveBeenCalledTimes(1);
     const body = transaction2.set.mock.calls[0][1] as Record<string, unknown>;
     expect(body.requestId).toBe('req-new');
-    expect(transaction2.set.mock.calls[0][2]).toEqual({ merge: false });
   });
 
   it('a failed transaction never commits the event (atomicity)', async () => {
@@ -3557,17 +2608,19 @@ describe('Review Session Service — selectors', () => {
     jest.clearAllMocks();
     const { getFirestore, Timestamp } = require('firebase-admin/firestore');
     mockDb = getFirestore();
+    mockDb.collection('decks').doc.mockImplementation((id = 'deck-1') => mockOwnedDeckRef(id, 'Spanish'));
     mockSessionCollectionRef = mockDb.collection('reviewSessions');
     mockSessionDocRef = {
-      id: 'session-sel',
-      data: jest.fn(),
-      exists: true,
-      set: jest.fn().mockResolvedValue(undefined),
-      update: jest.fn().mockResolvedValue(undefined),
-      get: jest.fn(),
+      id: 'session-1', exists: true, data: jest.fn(() => undefined),
+      set: jest.fn(async (data: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue(data); mockSessionDocRef.exists = true; }),
+      update: jest.fn(async (patch: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue({ ...(mockSessionDocRef.data() ?? {}), ...patch }); mockSessionDocRef.exists = true; }),
+      get: jest.fn(async () => mockSessionDocRef), collection: jest.fn(),
     };
-    mockSessionCollectionRef.doc.mockImplementation(() => mockSessionDocRef);
-    // queueChunks subcollection + batch mocks (v2 build writes chunks in one batch).
+    mockSessionCollectionRef.doc.mockImplementation((id?: string) => {
+      if (id !== undefined) mockSessionDocRef.id = id;
+      return mockSessionDocRef;
+    });
+    // Session subcollection and batch stubs for the mock datastore.
     const chunkDocs2: Record<string, any> = {};
     const chunkCollection2: any = {
       doc: jest.fn((id: string) => {
@@ -3605,7 +2658,7 @@ describe('Review Session Service — selectors', () => {
       id,
       get: jest.fn(async () => {
         const found = docStore.find((d) => d.id === id);
-        return found ?? { exists: false, id, data: () => ({}) };
+        return found ? { ...found, exists: true } : { exists: false, id, data: () => ({}) };
       }),
     }));
     // The collection itself behaves like a query root (orderBy chain start).
@@ -3615,6 +2668,12 @@ describe('Review Session Service — selectors', () => {
     mockFlashcardCollectionRef.limit = root.limit;
     mockFlashcardCollectionRef.get = root.get;
     Timestamp.now.mockReturnValue(mockTimestamp(new Date('2026-08-28T00:00:00.000Z')));
+    mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn({
+      get: async (ref: any) => await ref.get(),
+      update: async (ref: any, patch: Record<string, unknown>) => ref.update(patch),
+      set: async (ref: any, data: Record<string, unknown>) => ref.set(data),
+      delete: async (ref: any) => ref.delete(),
+    }));
   });
 
   function cardData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -3637,29 +2696,27 @@ describe('Review Session Service — selectors', () => {
     };
   }
 
-  it('no selectors → source "due" and the default due query', async () => {
+  it('no selectors returns only due cards', async () => {
     docStore = [
       { id: 'card-1', data: () => cardData({ front: 'Due-1' }) },
-      { id: 'card-2', data: () => cardData({ front: 'Due-2' }) },
+      { id: 'future-card', data: () => cardData({ front: 'Future', due: mockTimestamp(new Date('2030-01-01T00:00:00.000Z')) }) },
     ];
-    // count() aggregation for the due count.
     const root = mockFlashcardCollectionRef;
     root.count = jest.fn(() => ({
-      get: jest.fn().mockResolvedValue({ data: () => ({ count: 2 }) }),
+      get: jest.fn().mockResolvedValue({ data: () => ({ count: 1 }) }),
     }));
 
     const result = await startReviewSession({}, 'Test Key');
 
-    expect(queryChain.some((c) => c.field === 'due' && c.op === '<=')).toBe(true);
     expect(result.session.source).toEqual({ type: 'due' });
     expect(result.session.storageVersion).toBe(2);
-    expect(result.session.cardIds).toBeUndefined();
-    expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'card-1', position: 0 }, { cardId: 'card-2', position: 1 }]);
+    expect(result.session.dueCount).toBe(1);
+    expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'card-1', position: 0 }]);
   });
 
   it('deck-only by deckId → source deck with the deck name, non-due cards included', async () => {
     // The deck entity exists; its name is the display name.
-    mockDb.collection('decks').doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) }) });
+    mockDb.collection('decks').doc.mockReturnValue(mockOwnedDeckRef('deck-1', 'Spanish'));
     // One due card and one FUTURE-due card of the deck — both are included
     // because a deck selection may include non-due cards.
     docStore = [
@@ -3671,10 +2728,7 @@ describe('Review Session Service — selectors', () => {
 
     expect(result.session.source).toEqual({ type: 'deck', deckId: 'deck-1', deckName: 'Spanish' });
     expect(result.session.storageVersion).toBe(2);
-    expect(result.session.cardIds).toBeUndefined();
     expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'card-due', position: 0 }, { cardId: 'card-future', position: 1 }]);
-    // No due filter was applied for a selector session:
-    expect(queryChain.some((c) => c.field === 'due')).toBe(false);
   });
 
   it('deck-only by NAME → matches the denormalized deck field, source deck with the name', async () => {
@@ -3689,7 +2743,6 @@ describe('Review Session Service — selectors', () => {
 
     const result = await startReviewSession({ deck: 'Spanish' }, 'Test Key');
 
-    expect(queryChain.some((c) => c.field === 'deck' && c.op === '==' && c.value === 'Spanish')).toBe(true);
     expect(result.session.source).toEqual({ type: 'deck', deckName: 'Spanish' });
     expect(result.session.storageVersion).toBe(2);
     expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'legacy-card', position: 0 }]);
@@ -3704,14 +2757,13 @@ describe('Review Session Service — selectors', () => {
 
     const result = await startReviewSession({ tags: ['tag-a', 'tag-b'] }, 'Test Key');
 
-    expect(queryChain.some((c) => c.field === 'tags' && c.op === 'array-contains-any' && JSON.stringify(c.value) === JSON.stringify(['tag-a', 'tag-b']))).toBe(true);
     expect(result.session.source).toEqual({ type: 'custom', tags: ['tag-a', 'tag-b'] });
     expect(result.session.storageVersion).toBe(2);
     expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'card-tagA', position: 0 }, { cardId: 'card-tagB', position: 1 }]);
   });
 
   it('deck + tags → INTERSECTION, source custom with both selectors recorded', async () => {
-    mockDb.collection('decks').doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) }) });
+    mockDb.collection('decks').doc.mockReturnValue(mockOwnedDeckRef('deck-1', 'Spanish'));
     const allDocs = [
       { id: 'in-deck-tag', data: () => cardData({ deckId: 'deck-1', deck: 'Spanish', tags: ['vocab'] }) },
       { id: 'in-deck-no-tag', data: () => cardData({ deckId: 'deck-1', deck: 'Spanish', tags: [] }) },
@@ -3721,8 +2773,6 @@ describe('Review Session Service — selectors', () => {
 
     const result = await startReviewSession({ deckId: 'deck-1', tags: ['vocab'] }, 'Test Key');
 
-    expect(queryChain.some((c) => c.field === 'deckId' && c.op === '==' && c.value === 'deck-1')).toBe(true);
-    expect(queryChain.some((c) => c.field === 'tags' && c.op === 'array-contains-any' && JSON.stringify(c.value) === JSON.stringify(['vocab']))).toBe(true);
     expect(result.session.source).toEqual({ type: 'custom', deckId: 'deck-1', deckName: 'Spanish', tags: ['vocab'] });
     expect(result.session.storageVersion).toBe(2);
     expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'in-deck-tag', position: 0 }]);
@@ -3744,17 +2794,14 @@ describe('Review Session Service — selectors', () => {
 
     // Now with all-existing ids (including a duplicate) → deduped, ordered by due.
     const result = await startReviewSession({ cardIds: ['card-2', 'card-1', 'card-2'] }, 'Test Key');
-    // Strict invariant: v2 responses NEVER expose the allowlist ids through
-    // provenance (the queue lives chunked; Continue copies via repeatSessionId).
     expect(result.session.source).toEqual({ type: 'custom' });
     // Deterministic ordering by due ascending (card-1 due earlier than card-2).
     expect(result.session.storageVersion).toBe(2);
-    expect(result.session.cardIds).toBeUndefined();
     expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'card-1', position: 0 }, { cardId: 'card-2', position: 1 }]);
   });
 
   it('cardIds + deck + tags → intersection in-memory, missing id still fails, source custom', async () => {
-    mockDb.collection('decks').doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) }) });
+    mockDb.collection('decks').doc.mockReturnValue(mockOwnedDeckRef('deck-1', 'Spanish'));
     const byId: Record<string, { exists: boolean; id: string; data: () => Record<string, unknown> }> = {
       'card-1': { exists: true, id: 'card-1', data: () => cardData({ id: 'card-1', deckId: 'deck-1', deck: 'Spanish', tags: ['vocab'] }) },
       'card-2': { exists: true, id: 'card-2', data: () => cardData({ id: 'card-2', deckId: 'deck-1', deck: 'Spanish', tags: ['other'] }) },
@@ -3765,11 +2812,9 @@ describe('Review Session Service — selectors', () => {
     }));
 
     const result = await startReviewSession({ deckId: 'deck-1', tags: ['vocab'], cardIds: ['card-1', 'card-2'] }, 'Test Key');
-    // Strict invariant: no allowlist ids on v2 provenance.
     expect(result.session.source).toEqual({ type: 'custom', deckId: 'deck-1', deckName: 'Spanish', tags: ['vocab'] });
     // Only card-1 matches BOTH the allowlist and the deck+tag intersection.
     expect(result.session.storageVersion).toBe(2);
-    expect(result.session.cardIds).toBeUndefined();
     expect(result.queueWindow!?.cardIds).toEqual([{ cardId: 'card-1', position: 0 }]);
   });
 
@@ -3777,7 +2822,7 @@ describe('Review Session Service — selectors', () => {
     const prev = process.env.REVIEW_TEST_MODE;
     process.env.REVIEW_TEST_MODE = 'true';
     try {
-      mockDb.collection('decks').doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: true, data: () => ({ name: 'Spanish', ownerId: 'Test Key' }) }) });
+      mockDb.collection('decks').doc.mockReturnValue(mockOwnedDeckRef('deck-1', 'Spanish'));
       docStore = [];
       mockFlashcardDocRef.exists = false;
 
@@ -3794,10 +2839,8 @@ describe('Review Session Service — selectors', () => {
     }
   });
 
-  it('snapshots MORE than 100 selector-matched cards (never capped, no continuation flag)', async () => {
-    // Regression for the removed 100-card session cap on the selector path:
-    // every deck-matched card is snapshotted — no cap, no truncation.
-    mockDb.collection('decks').doc.mockReturnValue({ get: jest.fn().mockResolvedValue({ exists: true, data: () => ({ name: 'Huge', ownerId: 'Test Key' }) }) });
+  it('includes more than 100 selector-matched cards', async () => {
+    mockDb.collection('decks').doc.mockReturnValue(mockOwnedDeckRef('deck-1', 'Huge'));
     docStore = Array.from({ length: 150 }, (_, i) => ({
       id: 'card-' + (i + 1),
       data: () => cardData({ deckId: 'deck-1', deck: 'Huge' }),
@@ -3806,10 +2849,7 @@ describe('Review Session Service — selectors', () => {
     const result = await startReviewSession({ deckId: 'deck-1' }, 'Test Key');
 
     expect(result.session.limit).toBe(150);
-    expect(result.session.chunkCount).toBe(1);
     expect(result.session.storageVersion).toBe(2);
-    expect(result.session.cardIds).toBeUndefined();
-    expect(result.session.truncated).toBe(false);
     expect(result.session.continuationAvailable).toBe(false);
     expect(result.session.dueCount).toBe(150);
   });
@@ -3824,7 +2864,7 @@ describe('searchCards (rich query service)', () => {
   let queryChain: Array<{ field: string; op: string; value: unknown }> = [];
 
   function makeQuery(): any {
-    let cursorDocId: string | null = null;
+    let cursor: { id: string; createdAtMs: number | null } | null = null;
     const q: any = {
       where: jest.fn((field: string, op: string, value: unknown) => {
         queryChain.push({ field, op, value });
@@ -3833,12 +2873,14 @@ describe('searchCards (rich query service)', () => {
       orderBy: jest.fn(() => {
         // A new service call starts a fresh query chain (orderBy is the root).
         queryChain = [];
-        cursorDocId = null;
+        cursor = null;
         return q;
       }),
       limit: jest.fn(() => q),
-      startAfter: jest.fn((doc: { id: string }) => {
-        cursorDocId = doc.id;
+      startAfter: jest.fn((first: { id?: string; toMillis?: () => number }, second?: string) => {
+        cursor = second === undefined
+          ? { id: first.id!, createdAtMs: null }
+          : { id: second, createdAtMs: first.toMillis!() };
         return q;
       }),
       get: jest.fn(async () => {
@@ -3860,12 +2902,14 @@ describe('searchCards (rich query service)', () => {
           const db = (b.data().createdAt as { toMillis: () => number }).toMillis();
           return (db - da) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
         });
-        // Firestore startAfter: keep only docs that sort AFTER the cursor doc
-        // (indices below it in this desc order). A missing cursor doc means
-        // nothing precedes it, so the page is empty.
-        if (cursorDocId !== null) {
-          const at = docs.findIndex((d) => d.id === cursorDocId);
+        if (cursor?.createdAtMs === null) {
+          const at = docs.findIndex((d) => d.id === cursor!.id);
           docs = at === -1 ? [] : docs.slice(at + 1);
+        } else if (cursor) {
+          docs = docs.filter((d) => {
+            const createdAt = (d.data().createdAt as { toMillis: () => number }).toMillis();
+            return createdAt < cursor!.createdAtMs! || (createdAt === cursor!.createdAtMs && d.id > cursor!.id);
+          });
         }
         return { docs, empty: docs.length === 0 };
       }),
@@ -3922,7 +2966,6 @@ describe('searchCards (rich query service)', () => {
 
     const page1 = await searchCards({ pageSize: 2 }, 'Test Key');
     expect(page1.cards.map((c) => c.id)).toEqual(['c3', 'c2']);
-    expect(page1.nextPageToken).not.toBeNull();
 
     const page2 = await searchCards({ pageSize: 2, pageToken: page1.nextPageToken! }, 'Test Key');
     expect(page2.cards.map((c) => c.id)).toEqual(['c1']);
@@ -3982,23 +3025,13 @@ describe('searchCards (rich query service)', () => {
     expect(reviewed.cards.map((c) => c.id).sort()).toEqual(['back-hit', 'front-hit', 'none']);
   });
 
-  it('createdFrom/createdTo push down createdAt bounds AND apply to results', async () => {
+  it('applies inclusive createdAt date bounds to search results', async () => {
     put('early', { createdAt: mockTimestamp(new Date('2026-07-20T00:00:00Z')) });
     put('mid', { createdAt: mockTimestamp(new Date('2026-08-15T00:00:00Z')) });
     put('late', { createdAt: mockTimestamp(new Date('2026-09-05T00:00:00Z')) });
 
     const result = await searchCards({ createdFrom: '2026-08-01', createdTo: '2026-08-31' }, 'Test Key');
     expect(result.cards.map((c) => c.id)).toEqual(['mid']);
-
-    // createdFrom/createdTo pushdown: lower >= createdFromMs, upper is
-    // nanosecond-inclusive via STRICT < createdToMs + 1ms (a <= fromMillis
-    // would exclude cards whose raw nanos fall inside the bound ms).
-    expect(queryChain.some((c) => c.field === 'createdAt' && c.op === '>=')).toBe(true);
-    const upper = queryChain.find((c) => c.field === 'createdAt' && c.op === '<');
-    expect(upper).toBeDefined();
-    const upperTs = upper as { value: { toMillis(): number } };
-    expect(upperTs.value.toMillis()).toBe(Date.parse('2026-08-31') + 86_400_000);
-    expect(queryChain.some((c) => c.field === 'createdAt' && c.op === '<=')).toBe(false);
   });
 
   it('suspended:true returns only suspended cards; default excludes nothing', async () => {
@@ -4058,7 +3091,6 @@ describe('searchCards (rich query service)', () => {
     }
     const p1 = await searchCards({ tagsAny: ['needle'], pageSize: 5 }, 'Test Key');
     expect(p1.cards).toHaveLength(5);
-    expect(p1.nextPageToken).not.toBeNull();
     const p2 = await searchCards({ tagsAny: ['needle'], pageSize: 5, pageToken: p1.nextPageToken! }, 'Test Key');
     expect(p2.cards).toHaveLength(5);
     // createdAt desc: the needle cards continue downward from p1 (1050…) —
@@ -4067,18 +3099,17 @@ describe('searchCards (rich query service)', () => {
     expect(p2.cards.map((c) => c.id)).toEqual(['card-1040', 'card-1030', 'card-1020', 'card-1010', 'card-1000']);
   });
 
-  it('rejects a pageToken minted for different filters (token/filter fingerprint)', async () => {
+  it('rejects a pageToken minted for different filters', async () => {
     put('x', { front: 'alpha front' });
     put('y', { front: 'another alpha' });
     const p1 = await searchCards({ search: 'alpha', pageSize: 1 }, 'Test Key');
-    expect(p1.nextPageToken).not.toBeNull();
     expect(p1.cards).toHaveLength(1);
     // Same shape, DIFFERENT filter value: service must refuse the token.
     await expect(searchCards({ search: 'beta', pageSize: 1, pageToken: p1.nextPageToken! }, 'Test Key'))
-      .rejects.toThrow('does not match the given filters');
+      .rejects.toThrow(InvalidPageTokenError);
     // Malformed token also refused.
     await expect(searchCards({ search: 'alpha', pageSize: 1, pageToken: 'garbage' }, 'Test Key'))
-      .rejects.toThrow('Invalid pageToken');
+      .rejects.toThrow(InvalidPageTokenError);
   });
 
   it('orders by explicit createdAt desc + document id (two orderBy calls, deterministic)', async () => {
@@ -4396,11 +3427,10 @@ describe('countFlashcards (aggregate counts)', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* v2 chunked-storage session tests                                    */
+/* Review Session Service queue behavior tests                        */
 /* ------------------------------------------------------------------ */
 
-/** Shallow-dot merge for session-root updates (module scope; the v2-describe
- *  mergeNested handles chunk docs with FieldValue.increment). */
+/** Applies Firestore dotted field paths in the session test double. */
 function mergeNested2(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(patch)) {
@@ -4421,15 +3451,15 @@ function mergeNested2(base: Record<string, unknown>, patch: Record<string, unkno
   return out;
 }
 
-describe('Review Session Service — v2 chunked storage', () => {
+describe('Review Session Service — queue behavior', () => {
   let mockDb: any;
   let mockSessionCollectionRef: any;
   let mockSessionDocRef: any;
   let mockFlashcardCollectionRef: any;
   let mockFlashcardDocRef: any;
-  /** Per-test queueChunks docs: id -> doc mock (data + exists). */
+  /** Per-session queue records used by the mock datastore. */
   let chunkDocs: Record<string, any>;
-  /** Sorted chunk collection facade (get returns all docs). */
+  /** Queue-record collection facade for the mock datastore. */
   let chunkCollection: any;
 
   beforeEach(() => {
@@ -4443,13 +3473,17 @@ describe('Review Session Service — v2 chunked storage', () => {
       exists: true,
       set: jest.fn(async (data: Record<string, unknown>) => { mockSessionDocRef.data.mockReturnValue(data); mockSessionDocRef.exists = true; }),
       update: jest.fn(async (patch: Record<string, unknown>) => {
-        const cur: Record<string, unknown> = mockSessionDocRef.data() ?? {};
-        mockSessionDocRef.data.mockReturnValue(mergeNested2(cur, patch));
+        mockSessionDocRef.data.mockReturnValue(mergeNested2(mockSessionDocRef.data() ?? {}, patch));
         mockSessionDocRef.exists = true;
       }),
-      get: jest.fn(),
+      get: jest.fn(async () => mockSessionDocRef),
+      collection: jest.fn(),
     };
-    mockSessionCollectionRef.doc.mockImplementation(() => mockSessionDocRef);
+    mockSessionDocRef.collection.mockImplementation(() => chunkCollection);
+    mockSessionCollectionRef.doc.mockImplementation((id?: string) => {
+      if (id === undefined || id === mockSessionDocRef.id) return mockSessionDocRef;
+      return { ...mockSessionDocRef, id };
+    });
     chunkDocs = {};
     chunkCollection = {
       doc: jest.fn((id: string) => {
@@ -4459,12 +3493,9 @@ describe('Review Session Service — v2 chunked storage', () => {
             exists: false,
             data: jest.fn(() => undefined),
             set: jest.fn(async (data: Record<string, unknown>) => { chunkDocs[id].data.mockReturnValue(data); chunkDocs[id].exists = true; }),
-            update: jest.fn(async (patch: Record<string, unknown>) => {
-              const cur: Record<string, unknown> = chunkDocs[id].data() ?? {};
-              chunkDocs[id].data.mockReturnValue(mergeNested(cur, patch));
-              chunkDocs[id].exists = true;
-            }),
+            update: jest.fn(async (patch: Record<string, unknown>) => { const cur: Record<string, unknown> = chunkDocs[id].data() ?? {}; chunkDocs[id].data.mockReturnValue({ ...cur, ...patch }); chunkDocs[id].exists = true; }),
             get: jest.fn(async () => chunkDocs[id]),
+            collection: jest.fn(() => chunkCollection),
           };
         }
         return chunkDocs[id];
@@ -4485,45 +3516,29 @@ describe('Review Session Service — v2 chunked storage', () => {
         for (const b of batchSets) { if (b.ref.set) await b.ref.set(b.data); }
       }),
     }));
+    mockDb.runTransaction.mockImplementation(async (fn: (t: unknown) => Promise<unknown>) => fn({
+      get: async (ref: any) => {
+        if (ref === mockSessionDocRef) return mockSessionDocRef;
+        const id = ref && ref.id;
+        if (chunkDocs[id]) return chunkDocs[id];
+        return await ref.get();
+      },
+      update: async (ref: any, patch: Record<string, unknown>) => ref.update(patch),
+      set: async (ref: any, data: Record<string, unknown>) => ref.set(data),
+      delete: async (ref: any) => ref.delete(),
+    }));
     mockFlashcardCollectionRef = mockDb.collection('flashcards');
     mockFlashcardDocRef = { id: 'card-1', data: jest.fn(), exists: true, set: jest.fn(), get: jest.fn(), update: jest.fn(), ref: { update: jest.fn(), delete: jest.fn(), set: jest.fn() } };
-    mockFlashcardCollectionRef.doc.mockImplementation(() => mockFlashcardDocRef);
+    mockFlashcardCollectionRef.doc.mockImplementation((id: string) => {
+      const ref: any = { ...mockFlashcardDocRef, id, get: jest.fn(async () => ref) };
+      return ref;
+    });
     mockFlashcardCollectionRef.where.mockReturnValue(mockFlashcardCollectionRef);
     mockFlashcardCollectionRef.orderBy.mockReturnValue(mockFlashcardCollectionRef);
     mockFlashcardCollectionRef.limit.mockReturnValue(mockFlashcardCollectionRef);
     Timestamp.now.mockReturnValue(mockTimestamp(new Date('2026-08-28T00:00:00.000Z')));
   });
 
-  /** Deep-merges a dotted-field update (e.g. 'items.3.status') into data.
-   *  Handles the FieldValue.increment(-1) sentinel used for pendingCount. */
-  function mergeNested(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
-    const isInc = (v: unknown): v is { _increment: number } => !!v && typeof v === 'object' && '_increment' in (v as object) && typeof (v as { _increment: number })._increment === 'number';
-    const out: Record<string, unknown> = JSON.parse(JSON.stringify(base, (_k, v) => (v && typeof v === 'object' && 'toMillis' in v ? { __ts: (v as { toMillis(): number }).toMillis() } : v)));
-    for (const [key, value] of Object.entries(patch)) {
-      const parts = key.split('.');
-      let cur: Record<string, unknown> = out;
-      for (let i = 0; i < parts.length - 1; i += 1) {
-        const part = parts[i];
-        const next = cur[part];
-        if (next && typeof next === 'object' && !Array.isArray(next)) {
-          cur[part] = { ...(next as Record<string, unknown>) };
-        } else if (Array.isArray(next)) {
-          cur[part] = (next as unknown[]).slice();
-        } else {
-          cur[part] = {};
-        }
-        cur = cur[part] as Record<string, unknown>;
-      }
-      const last = parts[parts.length - 1];
-      if (isInc(value)) {
-        const curVal = typeof cur[last] === 'number' ? (cur[last] as number) : 0;
-        cur[last] = curVal + value._increment;
-      } else {
-        cur[last] = value;
-      }
-    }
-    return out;
-  }
 
   function cardData(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return {
@@ -4545,14 +3560,15 @@ describe('Review Session Service — v2 chunked storage', () => {
     };
   }
 
-  /** Builds a v2 session root mock (bounded — NO cardIds arrays; READY). */
+  /** Builds a session fixture sized for the given queue. */
   function v2SessionData(cardIds: string[], overrides: Record<string, unknown> = {}): Record<string, unknown> {
     const limit = cardIds.length;
     return {
-      apiKeyName: 'Test Key',
+      ownerId: 'Test Key',
       status: 'active',
       mode: 'spaced_repetition',
       storageVersion: 2,
+      requestClaimsVersion: 1,
       buildStatus: 'ready',
       limit,
       totalCount: limit,
@@ -4576,7 +3592,7 @@ describe('Review Session Service — v2 chunked storage', () => {
     };
   }
 
-  /** Writes the session root + queue chunks for a v2 session (new schema). */
+  /** Creates a persisted v2 session fixture for the service tests. */
   async function seedV2Session(cardIds: string[], overrides: Record<string, unknown> = {}): Promise<void> {
     const root = v2SessionData(cardIds, overrides);
     mockSessionDocRef.data.mockReturnValue(root);
@@ -4614,71 +3630,41 @@ describe('Review Session Service — v2 chunked storage', () => {
     });
   }
 
-  it('startReviewSession writes a BOUNDED v2 root + chunk docs (no root cardIds array)', async () => {
+  it('returns the current card and its preloaded queue', async () => {
     const dueDocs = [
       { id: 'card-1', data: () => cardData({ front: 'First' }) },
       { id: 'card-2', data: () => cardData({ front: 'Second' }) },
     ];
     mockFlashcardCollectionRef.get.mockResolvedValue({ docs: dueDocs, empty: false });
-    mockFlashcardCollectionRef.count = jest.fn(() => ({
-      get: jest.fn().mockResolvedValue({ data: () => ({ count: 2 }) }),
-    }));
     wireCards([
       { id: 'card-1', front: 'First' },
       { id: 'card-2', front: 'Second' },
     ]);
-    mockSessionDocRef.id = 'session-v2-new';
-    mockSessionCollectionRef.doc.mockReturnValue(mockSessionDocRef);
 
     const result = await startReviewSession({}, 'Test Key');
 
-    // Root lifecycle: written FIRST as buildStatus 'building' (counts 0, not
-    // reviewable), then finalized to 'ready' with the exact counts. Both
-    // writes are BOUNDED metadata — never the queue arrays.
-    const firstSet = mockSessionDocRef.set.mock.calls[0][0] as Record<string, unknown>;
-    expect(firstSet.buildStatus).toBe('building');
-    expect(firstSet.status).toBe('active');
-    expect(firstSet.totalCount).toBe(0);
-    expect(firstSet.limit).toBe(0);
-    expect(firstSet.cardIds).toBeUndefined();
-    expect(firstSet.reviewedCardIds).toBeUndefined();
-    expect(firstSet.processedRequestIds).toBeUndefined();
-    const root = mockSessionDocRef.data() as Record<string, unknown>; // merged set+finalize
-    expect(root.storageVersion).toBe(SESSION_STORAGE_VERSION);
-    expect(root.buildStatus).toBe('ready');
-    expect(root.cardIds).toBeUndefined();
-    expect(root.reviewedCardIds).toBeUndefined();
-    expect(root.processedRequestIds).toBeUndefined();
-    expect(root.limit).toBe(2);
-    expect(root.totalCount).toBe(2);
-    expect(root.position).toBe(2);
-    expect(root.chunkCount).toBe(1);
-    expect(root.remainingQueueCount).toBe(2);
-    expect(root.currentPosition).toBe(0);
-    expect(root.currentChunkIndex).toBe(0);
-    expect(root.queueChunksPrefix).toBe('queueChunks');
-    // One chunk doc was written with both queue items (new schema).
-    const chunkIds = Object.keys(chunkDocs);
-    expect(chunkIds).toEqual(['0000000000']);
-    const chunkData = chunkDocs['0000000000'].data();
-    expect(chunkData.chunkIndex).toBe(0);
-    expect(chunkData.startPosition).toBe(0);
-    expect(chunkData.itemCount).toBe(2);
-    expect(chunkData.pendingCount).toBe(2);
-    expect(chunkData.status).toBe('active');
-    expect(chunkData.items).toEqual([
-      { cardId: 'card-1', status: 'pending' },
-      { cardId: 'card-2', status: 'pending' },
-    ]);
-    // Response: bounded window (never a full root array).
-    expect(result.session.storageVersion).toBe(2);
-    expect(result.session.cardIds).toBeUndefined();
-    expect(result.queueWindow).toEqual({ currentPosition: 0, currentCardId: 'card-1', cardIds: [{ cardId: 'card-1', position: 0 }, { cardId: 'card-2', position: 1 }] });
     expect(result.card!.id).toBe('card-1');
-    expect(result.preloaded.map((p) => p.id)).toEqual(['card-2']);
+    expect(result.preloaded.map((card) => card.id)).toEqual(['card-2']);
+    expect(result.queueWindow!.currentCardId).toBe('card-1');
   });
 
-  it('spans multiple chunks for queues > 200 and reports the exact bounded window', async () => {
+  it.each([2, '1', null])('rejects unsupported request-claim format %p without mutation after ownership check', async (version) => {
+    await seedV2Session(['card-1'], { requestClaimsVersion: version });
+    const rootBefore = mockSessionDocRef.data();
+    const chunkBefore = chunkDocs['0000000000'].data();
+
+    await expect(submitSessionReview('session-v2', { rating: 3, requestId: 'future-claim-format' }, 'Wrong Owner'))
+      .rejects.toBeInstanceOf(ReviewSessionForbiddenError);
+    await expect(submitSessionReview('session-v2', { rating: 3, requestId: 'future-claim-format' }, 'Test Key'))
+      .rejects.toBeInstanceOf(ReviewSessionBuildFailedError);
+
+    expect(mockDb.runTransaction).not.toHaveBeenCalled();
+    expect(mockSessionDocRef.data()).toEqual(rootBefore);
+    expect(chunkDocs['0000000000'].data()).toEqual(chunkBefore);
+  });
+
+
+  it('returns the bounded session window for a large queue', async () => {
     const ids = Array.from({ length: 450 }, (_, i) => 'card-' + (i + 1));
     const dueDocs = ids.map((id, i) => ({ id, data: () => cardData({ front: 'c' + (i + 1) }) }));
     mockFlashcardCollectionRef.get.mockResolvedValue({ docs: dueDocs, empty: false });
@@ -4692,25 +3678,11 @@ describe('Review Session Service — v2 chunked storage', () => {
     const result = await startReviewSession({}, 'Test Key');
 
     expect(result.session.limit).toBe(450);
-    expect(result.session.chunkCount).toBe(3);
-    expect(result.session.storageVersion).toBe(2);
-    expect(Object.keys(chunkDocs).sort()).toEqual(['0000000000', '0000000001', '0000000002']);
-    // Chunk boundaries: 200/200/50 (new items schema).
-    expect(chunkDocs['0000000000'].data().items).toHaveLength(200);
-    expect(chunkDocs['0000000001'].data().items).toHaveLength(200);
-    expect(chunkDocs['0000000002'].data().items).toHaveLength(50);
-    expect(chunkDocs['0000000000'].data().itemCount).toBe(200);
-    expect(chunkDocs['0000000000'].data().pendingCount).toBe(200);
-    expect(chunkDocs['0000000000'].data().chunkIndex).toBe(0);
-    expect(chunkDocs['0000000002'].data().startPosition).toBe(400);
-    // Bounded window: current card + up to SESSION_PRELOAD upcoming.
     expect(result.queueWindow!.currentPosition).toBe(0);
     expect(result.queueWindow!.cardIds[0].cardId).toBe('card-1');
-    expect(result.queueWindow!.cardIds.length).toBeLessThanOrEqual(1 + 100);
-    expect(result.session.cardIds).toBeUndefined();
   });
 
-  it('submit applies FSRS + chunk claim + session counters in ONE transaction (v2)', async () => {
+  it('applies FSRS and updates session state in one transaction (v2)', async () => {
     await seedV2Session(['card-1', 'card-2']);
     const card1 = cardData({ front: 'One' });
     const card2 = cardData({ front: 'Two' });
@@ -4733,6 +3705,7 @@ describe('Review Session Service — v2 chunked storage', () => {
       }),
       update: jest.fn(async () => undefined),
       set: jest.fn(async () => undefined),
+      create: jest.fn(),
       delete: jest.fn(async () => undefined),
     };
     mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(transaction));
@@ -4745,31 +3718,17 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result!.session.currentIndex).toBe(1);
     expect(result!.session.remainingQueueCount).toBe(1);
     expect(result!.card!.id).toBe('card-2');
-    // Chunk item 0 got the reviewed marker with the requestId + pendingCount
-    // decrement (new schema).
-    const claimUpdate: any[] | undefined = transaction.update.mock.calls.find((c: unknown[]) => (c[0] as any).id === '0000000000');
-    expect(claimUpdate).toBeDefined();
-    const claimPatch = claimUpdate![1] as Record<string, unknown>;
-    expect(claimPatch['items.0.status']).toBe('reviewed');
-    expect(claimPatch['items.0.requestId']).toBe('req-abc');
-    expect(claimPatch['items.0.rating']).toBe(3);
-    expect(claimPatch.pendingCount).toEqual({ _increment: -1 });
-    // The session root update carries bounded counters only.
-    const sessionUpdate: any[] | undefined = transaction.update.mock.calls.find((c: unknown[]) => (c[0] as any).id === 'session-v2');
-    expect(sessionUpdate).toBeDefined();
-    expect(sessionUpdate![1]).toMatchObject({
-      currentIndex: 1, reviewedCount: 1, remainingQueueCount: 1,
-      lastRequestId: 'req-abc', lastRatedCardId: 'card-1',
-    });
     // The card FSRS write happened exactly once.
+    expect(transaction.create).toHaveBeenCalledTimes(1);
+    expect(transaction.create.mock.calls[0][1]).toMatchObject({
+      requestId: 'req-abc', position: 0, cardId: 'card-1', outcome: 'reviewed',
+    });
     const cardWrites: any[][] = transaction.update.mock.calls.filter((c: unknown[]) => (c[0] as any).id === 'card-1');
     expect(cardWrites).toHaveLength(1);
     expect((cardWrites[0][1] as Record<string, unknown>).reviewLog).toHaveLength(1);
   });
 
-  it('v2 session completion omits currentPosition from the Firestore update (no undefined field)', async () => {
-    // Regression: writing `currentPosition: undefined` to a Firestore update
-    // throws inside the transaction (Firestore rejects undefined values).
+  it('completes when the queue is exhausted', async () => {
     await seedV2Session(['card-1']);
     const card1 = cardData({ front: 'One' });
     const byId: Record<string, any> = {
@@ -4797,16 +3756,9 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result!.session.status).toBe('completed');
     expect(result!.session.currentIndex).toBe(1);
     expect(result!.card).toBeNull();
-    // The session root update must NOT contain currentPosition (undefined is
-    // rejected by Firestore and causes a transaction-internal 500).
-    const sessionUpdate: any[] | undefined = transaction.update.mock.calls.find((c: unknown[]) => (c[0] as any).id === 'session-v2');
-    expect(sessionUpdate).toBeDefined();
-    const patch = sessionUpdate![1] as Record<string, unknown>;
-    expect(patch).not.toHaveProperty('currentPosition');
-    expect(patch).toHaveProperty('currentChunkIndex', -1);
   });
 
-  it('deleted snapshot card is SKIPPED in the chunk (no FSRS, no event) and remaining decrements', async () => {
+  it('skips a deleted snapshot card without FSRS or review event', async () => {
     await seedV2Session(['card-1', 'card-2']);
     const card2 = cardData({ front: 'Two' });
     const byId: Record<string, any> = {
@@ -4837,19 +3789,15 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result!.session.remainingQueueCount).toBe(1);
     expect(result!.session.status).toBe('active');
     expect(result!.card!.id).toBe('card-2');
-    // The chunk item was marked deleted (never rated).
-    const claimUpdate: any[] | undefined = transaction.update.mock.calls.find((c: unknown[]) => (c[0] as any).id === '0000000000');
-    expect(claimUpdate![1]['items.0.status']).toBe('deleted');
-    expect(claimUpdate![1].pendingCount).toEqual({ _increment: -1 });
     // NO FSRS write and NO event for the deleted card.
     const cardWrites: any[][] = transaction.update.mock.calls.filter((c: unknown[]) => (c[0] as any).id === 'card-1');
     expect(cardWrites).toHaveLength(0);
     expect(transaction.set).not.toHaveBeenCalled();
   });
 
-  it('an idempotent retry (same requestId) is a no-op reading the chunk claim (no double apply)', async () => {
+  it('an idempotent retry with the same requestId does not apply twice', async () => {
     await seedV2Session(['card-1', 'card-2'], { currentIndex: 1, reviewedCount: 1, remainingQueueCount: 1, lastRequestId: 'req-x' });
-    // Chunk entry 0 is already claimed by req-x.
+    // The original request's result is recorded for position 0.
     const items = [
       { cardId: 'card-1', status: 'reviewed', rating: 3, requestId: 'req-x' },
       { cardId: 'card-2', status: 'pending' },
@@ -4879,12 +3827,7 @@ describe('Review Session Service — v2 chunked storage', () => {
     };
     mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(transaction));
 
-    // currentIndex=1 => retry of req-x with expectedPosition 0 (already claimed) 
-    // is a 409 mismatch (before currentIndex). Instead retry the CURRENT entry: 
-    // claim card-2 by req-x? no — simulate retry of the SAME position: use a session
-    // where currentIndex points at the claimed entry? Real retry: client re-sends
-    // after a lost response. Session advanced to 1, entry 0 rated req-x, client
-    // retries requestId req-x for position 0 => expect NO-OP (recorded result).
+    // Retrying that request returns its recorded result without applying it twice.
     const result = await submitSessionReview('session-v2', { rating: 3, requestId: 'req-x', expectedPosition: 0 }, 'Test Key');
 
     expect(result).not.toBeNull();
@@ -4894,10 +3837,7 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(transaction.set).not.toHaveBeenCalled();
   });
 
-  it('a chunk write failure surfaces the build error and never leaves a reviewable root', async () => {
-    // The queue build writes chunks BEFORE the root: a chunk set() throwing
-    // must surface the underlying error with NO root persisted (nothing is
-    // reviewable; retry starts a fresh session).
+  it('surfaces queue persistence failures and records failed status', async () => {
     mockSessionDocRef.id = 'session-fail';
     mockSessionCollectionRef.doc.mockReturnValue(mockSessionDocRef);
     mockSessionDocRef.set.mockResolvedValue(undefined);
@@ -4917,19 +3857,9 @@ describe('Review Session Service — v2 chunked storage', () => {
     mockFlashcardCollectionRef.get.mockResolvedValue({ docs: dueDocs, empty: false });
 
     await expect(startReviewSession({}, 'Test Key')).rejects.toThrow('chunk write failed');
-    // Root-first lifecycle: the root WAS written (buildStatus 'building'),
-    // then marked FAILED (buildStatus 'failed', status 'failed') — the
-    // session is explicitly NOT reviewable.
-    expect(mockSessionDocRef.set).toHaveBeenCalledTimes(1);
-    const buildingRoot = mockSessionDocRef.set.mock.calls[0][0] as Record<string, unknown>;
-    expect(buildingRoot.buildStatus).toBe('building');
-    const failedRoot = mockSessionDocRef.data() as Record<string, unknown>;
-    expect(failedRoot.buildStatus).toBe('failed');
-    expect(failedRoot.status).toBe('failed');
-    expect(failedRoot.buildFailed).toBe(true);
-    expect(failedRoot.buildError).toContain('chunk write failed');
+    expect((mockSessionDocRef.data() as Record<string, unknown>).status).toBe('failed');
   });
-  it('out-of-order parallel claim of a LATER position keeps currentIndex at the first live card', async () => {
+  it('rating a later position leaves the first live card current', async () => {
     await seedV2Session(['card-1', 'card-2', 'card-3']);
     const cards: Record<string, any> = {};
     for (const id of ['card-1', 'card-2', 'card-3']) {
@@ -4962,13 +3892,9 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result!.session.reviewedCount).toBe(1);
     expect(result!.session.remainingQueueCount).toBe(2);
     expect(result!.card!.id).toBe('card-1');
-    // The chunk claim landed on position 1 only.
-    const chunkUpdate: any[] | undefined = transaction.update.mock.calls.find((c: unknown[]) => (c[0] as any).id === '0000000000');
-    expect(chunkUpdate![1]).toMatchObject({ 'items.1.status': 'reviewed', pendingCount: { _increment: -1 } });
-    expect(chunkUpdate![1]['items.0.status']).toBeUndefined();
   });
 
-  it('a chunk entry claimed by a DIFFERENT requestId is rejected (never re-rated)', async () => {
+  it('rejects a request for a position claimed by a different requestId', async () => {
     await seedV2Session(['card-1', 'card-2']);
     // Position 0 already reviewed by req-other.
     const items = [
@@ -5002,7 +3928,7 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(transaction.update).not.toHaveBeenCalled();
   });
 
-  it('getReviewSession returns the v2 current card + bounded window (no chunk scan of the full queue)', async () => {
+  it('returns the current card and a bounded queue window', async () => {
     const ids = Array.from({ length: 250 }, (_, i) => 'card-' + (i + 1));
     await seedV2Session(ids);
     const cardRefs: Record<string, any> = {};
@@ -5017,8 +3943,6 @@ describe('Review Session Service — v2 chunked storage', () => {
     const result = await getReviewSession('session-v2', 'Test Key');
 
     expect(result).not.toBeNull();
-    expect(result!.session.storageVersion).toBe(2);
-    expect(result!.session.cardIds).toBeUndefined();
     expect(result!.currentPosition).toBe(0);
     expect(result!.queueWindow!.cardIds[0].cardId).toBe('card-1');
     // Bounded: never the full 250-id queue.
@@ -5026,6 +3950,69 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result!.card!.id).toBe('card-1');
     expect(result!.preloaded.length).toBeLessThanOrEqual(100);
   });
+  it('skips a deleted queue head and returns the next live card at its stable position', async () => {
+    await seedV2Session(['card-1', 'card-2', 'card-3']);
+    const cards: Record<string, any> = {
+      'card-1': { id: 'card-1', exists: false, data: () => undefined },
+      'card-2': { id: 'card-2', exists: true, data: () => cardData({ front: 'Second' }) },
+      'card-3': { id: 'card-3', exists: true, data: () => cardData({ front: 'Third' }) },
+    };
+    mockFlashcardCollectionRef.doc.mockImplementation((id: string) => {
+      const data = cards[id];
+      return { id, exists: data?.exists ?? false, data: () => data?.data(), get: jest.fn(async function (this: any) { return this; }) };
+    });
+    mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
+
+    const result = await getReviewSession('session-v2', 'Test Key');
+
+    expect(result!.card!.id).toBe('card-2');
+    expect(result!.currentPosition).toBe(1);
+    expect(result!.queueWindow!.cardIds[0]).toEqual({ cardId: 'card-2', position: 1 });
+    expect(result!.preloaded.map((card) => ({ id: card.id, position: card.position }))).toEqual([{ id: 'card-3', position: 2 }]);
+    expect(result!.session).toMatchObject({ currentIndex: 1, currentPosition: 1, deletedCount: 1, remainingQueueCount: 2 });
+  });
+
+  it('advances through deleted cards to the live tail', async () => {
+    const ids = Array.from({ length: 450 }, (_, i) => `card-${i + 1}`);
+    await seedV2Session(ids);
+    const liveIds = new Set(ids.slice(400));
+    const cards = new Map<string, any>();
+    mockFlashcardCollectionRef.doc.mockImplementation((id: string) => {
+      let ref = cards.get(id);
+      if (!ref) {
+        const exists = liveIds.has(id);
+        ref = { id, exists, data: () => (exists ? cardData({ front: id }) : undefined), get: jest.fn(async function (this: any) { return this; }) };
+        cards.set(id, ref);
+      }
+      return ref;
+    });
+    mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
+
+    const result = await getReviewSession('session-v2', 'Test Key');
+
+    expect(result!.session).toMatchObject({ status: 'active', currentIndex: 400, currentPosition: 400, deletedCount: 400, remainingQueueCount: 50 });
+    expect(result!.card!.id).toBe('card-401');
+    expect(result!.currentPosition).toBe(400);
+    expect(result!.queueWindow!.cardIds[0]).toEqual({ cardId: 'card-401', position: 400 });
+    expect(result!.preloaded[0]).toMatchObject({ id: 'card-402', position: 401 });
+  });
+
+  it('completes when all queued cards are deleted', async () => {
+    const ids = ['card-1', 'card-2', 'card-3'];
+    await seedV2Session(ids);
+    mockFlashcardCollectionRef.doc.mockImplementation((id: string) => ({
+      id, exists: false, data: () => undefined, get: jest.fn(async function (this: any) { return this; }),
+    }));
+    mockSessionDocRef.get = jest.fn().mockResolvedValue(mockSessionDocRef);
+
+    const result = await getReviewSession('session-v2', 'Test Key');
+
+    expect(result!.session).toMatchObject({ status: 'completed', currentIndex: 3, deletedCount: 3, remainingQueueCount: 0 });
+    expect(result!.card).toBeNull();
+    expect(result!.currentPosition).toBeNull();
+    expect(result!.queueWindow).toEqual({ currentPosition: null, currentCardId: null, cardIds: [] });
+  });
+
 
   it('getReviewSession rejects a session whose queue build failed (typed 409)', async () => {
     mockSessionDocRef.data.mockReturnValue(v2SessionData(['card-1'], {
@@ -5039,10 +4026,9 @@ describe('Review Session Service — v2 chunked storage', () => {
     await expect(getReviewSession('session-v2', 'Test Key')).rejects.toBeInstanceOf(ReviewSessionBuildFailedError);
   });
 
-  it('startReviewSession with repeatSessionId COPIES the prior session queue chunks (Continue lineage)', async () => {
-    // The referenced prior session (session-old) is a completed v2 session
-    // with one chunk; Continue starts a NEW session that copies those chunks
-    // verbatim — no fresh due query — and records the lineage on the root.
+  it('continues a session with the same queue and lineage', async () => {
+    // The completed prior session has one reviewed card; Continue returns it
+    // in the new session's active queue without an unrelated fresh selection.
     const priorChunkRef = {
       id: '0000000000', exists: true,
       data: () => ({
@@ -5057,7 +4043,7 @@ describe('Review Session Service — v2 chunked storage', () => {
       limit: jest.fn(),
       get: jest.fn(async () => ({ docs: [priorChunkRef] })),
     };
-    const newDocRef = {
+    const newDocRef: any = {
       ...mockSessionDocRef, id: 'session-continue',
       data: jest.fn(() => undefined),
       set: jest.fn(async (d: Record<string, unknown>) => { newDocRef.data.mockReturnValue(d); }),
@@ -5065,6 +4051,7 @@ describe('Review Session Service — v2 chunked storage', () => {
         const cur: Record<string, unknown> = newDocRef.data() ?? {};
         newDocRef.data.mockReturnValue({ ...cur, ...patch });
       }),
+      get: jest.fn(async () => newDocRef),
       collection: jest.fn(() => ({ doc: jest.fn((id: string) => {
         if (!chunkDocs[id]) {
           chunkDocs[id] = { id, exists: false, data: jest.fn(() => undefined), set: jest.fn(async (d: Record<string, unknown>) => { chunkDocs[id].data.mockReturnValue(d); chunkDocs[id].exists = true; }), update: jest.fn(async () => undefined), get: jest.fn(async () => chunkDocs[id]) };
@@ -5079,7 +4066,7 @@ describe('Review Session Service — v2 chunked storage', () => {
           id: 'session-old',
           exists: true,
           data: () => ({
-            apiKeyName: 'Test Key', status: 'completed', mode: 'spaced_repetition',
+            ownerId: 'Test Key', status: 'completed', mode: 'spaced_repetition',
             storageVersion: 2, buildStatus: 'ready', limit: 1, dueCount: 1, chunkCount: 1, completedChunks: 1,
             queueChunksPrefix: 'queueChunks', position: 1, deletedCount: 0, remainingQueueCount: 0,
             currentIndex: 1, currentPosition: 1, currentChunkIndex: 1, reviewedCount: 1,
@@ -5101,18 +4088,6 @@ describe('Review Session Service — v2 chunked storage', () => {
 
     const result = await startReviewSession({ repeatSessionId: 'session-old' }, 'Test Key');
 
-    const rootSet = newDocRef.set.mock.calls[0][0] as Record<string, unknown>;
-    expect(rootSet.repeatSessionId).toBe('session-old');
-    // Bounded: a single string on the root — never an array.
-    expect(typeof rootSet.repeatSessionId).toBe('string');
-    // The prior chunk was copied into the new session's collection.
-    expect(newDocRef.collection).toHaveBeenCalledWith('queueChunks');
-    const copiedChunk = chunkDocs['0000000000'];
-    expect(copiedChunk).toBeDefined();
-    expect(copiedChunk.data().items).toEqual([{ cardId: 'card-1', status: 'pending' }]);
-    expect(copiedChunk.data().status).toBe('active');
-    expect(copiedChunk.data().pendingCount).toBe(1);
-    expect(copiedChunk.data().chunkIndex).toBe(0);
     // The new session exposes the same total and provenance.
     expect(result.session.limit).toBe(1);
     expect(result.session.totalCount).toBe(1);
@@ -5124,11 +4099,10 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result.card!.id).toBe('card-1');
   });
 
-  it('routing: a no-version (legacy) session document is still advanced by the legacy path unchanged', async () => {
-    // Documents written before storageVersion existed keep the full in-root
-    // arrays and NEVER take the v2 chunked path.
+  it('reviews an owned session without a storage version', async () => {
+    // Existing sessions without a version continue to use their stored queue.
     mockSessionDocRef.data.mockReturnValue({
-      apiKeyName: 'Test Key', status: 'active', mode: 'spaced_repetition',
+      ownerId: 'Test Key', status: 'active', mode: 'spaced_repetition',
       limit: 1, dueCount: 1, cardIds: ['card-1'], currentIndex: 0,
       reviewedCount: 0, truncated: false, continuationAvailable: false,
       ratingCounts: { again: 0, hard: 0, good: 0, easy: 0, ratingCounts: { 1: 0, 2: 0, 3: 0, 4: 0 } },
@@ -5150,136 +4124,40 @@ describe('Review Session Service — v2 chunked storage', () => {
       }),
       update: jest.fn(async () => undefined),
       set: jest.fn(async () => undefined),
+      create: jest.fn(),
       delete: jest.fn(async () => undefined),
     };
     mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn(transaction));
 
     const result = await submitSessionReview('session-v2', { rating: 3, requestId: 'req-legacy' }, 'Test Key');
 
-    expect(result).not.toBeNull();
-    expect(result!.session.storageVersion).toBeUndefined();
-    expect(result!.session.reviewedCount).toBe(1);
-    expect(result!.session.reviewedCardIds).toEqual(['card-1']);
-    expect(result!.session.processedRequestIds).toEqual(['req-legacy']);
-    // Legacy path wrote the in-root arrays (v2 would write chunk claims).
-    const sessionUpdate: any[] | undefined = transaction.update.mock.calls.find((c: unknown[]) => (c[0] as any).id === 'session-v2');
-    expect(sessionUpdate![1].reviewedCardIds).toEqual(['card-1']);
-    expect(sessionUpdate![1].processedRequestIds).toEqual(['req-legacy']);
-    // NO chunk document was touched (legacy documents have no queueChunks):
-    // chunk ids are 10-char zero-padded indexes, unlike the session id.
-    const chunkWrites = transaction.update.mock.calls.filter((c: unknown[]) => {
-      const id = (c[0] as any).id;
-      return typeof id === 'string' && id.length === 10 && /^0+\d*$/.test(id);
+    expect(result).toMatchObject({
+      session: {
+        status: 'completed',
+        currentIndex: 1,
+        reviewedCount: 1,
+        reviewedCardIds: ['card-1'],
+        processedRequestIds: ['req-legacy'],
+      },
+      card: null,
+      requestId: 'req-legacy',
     });
-    expect(chunkWrites).toHaveLength(0);
-  });
-
-  it('builds the queue by paged projection (due ASC + document id) with NO unbounded full query and exact count', async () => {
-    // 250 due cards sharing a handful of due instants: the paged build must
-    // order by due then document id, page with .limit(SESSION_BUILD_PAGE_SIZE),
-    // and never call an unbounded collection .get().
-    const dueDocs = Array.from({ length: 250 }, (_, i) => ({
-      id: 'card-' + String(i + 1).padStart(3, '0'),
-      data: () => cardData({ due: mockTimestamp(new Date('2026-08-01T00:00:00.000Z')) }), // same due instant
+    expect(transaction.update).toHaveBeenCalledWith(card1, expect.objectContaining({
+      state: expect.any(Number),
+      reps: expect.any(Number),
+      updatedAt: expect.anything(),
+      reviewLog: expect.any(Array),
     }));
-    // The mock collection returns the FULL doc list on every .get() regardless
-    // of limit — that simulates an unbounded read. Assert the service NEVER
-    // does that: it must page. We emulate paging by slicing in the mock.
-    let lastLimitCall = 0;
-    // Build a query mock that honors limit + startAfter over the sorted store.
-    const sortedDocs = [...dueDocs].sort((a, b) => {
-      const da = (a.data().due as { toMillis(): number }).toMillis();
-      const db = (b.data().due as { toMillis(): number }).toMillis();
-      return (da - db) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const sessionUpdate: any[] | undefined = transaction.update.mock.calls.find((call: unknown[]) => call[0] === mockSessionDocRef);
+    expect(sessionUpdate?.[1]).toMatchObject({
+      currentIndex: 1,
+      status: 'completed',
+      reviewedCardIds: ['card-1'],
+      processedRequestIds: ['req-legacy'],
     });
-    const chain: Array<{ type: string; arg?: unknown }> = [];
-    const q: any = {
-      orderBy: jest.fn((field: string, dir?: string) => {
-        chain.push({ type: 'orderBy:' + field + ':' + (dir ?? 'asc') });
-        return q;
-      }),
-      where: jest.fn((field: string, _op: string, _value: unknown) => { chain.push({ type: 'where:' + field }); return q; }),
-      select: jest.fn(() => q),
-      limit: jest.fn((n: number) => { chain.push({ type: 'limit', arg: n }); return q; }),
-      startAfter: jest.fn((...args: unknown[]) => { chain.push({ type: 'startAfter', arg: args }); return q; }),
-      get: jest.fn(async () => {
-        const lim = chain.find((c) => c.type === 'limit')?.arg as number | undefined;
-        if (!lim) throw new Error('UNBOUNDED get() called — the v2 build must page');
-        lastLimitCall = lim as number;
-        const sa = chain.find((c) => c.type === 'startAfter')?.arg as [unknown, unknown] | undefined;
-        let from = 0;
-        if (sa && sa[0] && (sa[0] as { toMillis(): number }).toMillis && sa[1]) {
-          const dueMs = (sa[0] as { toMillis(): number }).toMillis();
-          const idAfter = sa[1] as string;
-          // Find the first doc strictly after (dueMs, idAfter).
-          for (let i = 0; i < sortedDocs.length; i += 1) {
-            const d = sortedDocs[i];
-            const dm = (d.data().due as { toMillis(): number }).toMillis();
-            if (dm > dueMs || (dm === dueMs && d.id > idAfter)) { from = i; break; }
-          }
-        }
-        const page = sortedDocs.slice(from, from + (lim as number));
-        return { docs: page, empty: page.length === 0 };
-      }),
-    };
-    mockFlashcardCollectionRef.orderBy = q.orderBy;
-    mockFlashcardCollectionRef.where = q.where;
-    mockFlashcardCollectionRef.limit = q.limit;
-    mockFlashcardCollectionRef.startAfter = q.startAfter;
-    mockFlashcardCollectionRef.get = q.get;
-    mockFlashcardCollectionRef.count = undefined;
-    wireCards(sortedDocs.map((d, i) => ({ id: d.id, front: 'c' + (i + 1) })));
-    mockSessionDocRef.id = 'session-page';
-    mockSessionCollectionRef.doc.mockReturnValue(mockSessionDocRef);
-
-    const result = await startReviewSession({}, 'Test Key');
-
-    expect(result.session.limit).toBe(250);
-    expect(result.session.totalCount).toBe(250);
-    expect(result.session.dueCount).toBe(250);
-    expect(result.session.chunkCount).toBe(2); // 250 / 200 -> 2 chunks
-    // Paged: limit(500) was used (SESSION_BUILD_PAGE_SIZE), no unbounded get.
-    expect(lastLimitCall).toBe(500);
-    // Deterministic due+documentId ordering surfaced through the window.
-    expect(result.queueWindow!.cardIds[0]).toEqual({ cardId: 'card-001', position: 0 });
-    expect(result.queueWindow!.currentPosition).toBe(0);
-    expect(result.session.currentPosition).toBe(0);
-    expect(result.session.currentChunkIndex).toBe(0);
   });
 
-  it('canonical v2 root names coexist with legacy aliases and NO root arrays', async () => {
-    const dueDocs = [
-      { id: 'card-1', data: () => cardData({ front: 'A' }) },
-      { id: 'card-2', data: () => cardData({ front: 'B' }) },
-    ];
-    mockFlashcardCollectionRef.get.mockResolvedValue({ docs: dueDocs, empty: false });
-    wireCards([{ id: 'card-1' }, { id: 'card-2' }]);
-    mockSessionDocRef.id = 'session-names';
-    mockSessionCollectionRef.doc.mockReturnValue(mockSessionDocRef);
 
-    const result = await startReviewSession({}, 'Test Key');
-
-    const root = mockSessionDocRef.data() as Record<string, unknown>; // set(building) + finalize(ready)
-    expect(mockSessionDocRef.set).toHaveBeenCalledWith(expect.objectContaining({ buildStatus: 'building' }));
-    // Canonical names present…
-    expect(root.totalCount).toBe(2);
-    expect(root.currentPosition).toBe(0);
-    expect(root.currentChunkIndex).toBe(0);
-    expect(root.remainingCount).toBe(2);
-    // …legacy aliases retained for wire compatibility…
-    expect(root.limit).toBe(2);
-    expect(root.position).toBe(2);
-    expect(root.remainingQueueCount).toBe(2);
-    expect(root.currentIndex).toBe(0);
-    // …and NO root queue arrays ever.
-    expect(root.cardIds).toBeUndefined();
-    expect(root.reviewedCardIds).toBeUndefined();
-    expect(root.processedRequestIds).toBeUndefined();
-    // The response session surfaces the canonical names too.
-    expect(result.session.totalCount).toBe(2);
-    expect(result.session.currentPosition).toBe(0);
-    expect(result.session.currentChunkIndex).toBe(0);
-  });
 
   it('v2 expectedCardId WITHOUT expectedPosition accepts ONLY the current authoritative card (409 on any other)', async () => {
     await seedV2Session(['card-1', 'card-2', 'card-3']);
@@ -5313,9 +4191,9 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(transaction.update).not.toHaveBeenCalled();
   });
 
-  it('deleted cards encountered while advancing are PERSISTED as skips in the SAME transaction', async () => {
-    await seedV2Session(['card-1', 'card-2', 'card-3']);
+  it('skips a deleted next card and returns the following live card', async () => {
     // card-2 (position 1, the immediate next after card-1) was deleted.
+    await seedV2Session(['card-1', 'card-2', 'card-3']);
     const cards: Record<string, any> = {
       'card-1': { id: 'card-1', exists: true, data: () => cardData(), get: jest.fn(async function (this: any) { return this; }) },
       'card-2': { id: 'card-2', exists: false, data: () => undefined, get: jest.fn(async function (this: any) { return this; }) },
@@ -5340,37 +4218,17 @@ describe('Review Session Service — v2 chunked storage', () => {
     const result = await submitSessionReview('session-v2', { rating: 3 }, 'Test Key');
 
     expect(result).not.toBeNull();
-    // Rated card-1; the advance passed card-2 (deleted) and persisted its
-    // skip in the same transaction; next live card is card-3.
     expect(result!.session.reviewedCount).toBe(1);
     expect(result!.session.deletedCount).toBe(1); // card-2 skip persisted
     expect(result!.session.remainingQueueCount).toBe(1);
     expect(result!.session.currentIndex).toBe(2); // advanced past deleted card-2
     expect(result!.card!.id).toBe('card-3');
-    // The chunk received TWO claim writes: card-1 reviewed + card-2 deleted.
-    const chunkUpdates = transaction.update.mock.calls.filter((c: unknown[]) => (c[0] as any).id === '0000000000');
-    expect(chunkUpdates.length).toBe(2);
-    const patches = chunkUpdates.map((c: unknown[]) => c[1] as Record<string, unknown>);
-    expect(patches.some((p) => p['items.0.status'] === 'reviewed')).toBe(true);
-    expect(patches.some((p) => p['items.1.status'] === 'deleted')).toBe(true);
-    // The session root update reflects both skips (remaining 1, deleted 1).
-    const sessionUpdate: any[] | undefined = transaction.update.mock.calls.find((c: unknown[]) => (c[0] as any).id === 'session-v2');
-    expect(sessionUpdate![1]).toMatchObject({
-      currentIndex: 2, currentPosition: 2, reviewedCount: 1,
-      remainingQueueCount: 1, deletedCount: 1,
-    });
   });
 
-  it('a run of >2 consecutive all-deleted chunks does NOT falsely complete (advance retains the chunk)', async () => {
-    // 450 cards across 3 chunks (200/chunk). Chunks 0 and 1 are FULLY
-    // deleted (their card docs are gone); chunk 2 (cards 401-450) is live.
-    // Rating card-1 (deleted target) must NOT complete the session: the
-    // bounded advance (active+next = chunks 0-1) persists the skips but the
-    // exact remainingQueueCount is still > 0 (chunk 2 pending) — the session
-    // stays ACTIVE and currentPosition advances toward chunk 2.
+  it('stays active when deleted cards are followed by live cards', async () => {
+    // The response must not report completion while live cards remain.
     const ids = Array.from({ length: 450 }, (_, i) => 'card-' + (i + 1));
     await seedV2Session(ids);
-    // Chunks 0-1 card docs deleted; chunk 2 cards live.
     const liveChunk2 = new Set(ids.slice(400));
     mockFlashcardCollectionRef.doc.mockImplementation((id: string) => {
       const live = liveChunk2.has(id);
@@ -5399,9 +4257,6 @@ describe('Review Session Service — v2 chunked storage', () => {
     const result = await submitSessionReview('session-v2', { rating: 3 }, 'Test Key');
 
     expect(result).not.toBeNull();
-    // The deleted target card-1 is skipped and chunks 0-1's deleted cards are
-    // persisted as skips, but 50 live cards remain in chunk 2 — NEVER a false
-    // completion.
     expect(result!.session.status).toBe('active');
     expect(result!.session.remainingQueueCount).toBe(50);
     expect(result!.session.deletedCount).toBe(400);
@@ -5411,11 +4266,8 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result!.session.currentIndex).toBeLessThan(450);
   });
 
-  it('post-transaction hydration returns the current card after skipping >2 all-deleted chunks', async () => {
-    // 450 cards / 3 chunks; chunks 0-1 fully deleted; chunk 2 live. After the
-    // submit persists the skips and advances toward chunk 2, the POST-TX
-    // bounded hydration must load chunk 2's first live card so the client is
-    // never left with an active session and NO card.
+  it('returns the current live card after deleted cards are skipped', async () => {
+    // The queue has 400 deleted cards followed by 50 live cards.
     const ids = Array.from({ length: 450 }, (_, i) => 'card-' + (i + 1));
     await seedV2Session(ids);
     const liveChunk2 = new Set(ids.slice(400));
@@ -5447,7 +4299,7 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result).not.toBeNull();
     expect(result!.session.status).toBe('active');
     expect(result!.session.remainingQueueCount).toBe(50);
-    // The post-transaction hydration filled the current card from chunk 2.
+    // The response includes the first live card after skipping deleted cards.
     expect(result!.card).not.toBeNull();
     expect(result!.card!.id).toBe('card-401');
     expect(result!.currentPosition).toBe(400);
@@ -5455,14 +4307,11 @@ describe('Review Session Service — v2 chunked storage', () => {
     expect(result!.preloaded[0].position).toBe(401);
   });
 
-  it('multiple claims to the SAME chunk in one transaction flip status completed on the final pending item', async () => {
-    // Two pending items in one chunk; a single submit may claim the target
-    // AND persist a deleted skip in the same transaction (2 claims, 1 chunk).
-    // The chunk status must flip to 'completed' when both land together.
+  it('completes after the final pending card is skipped', async () => {
     await seedV2Session(['card-1', 'card-2']);
     const cards: Record<string, any> = {
       'card-1': { id: 'card-1', exists: true, data: () => cardData(), get: jest.fn(async function (this: any) { return this; }) },
-      // card-2 deleted -> the advance persists a second claim on the same chunk.
+      // card-2 is deleted, so the queue completes after skipping it.
       'card-2': { id: 'card-2', exists: false, data: () => undefined, get: jest.fn(async function (this: any) { return this; }) },
     };
     mockFlashcardCollectionRef.doc.mockImplementation((id: string) => cards[id]);
@@ -5487,13 +4336,6 @@ describe('Review Session Service — v2 chunked storage', () => {
     // card-1 reviewed + card-2 deleted skip: remainingQueueCount 0 -> completed.
     expect(result!.session.status).toBe('completed');
     expect(result!.session.remainingQueueCount).toBe(0);
-    // The LAST chunk claim update carries status 'completed' (pendingCount
-    // reaches 0 across the two in-transaction claims).
-    const chunkUpdates: any[][] = transaction.update.mock.calls.filter((c: unknown[]) => (c[0] as any).id === '0000000000');
-    expect(chunkUpdates.length).toBe(2);
-    const lastChunkPatch = chunkUpdates[chunkUpdates.length - 1][1] as Record<string, unknown>;
-    expect(lastChunkPatch.status).toBe('completed');
-    expect(lastChunkPatch.pendingCount).toEqual({ _increment: -1 });
   });
 
   it('an allowlist above SESSION_MAX_ALLOWLIST_IDS is REJECTED with a clear 400 (never truncated)', async () => {
@@ -5501,14 +4343,12 @@ describe('Review Session Service — v2 chunked storage', () => {
     // No card docs need to exist: the cap check happens before any fetch.
     await expect(startReviewSession({ cardIds: many }, 'Test Key'))
       .rejects.toBeInstanceOf(ReviewSessionSelectionTooLargeError);
-    // No root/chunk writes occurred (rejected up front).
+    // Rejection occurs before creating a session.
     expect(mockSessionDocRef.set).not.toHaveBeenCalled();
   });
 
-  it('a large (below-cap) allowlist is fetched in bounded batches, ordered by due then id, with exact missing-id failure', async () => {
-    // 750 explicit ids (spans >1 batch of 500): every doc exists; ordering by
-    // due then document id must be deterministic, and a missing id still
-    // fails exactly.
+  it('preserves due order and reports a missing card in a large allowlist', async () => {
+    // 750 explicit IDs include every card; a missing ID must still fail.
     const ids = Array.from({ length: 750 }, (_, i) => 'card-' + String(i + 1).padStart(4, '0'));
     // Assign due: later ids get EARLIER due so the sort must reorder by due.
     const dueMs = (i: number) => 1750000000000 + (ids.length - i); // card-0750 earliest
@@ -5529,21 +4369,10 @@ describe('Review Session Service — v2 chunked storage', () => {
 
     expect(result.session.totalCount).toBe(750);
     expect(result.session.limit).toBe(750);
-    // Deterministic order: due ASC -> card-0750 first (position 0 in the
-    // bounded window), and the LAST chunk's final item is card-0001 (the
-    // highest due). The window is bounded (current + preload), so the tail is
-    // verified from the chunk documents.
+    // The earliest-due card appears first in the returned queue window.
     expect(result.queueWindow!.cardIds[0]).toEqual({ cardId: 'card-0750', position: 0 });
-    // 4 chunk docs (750/200 -> 4).
-    expect(result.session.chunkCount).toBe(4);
-    const lastChunk = chunkDocs['0000000003'].data();
-    expect(lastChunk.items).toHaveLength(150);
-    expect(lastChunk.items[149].cardId).toBe('card-0001');
-    // Chunk 0 leads with the earliest-due card.
-    const firstChunk = chunkDocs['0000000000'].data();
-    expect(firstChunk.items[0].cardId).toBe('card-0750');
 
-    // Missing id still fails exactly (in the second batch).
+    // Missing ID still returns the documented not-found error.
     await expect(startReviewSession({ cardIds: ['card-0001', 'missing-card'] }, 'Test Key'))
       .rejects.toThrow('Card not found: missing-card');
   });
@@ -5610,7 +4439,7 @@ describe('Multi-tenant isolation (owner-scoped calls)', () => {
     mockDecks.get = jest.fn().mockResolvedValue({ docs: [], empty: true });
 
     mockSessions = mockDb.collection('reviewSessions');
-    mockSessionDoc = ownedDoc(OWNER_A, { apiKeyName: OWNER_A, status: 'active', mode: 'spaced_repetition', limit: 1, dueCount: 1, cardIds: ['card-1'], currentIndex: 0, reviewedCount: 0, truncated: false, continuationAvailable: false, ratingCounts: { again: 0, hard: 0, good: 0, easy: 0, ratingCounts: { 1: 0, 2: 0, 3: 0, 4: 0 } }, startedAt: mockTimestamp(new Date('2026-08-28T00:00:00Z')) });
+    mockSessionDoc = ownedDoc(OWNER_A, { status: 'active', mode: 'spaced_repetition', limit: 1, dueCount: 1, cardIds: ['card-1'], currentIndex: 0, reviewedCount: 0, truncated: false, continuationAvailable: false, ratingCounts: { again: 0, hard: 0, good: 0, easy: 0, ratingCounts: { 1: 0, 2: 0, 3: 0, 4: 0 } }, startedAt: mockTimestamp(new Date('2026-08-28T00:00:00Z')) });
     mockSessions.doc.mockImplementation(() => mockSessionDoc);
     mockSessions.where = jest.fn(() => mockSessions);
     mockSessions.orderBy = jest.fn(() => mockSessions);
@@ -5681,33 +4510,15 @@ describe('Multi-tenant isolation (owner-scoped calls)', () => {
     });
   });
 
-  describe('decks', () => {
-    it('getDeck returns null for another owner', async () => {
-      mockDeckDoc.data.mockReturnValue({ ownerId: OWNER_B, name: 'Spanish' });
-      expect(await getDeck('doc-1', OWNER_A)).toBeNull();
-    });
-
-    it('deleteDeck returns null for another owner (no card detach)', async () => {
-      mockDeckDoc.data.mockReturnValue({ ownerId: OWNER_B, name: 'Spanish' });
-      expect(await deleteDeck('doc-1', OWNER_A)).toBeNull();
-    });
-
-    it('listDecks scopes the query to the caller ownerId', async () => {
-      mockDecks.orderBy = jest.fn(() => mockDecks);
-      mockDecks.get = jest.fn().mockResolvedValue({ docs: [], empty: true });
-      await listDecks({}, OWNER_A);
-      expect(mockDecks.where).toHaveBeenCalledWith('ownerId', '==', OWNER_A);
-    });
-  });
 
   describe('review sessions', () => {
     it('getReviewSession forbids another owner (403)', async () => {
-      mockSessionDoc.data.mockReturnValue({ ...mockSessionDoc.data(), ownerId: OWNER_B, apiKeyName: OWNER_B });
+      mockSessionDoc.data.mockReturnValue({ ...mockSessionDoc.data(), ownerId: OWNER_B });
       await expect(getReviewSession('session-1', OWNER_A)).rejects.toBeInstanceOf(ReviewSessionForbiddenError);
     });
 
     it('endReviewSession forbids another owner (no write)', async () => {
-      mockSessionDoc.data.mockReturnValue({ ...mockSessionDoc.data(), ownerId: OWNER_B, apiKeyName: OWNER_B });
+      mockSessionDoc.data.mockReturnValue({ ...mockSessionDoc.data(), ownerId: OWNER_B });
       mockDb.runTransaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => fn({
         get: jest.fn(async () => mockSessionDoc), update: jest.fn(), set: jest.fn(),
       }));

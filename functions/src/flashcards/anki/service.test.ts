@@ -1,7 +1,7 @@
 /**
- * Service-layer tests for Anki .apkg import/export: Firestore write behavior
- * (atomic batches, deck find-or-create, no partial writes), export card
- * selection, and error mapping. The format layer is covered by apkg.test.ts.
+ * Service-layer tests for Anki .apkg import/export: owner-scoped card
+ * transactions and current deck-name resolution, export selection, and error
+ * mapping. The format layer is covered by apkg.test.ts.
  */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,11 +12,17 @@ import {
   importApkg, exportApkg, writeImportedCards, selectExportCards,
   ApkgImportError, ApkgExportError, normalizeDeckPathForImportPublic,
 } from './service';
-import { ImportedCard } from './types';
+import { parseApkgImport } from './apkg';
+import { ANKI_MAX_APKG_RESPONSE_BYTES, ImportedCard } from './types';
+import { getOrCreateOwnedDeck, readOwnedDeckInTransaction } from '../decks';
 import {
   safeValidateImportApkg, safeValidateExportApkg, validateImportApkg,
   validateExportApkg,
 } from './validators';
+jest.mock('../decks', () => ({
+  getOrCreateOwnedDeck: jest.fn(),
+  readOwnedDeckInTransaction: jest.fn(),
+}));
 
 // Mock Firebase Admin Firestore (same shape as service.test.ts's mocks).
 const createMockDoc = (overrides: Record<string, unknown> = {}) => ({
@@ -46,15 +52,13 @@ const createMockCollection = (doc: Record<string, unknown>): Record<string, unkn
 
 const mockCardDoc: any = createMockDoc();
 const mockCardCollection: any = createMockCollection(mockCardDoc);
-const mockDeckDoc: any = createMockDoc({ id: 'deck-1' });
-const mockDeckCollection: any = createMockCollection(mockDeckDoc);
+const mockTransaction = {
+  create: jest.fn(),
+  get: jest.fn(),
+};
 const mockDbInstance = {
-  collection: jest.fn((name: string) => {
-    if (name === 'decks') return mockDeckCollection;
-    return mockCardCollection;
-  }),
+  collection: jest.fn(() => mockCardCollection),
   runTransaction: jest.fn(),
-  batch: jest.fn(),
 };
 
 jest.mock('firebase-admin/firestore', () => ({
@@ -69,7 +73,10 @@ jest.mock('firebase-admin/firestore', () => ({
 }));
 
 /** Builds a valid .apkg (SQLite collection) with the given notes. */
-async function buildApkg(notes: Array<{ id: number; flds: string; tags?: string }>): Promise<string> {
+async function buildApkg(
+  notes: Array<{ id: number | bigint; flds: string; tags?: string }>,
+  compression: 'STORE' | 'DEFLATE' = 'STORE',
+): Promise<string> {
   const dir = mkdtempSync(join(tmpdir(), 'fsrs-svc-'));
   const p = join(dir, 'collection.anki2');
   const db = new DatabaseSync(p);
@@ -82,15 +89,19 @@ async function buildApkg(notes: Array<{ id: number; flds: string; tags?: string 
       left integer, odue integer, odid integer, flags integer, data text);
     CREATE TABLE revlog (id integer primary key, cid integer, usn integer, ease integer, ivl integer, lastIvl integer, factor integer, time integer, type integer);
     CREATE TABLE graves (usn integer, oid integer, type integer);`);
+  const models = JSON.stringify({
+    1: { type: 0, sortf: 0, flds: [{ name: 'Front' }, { name: 'Back' }] },
+  });
   db.prepare(`INSERT INTO col (id,crt,mod,scm,ver,dty,usn,ls,conf,models,decks,dconf,tags)
-    VALUES (1,1700000000,1700000000,0,11,0,-1,0,'{}','{}',?, '{}','{}')`)
-    .run(JSON.stringify({ 1: { name: 'Default' }, 2: { name: 'Spanish::Verbs' } }));
+    VALUES (1,1700000000,1700000000,0,11,0,-1,0,'{}',?,?,'{}','{}')`)
+    .run(models, JSON.stringify({ 1: { name: 'Default' }, 2: { name: 'Spanish::Verbs' } }));
   db.exec('BEGIN');
   const insN = db.prepare('INSERT INTO notes (id,guid,mid,mod,usn,tags,flds,sfld,csum,flags,data) VALUES (?,?,1,0,-1,?,?,0,0,0,\'\')');
   const insC = db.prepare('INSERT INTO cards (id,nid,did,ord,mod,usn,type,queue,due,ivl,factor,reps,lapses,left,odue,odid,flags,data) VALUES (?,?,?,0,0,-1,0,0,0,0,0,0,0,0,0,0,0,\'\')');
   notes.forEach((n, i) => {
     insN.run(n.id, `guid-${n.id}`, n.tags ?? '', n.flds);
-    insC.run(n.id * 10 + 1, n.id, i === 0 ? 1 : 2);
+    const cardId = typeof n.id === 'bigint' ? 11 : n.id * 10 + 1;
+    insC.run(cardId, n.id, i === 0 ? 1 : 2);
   });
   db.exec('COMMIT');
   db.close();
@@ -98,128 +109,156 @@ async function buildApkg(notes: Array<{ id: number; flds: string; tags?: string 
   rmSync(dir, { recursive: true, force: true });
   const zip = new JSZip();
   zip.file('collection.anki2', bytes as unknown as ArrayBuffer, { binary: true });
-  const out = await zip.generateAsync({ type: 'uint8array' });
+  const out = await zip.generateAsync({
+    type: 'uint8array', compression, compressionOptions: { level: 1 },
+  });
   return Buffer.from(out).toString('base64');
 }
 
 describe('anki import service', () => {
-  let mockCard: any;
-  let mockDeck: any;
-
+  const OWNER_IMPORT = 'anki-import-owner';
 
   beforeEach(() => {
     jest.clearAllMocks();
-    const { getFirestore, Timestamp } = require('firebase-admin/firestore');
+    const { Timestamp } = require('firebase-admin/firestore');
     mockDbInstance.collection.mockClear();
-    mockDbInstance.batch.mockClear();
-    mockCard = getFirestore().collection('flashcards');
-    mockDeck = getFirestore().collection('decks');
-    // Default: a matching deck query returns empty (find-or-create path).
-    mockDeck.where = jest.fn(() => mockDeck);
-    mockDeck.limit = jest.fn(() => mockDeck);
-    mockDeck.get = jest.fn().mockResolvedValue({ empty: true, docs: [] });
+    mockDbInstance.runTransaction.mockImplementation(async (callback: (tx: typeof mockTransaction) => unknown) => callback(mockTransaction));
+    mockTransaction.create.mockImplementation(() => undefined);
+    (getOrCreateOwnedDeck as jest.Mock).mockImplementation(async (ownerId: string, name: string) => ({
+      id: `deck:${name}`, ownerId, name,
+    }));
+    (readOwnedDeckInTransaction as jest.Mock).mockImplementation(async (_tx: unknown, id: string, ownerId: string) => ({
+      id, ownerId, name: `current:${id}`,
+    }));
+
     Timestamp.now.mockReturnValue({ toMillis: () => 1700000000000, seconds: 1700000000, nanoseconds: 0 });
   });
 
-  it('writes cards into a single atomic batch (no partial writes)', async () => {
-    const batches: Array<Array<unknown>> = [];
-    mockDbInstance.batch.mockReturnValue({
-      set: jest.fn((_ref: unknown, data: unknown) => { batches[batches.length - 1].push(data); }),
-      commit: jest.fn().mockResolvedValue(undefined),
+  it('writes owner-scoped cards in one transaction after rereading owned decks', async () => {
+    const events: string[] = [];
+    const writes: Array<Record<string, unknown>> = [];
+    (readOwnedDeckInTransaction as jest.Mock).mockImplementation(async (_tx: unknown, id: string, ownerId: string) => {
+      events.push('read-deck');
+      return { id, ownerId, name: 'Renamed::Verbs' };
     });
-    // Simulate a real batch factory: each batch() returns a new object.
-    mockDbInstance.batch.mockImplementation(() => {
-      const items: unknown[] = [];
-      batches.push(items);
-      return {
-        set: jest.fn((_ref: unknown, data: unknown) => { items.push(data); }),
-        commit: jest.fn().mockResolvedValue(undefined),
-      };
+    mockTransaction.create.mockImplementation((_ref: unknown, data: Record<string, unknown>) => {
+      events.push('create-card');
+      writes.push(data);
     });
-    mockCard.doc = jest.fn(() => ({ id: 'new-id', set: jest.fn().mockResolvedValue(undefined) }));
     const cards: ImportedCard[] = [
       { front: 'Q1', back: 'A1', deckPath: 'Spanish::Verbs', tags: ['x'] },
       { front: 'Q2', back: 'A2', deckPath: null, tags: [] },
     ];
-    const r = await writeImportedCards(cards);
-    expect(r.atomic).toBe(true);
-    expect(r.batchCount).toBe(1);
-    // Exactly 2 writes in the one batch; the deck was created (find-or-create).
-    const writes = batches[0];
+    const result = await writeImportedCards(cards, OWNER_IMPORT);
+    expect(result).toEqual({ atomic: true, batchCount: 1 });
+    expect(getOrCreateOwnedDeck).toHaveBeenCalledWith(OWNER_IMPORT, 'Spanish::Verbs');
+    expect(readOwnedDeckInTransaction).toHaveBeenCalledWith(mockTransaction, 'deck:Spanish::Verbs', OWNER_IMPORT);
     expect(writes).toHaveLength(2);
-    expect(writes[0]).toMatchObject({ front: 'Q1', back: 'A1' });
+    expect(writes[0]).toMatchObject({
+      ownerId: OWNER_IMPORT, front: 'Q1', back: 'A1',
+      deckId: 'deck:Spanish::Verbs', deck: 'Renamed::Verbs',
+    });
+    expect(events.indexOf('read-deck')).toBeLessThan(events.indexOf('create-card'));
   });
 
-  it('importApkg end-to-end creates cards and decks', async () => {
-    const batchItems: unknown[] = [];
-    mockDbInstance.batch.mockReturnValue({
-      set: jest.fn((_ref: unknown, data: unknown) => { batchItems.push(data); }),
-      commit: jest.fn().mockResolvedValue(undefined),
-    });
-    mockCard.doc = jest.fn(() => ({ id: `c${batchItems.length}`, set: jest.fn() }));
+  it('imports parsed cards through the owner-scoped deck registry', async () => {
     const pkg = await buildApkg([
       { id: 1, flds: 'What is 2+2?\x1f4', tags: ' math ' },
       { id: 2, flds: 'Capital?\x1fParis' },
     ]);
-    const result = await importApkg({ package: pkg });
+    const result = await importApkg({ package: pkg }, OWNER_IMPORT);
     expect(result.cards).toHaveLength(2);
     expect(result.cards[0].front).toBe('What is 2+2?');
     expect(result.cards[0].deckPath).toBe('Default');
     expect(result.cards[1].deckPath).toBe('Spanish::Verbs');
     expect(result.skippedNotes).toBe(0);
     expect(result.skippedEmpty).toBe(0);
+    expect(result.skippedOverLimit).toBe(0);
     expect(result.atomic).toBe(true);
     expect(result.batchCount).toBe(1);
-    // Deck entities were created for both distinct leaf names.
-    expect(mockDeck.get).toHaveBeenCalled();
-    expect(batchItems).toHaveLength(2);
+    expect(getOrCreateOwnedDeck).toHaveBeenCalledWith(OWNER_IMPORT, 'Default');
+    expect(getOrCreateOwnedDeck).toHaveBeenCalledWith(OWNER_IMPORT, 'Spanish::Verbs');
+    expect(mockTransaction.create).toHaveBeenCalledTimes(2);
+    expect(mockTransaction.create.mock.calls.map((call) => call[1])).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ownerId: OWNER_IMPORT, deck: 'current:deck:Default' }),
+      expect.objectContaining({ ownerId: OWNER_IMPORT, deck: 'current:deck:Spanish::Verbs' }),
+    ]));
+  });
+  it('rejects an oversized valid import response before deck resolution or card writes', async () => {
+    jest.setTimeout(60000);
+    const field = '\\'.repeat(9_000);
+    const pkg = await buildApkg(
+      Array.from({ length: 1_000 }, (_, index) => ({
+        id: index + 1,
+        flds: `${field}\x1f${field}`,
+      })),
+      'DEFLATE',
+    );
+    const parsed = await parseApkgImport(Buffer.from(pkg, 'base64'));
+    expect(parsed.cards).toHaveLength(1_000);
+    expect(parsed.cards[0]).toMatchObject({ front: field, back: field });
+    expect(parsed.cards.length * field.length * 4).toBeGreaterThan(ANKI_MAX_APKG_RESPONSE_BYTES);
+
+    await expect(importApkg({ package: pkg }, OWNER_IMPORT)).rejects.toBeInstanceOf(ApkgImportError);
+    expect(getOrCreateOwnedDeck).not.toHaveBeenCalled();
+    expect(readOwnedDeckInTransaction).not.toHaveBeenCalled();
+    expect(mockDbInstance.runTransaction).not.toHaveBeenCalled();
+    expect(mockTransaction.create).not.toHaveBeenCalled();
   });
 
-  it('rejects malformed packages with ApkgImportError (no writes)', async () => {
-    const batch = { set: jest.fn(), commit: jest.fn() };
-    mockDbInstance.batch.mockReturnValue(batch);
-    await expect(importApkg({ package: Buffer.from('not a zip at all').toString('base64') }))
-      .rejects.toBeInstanceOf(ApkgImportError);
-    expect(batch.commit).not.toHaveBeenCalled();
+  it('rejects malformed packages without opening a card transaction', async () => {
+    await expect(importApkg(
+      { package: Buffer.from('not a zip at all').toString('base64') }, OWNER_IMPORT,
+    )).rejects.toBeInstanceOf(ApkgImportError);
+    expect(mockDbInstance.runTransaction).not.toHaveBeenCalled();
+  });
+  it('maps unsafe SQLite integers to the typed import API error before any write', async () => {
+    const pkg = await buildApkg([{ id: 9007199254740993n, flds: 'Q\x1fA' }]);
+    await expect(importApkg({ package: pkg }, OWNER_IMPORT)).rejects.toBeInstanceOf(ApkgImportError);
+    expect(mockDbInstance.runTransaction).not.toHaveBeenCalled();
   });
 
   it('rejects non-base64 and oversized envelopes', async () => {
-    await expect(importApkg({ package: '%%%' })).rejects.toBeInstanceOf(ApkgImportError);
+    await expect(importApkg({ package: '%%%' }, OWNER_IMPORT)).rejects.toBeInstanceOf(ApkgImportError);
     const big = Buffer.alloc(21 * 1024 * 1024, 1).toString('base64');
-    await expect(importApkg({ package: big })).rejects.toThrow(/too large/);
+    await expect(importApkg({ package: big }, OWNER_IMPORT)).rejects.toBeInstanceOf(ApkgImportError);
   });
 
   it('honors the deckPath override', async () => {
-    mockDbInstance.batch.mockReturnValue({ set: jest.fn(), commit: jest.fn().mockResolvedValue(undefined) });
-    mockCard.doc = jest.fn(() => ({ id: 'x', set: jest.fn() }));
     const pkg = await buildApkg([{ id: 1, flds: 'Q\x1fA' }]);
-    const result = await importApkg({ package: pkg, deckPath: 'Custom::Deck' });
+    const result = await importApkg({ package: pkg, deckPath: 'Custom::Deck' }, OWNER_IMPORT);
     expect(result.cards[0].deckPath).toBe('Custom::Deck');
+    expect(getOrCreateOwnedDeck).toHaveBeenCalledWith(OWNER_IMPORT, 'Custom::Deck');
   });
 
-  it('no partial writes when a mid-batch commit fails', async () => {
+  it('splits imports by the transaction byte budget as well as the 500-write limit', async () => {
+    const card: ImportedCard = {
+      front: 'é'.repeat(10_000), back: 'é'.repeat(10_000), deckPath: null, tags: [],
+    };
+    const result = await writeImportedCards(Array.from({ length: 100 }, () => card), OWNER_IMPORT);
+    expect(result).toEqual({ atomic: false, batchCount: 2 });
+    expect(mockDbInstance.runTransaction).toHaveBeenCalledTimes(2);
+    expect(mockTransaction.create).toHaveBeenCalledTimes(100);
+  });
+
+  it('reports failure when a later 500-card transaction fails', async () => {
     jest.setTimeout(60000);
-    // >500 cards → 2 batches. First commits, second rejects.
     const pkg = await buildApkg(Array.from({ length: 501 }, (_, i) => ({ id: i + 1, flds: `Q${i}\x1fA${i}` })));
-    let commits = 0;
-    mockDbInstance.batch.mockImplementation(() => {
-      const items: unknown[] = [];
-      return {
-        set: jest.fn((_ref: unknown, data: unknown) => { items.push(data); }),
-        commit: jest.fn().mockImplementation(() => {
-          commits += 1;
-          if (commits === 2) return Promise.reject(new Error('commit failed'));
-          return Promise.resolve(undefined);
-        }),
-      };
+    let transactions = 0;
+    const transactionFailure = new Error();
+    mockDbInstance.runTransaction.mockImplementation(async (callback: (tx: typeof mockTransaction) => unknown) => {
+      transactions += 1;
+      if (transactions === 2) throw transactionFailure;
+      return callback(mockTransaction);
     });
-    mockCard.doc = jest.fn(() => ({ id: 'x', set: jest.fn() }));
-    await expect(importApkg({ package: pkg })).rejects.toThrow('commit failed');
-    expect(commits).toBe(2);
+    await expect(importApkg({ package: pkg }, OWNER_IMPORT)).rejects.toBe(transactionFailure);
+    expect(transactions).toBe(2);
+    expect(mockTransaction.create).toHaveBeenCalledTimes(500);
   });
 });
 
 describe('anki export service', () => {
+  const OWNER_EXPORT = 'anki-export-owner';
   beforeEach(() => {
     jest.clearAllMocks();
     mockCardCollection.get.mockResolvedValue({ docs: [], empty: true });
@@ -234,6 +273,7 @@ describe('anki export service', () => {
       id: `card-${String(i).padStart(3, '0')}`,
       exists: true,
       data: () => ({
+        ownerId: OWNER_EXPORT,
         front: `Front ${i}`, back: `Back ${i}`, deck: i % 2 ? 'Spanish' : null,
         tags: ['t'], createdAt: { toMillis: () => 1700000000000 + i }, updatedAt: { toMillis: () => 1700000000000 + i },
         due: { toMillis: () => 1700000000000 + i }, state: 0, stability: 0, difficulty: 0,
@@ -262,20 +302,20 @@ describe('anki export service', () => {
 
   it('selectExportCards returns newest-first within the cap', async () => {
     seedCards(3);
-    const r = await selectExportCards({});
+    const r = await selectExportCards({}, OWNER_EXPORT);
     expect(r.selected.map((c) => c.id)).toEqual(['card-000', 'card-001', 'card-002']);
     expect(r.filtered).toBe(0);
   });
 
   it('selectExportCards filters by exact deck name', async () => {
     seedCards(4);
-    const r = await selectExportCards({ deck: 'Spanish' });
+    const r = await selectExportCards({ deck: 'Spanish' }, OWNER_EXPORT);
     expect(r.selected.every((c) => c.deckPath === 'Spanish')).toBe(true);
   });
 
   it('exportApkg rejects an empty selection', async () => {
     mockCardCollection.get.mockResolvedValue({ docs: [], empty: true });
-    await expect(exportApkg({})).rejects.toBeInstanceOf(ApkgExportError);
+    await expect(exportApkg({}, OWNER_EXPORT)).rejects.toBeInstanceOf(ApkgExportError);
   });
 
   it('export media fetch refuses SSRF targets before any connection (mediaSkipped)', async () => {
@@ -288,6 +328,7 @@ describe('anki export service', () => {
       get: jest.fn(),
       data: () => ({
         front: 'Front', back: 'Back', deck: null,
+        ownerId: OWNER_EXPORT,
         tags: [], createdAt: { toMillis: () => 1700000000000 }, updatedAt: { toMillis: () => 1700000000000 },
         due: { toMillis: () => 1700000000000 }, state: 0, stability: 0, difficulty: 0,
         reps: 0, lapses: 0, reviewLog: [],
@@ -302,7 +343,7 @@ describe('anki export service', () => {
     };
     doc.get.mockResolvedValue(doc);
     mockCardCollection.doc.mockReturnValue(doc);
-    const result = await exportApkg({ cardIds: ['card-000'] });
+    const result = await exportApkg({ cardIds: ['card-000'] }, OWNER_EXPORT);
     // Every unsafe target refused; zero embedded media.
     expect(result.media).toHaveLength(0);
     expect(result.mediaSkipped.map((m) => m.url).sort()).toEqual([
@@ -328,6 +369,7 @@ describe('anki export service', () => {
       data: () => ({
         front: 'Front', back: 'Back', deck: null,
         tags: [], createdAt: { toMillis: () => 1700000000000 }, updatedAt: { toMillis: () => 1700000000000 },
+        ownerId: OWNER_EXPORT,
         due: { toMillis: () => 1700000000000 }, state: 0, stability: 0, difficulty: 0,
         reps: 0, lapses: 0, reviewLog: [],
         images: [{ url: 'https://example.com/export-test.png' }],
@@ -335,7 +377,7 @@ describe('anki export service', () => {
     };
     doc.get.mockResolvedValue(doc);
     mockCardCollection.doc.mockReturnValue(doc);
-    const result = await exportApkg({ cardIds: ['card-000'] });
+    const result = await exportApkg({ cardIds: ['card-000'] }, OWNER_EXPORT);
     // example.com serves a real page (200) — embedded unless the sandbox
     // blocks egress; when blocked it is reported, never fetched unsafely.
     if (result.media.length === 1) {
@@ -393,29 +435,26 @@ describe('anki multi-tenant isolation', () => {
     mockCardCollection.startAfter = jest.fn(() => mockCardCollection);
     mockCardCollection.select = jest.fn(() => mockCardCollection);
     mockCardCollection.get = jest.fn().mockResolvedValue({ docs: [], empty: true });
-    mockDeckCollection.where = jest.fn(() => mockDeckCollection);
-    mockDeckCollection.limit = jest.fn(() => mockDeckCollection);
-    mockDeckCollection.get = jest.fn().mockResolvedValue({ empty: true, docs: [] });
   });
 
-  it('importApkg stamps ownerId on every written card and created deck', async () => {
+  it('importApkg stamps ownerId on cards resolved through the owned deck registry', async () => {
     const written: Array<Record<string, unknown>> = [];
-    mockCardCollection.doc = jest.fn(() => ({
-      id: 'new', set: jest.fn((d: Record<string, unknown>) => { written.push(d); }),
-    }));
-    mockDbInstance.batch.mockReturnValue({
-      set: jest.fn((_ref: unknown, data: Record<string, unknown>) => { written.push(data); }),
-      commit: jest.fn().mockResolvedValue(undefined),
+    (getOrCreateOwnedDeck as jest.Mock).mockResolvedValue({
+      id: 'deck-default', ownerId: OWNER_A, name: 'Default',
     });
-    const deckSets: Array<Record<string, unknown>> = [];
-    mockDeckCollection.doc = jest.fn(() => ({
-      id: 'deck-new', set: jest.fn((d: Record<string, unknown>) => { deckSets.push(d); }),
-    }));
+    (readOwnedDeckInTransaction as jest.Mock).mockResolvedValue({
+      id: 'deck-default', ownerId: OWNER_A, name: 'Default',
+    });
+    mockTransaction.create.mockImplementation((_ref: unknown, data: Record<string, unknown>) => {
+      written.push(data);
+    });
+    mockDbInstance.runTransaction.mockImplementation(async (callback: (tx: typeof mockTransaction) => unknown) => callback(mockTransaction));
     const pkg = await buildApkg([{ id: 1, flds: 'Q1\x1fA1', tags: 'x' }]);
     await importApkg({ package: pkg }, OWNER_A);
-    expect(written.length).toBeGreaterThan(0);
-    for (const card of written) expect(card.ownerId).toBe(OWNER_A);
-    for (const deck of deckSets) expect(deck.ownerId).toBe(OWNER_A);
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatchObject({ ownerId: OWNER_A, deckId: 'deck-default', deck: 'Default' });
+    expect(getOrCreateOwnedDeck).toHaveBeenCalledWith(OWNER_A, 'Default');
+    expect(readOwnedDeckInTransaction).toHaveBeenCalledWith(mockTransaction, 'deck-default', OWNER_A);
   });
 
   it('selectExportCards omits another owner\'s explicit card id (never exported)', async () => {

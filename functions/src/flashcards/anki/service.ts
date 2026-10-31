@@ -2,47 +2,57 @@
  * Anki .apkg import/export orchestration over Firestore.
  *
  * IMPORT (`importApkg`): parse + validate the package (pure — see
- * `parseApkgImport`), then write every card in chunked Firestore write
- * batches (≤500 writes each — Firestore's batch limit). All cards are
- * validated before the first write; decks referenced by imported deck paths
- * are found-or-created (a deck entity per leaf name) before any card write.
- * Writes within one batch are ATOMIC (all or nothing); more than 500 cards
- * commit across batches, so a mid-run failure leaves explicit partial
- * progress (documented; the response reports `atomic` and `batchCount`).
+ * `parseApkgImport`), then write cards in owner-scoped Firestore transactions
+ * of ≤500 writes each. All cards are validated before the first card write;
+ * referenced decks are resolved through the owned-deck registry, and each
+ * card transaction re-reads the current owned deck name. Each transaction is
+ * atomic; more than 500 cards commit across transactions, so a mid-run
+ * failure leaves explicit partial progress (the response reports `atomic`
+ * and `batchCount`).
  *
  * EXPORT (`exportApkg`): scans cards in the canonical deterministic order
  * (createdAt DESC, document id ASC — the same total order searchCards and
  * the review-history pages use; needs the already-declared composite index
  * `(createdAt DESC, __name__ ASC)`), selects by deck or explicit ids, and
  * builds a valid stock-Anki .apkg in memory (collection.anki2 + media map).
- * Scheduling metadata is carried where Anki-compatible: review cards map
- * FSRS state to Anki type/queue/due day-ordinals; reps/lapses and the FSRS
- * reviewLog become Anki revlog rows. Media: stored images referenced by
- * signed download URL are embedded when fetchable and within the size caps;
- * otherwise they are reported as skipped.
+ * Scheduling export is approximate rather than lossless: current card state
+ * uses FSRS stability to approximate Anki intervals; revlog intervals use
+ * the next retained pre-review due time, with short-term steps encoded in
+ * seconds and review intervals in days. Unknown or truncated boundaries are
+ * zero, not inferred from stability. Card/note IDs retain source creation
+ * timestamps (same-ms ties use adjacent milliseconds); note GUIDs provide
+ * stable identity. Reviewed cards use Anki's default 2500‰ ease because no
+ * Anki-compatible FSRS memory state or SM-2 ease is stored. Truncated review
+ * history and manual due-date changes cannot be reconstructed.
+ * Media: stored images referenced by signed download URL are embedded when
+ * fetchable and within the size caps; otherwise they are reported as skipped.
  *
- * Auth is enforced by the HTTP handler (fail-closed, existing gate); these
- * functions take no actor and are unit-testable against mocked Firestore.
+ * Auth is enforced by the HTTP handler (fail-closed, existing gate); export
+ * selection additionally requires the authenticated owner id to stay scoped.
  */
 import {
   getFirestore, Firestore, Timestamp, FieldPath,
 } from 'firebase-admin/firestore';
 import {
-  ANKI_EXPORT_CARD_LIMIT, ANKI_IMPORT_CARD_LIMIT,
-  ANKI_MAX_MEDIA_BYTES, ANKI_MAX_MEDIA_COUNT, ANKI_MAX_TOTAL_MEDIA_BYTES,
-  ExportedMedia, ExportApkgInput, ExportApkgResponse, ImportApkgInput,
-  ImportApkgResponse, ImportedCard,
+  ANKI_DECK_PATH_MAX, ANKI_EXPORT_CARD_LIMIT, ANKI_MAX_APKG_RESPONSE_BYTES,
+  ANKI_IMPORT_TRANSACTION_MAX_BYTES, ANKI_MAX_MEDIA_BYTES, ANKI_MAX_MEDIA_COUNT,
+  ANKI_MAX_TOTAL_MEDIA_BYTES, ExportedMedia, ExportApkgInput, ExportApkgResponse,
+  ImportApkgInput, ImportApkgResponse, ImportedCard,
 } from './types';
 import {
   buildCollectionBytes, decodeImportEnvelope, assembleApkgBytes,
-  ExportCard, parseApkgImport,
+  ExportCard, ExportSchedulerSteps, parseApkgImport,
 } from './apkg';
 import { ApkgFormatError } from './zip';
+import { refreshOwnedCardImageUrls } from '../service';
+import type { CardImage, Flashcard as FlashcardType } from '../types';
+import { getFSRSStepConfiguration, reconstructLearningSteps, LearningProgressUnavailableError } from '../scheduler';
 import { safeMediaFetch } from './ssrf';
 
+import { getOrCreateOwnedDeck, readOwnedDeckInTransaction } from '../decks';
+
 const COLLECTION = 'flashcards';
-const DECKS_COLLECTION = 'decks';
-/** Firestore hard limit: one WriteBatch supports 500 writes. */
+/** Firestore hard limit: one transaction supports at most 500 writes. */
 const BATCH_WRITE_LIMIT = 500;
 /** Firestore page size while scanning export candidates. */
 const SCAN_PAGE = 500;
@@ -69,34 +79,12 @@ export class ApkgExportError extends Error {
   }
 }
 
-/** Resolves a deck entity by exact leaf name (or null), scoped to the
- *  owner's decks when `ownerId` is given (deck names are unique per owner). */
-async function findDeckIdByExactName(name: string, ownerId?: string): Promise<string | null> {
-  let q = getDb().collection(DECKS_COLLECTION).where('name', '==', name);
-  if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
-  const existing = await q.limit(1).get();
-  if (existing.empty) return null;
-  return existing.docs[0].id;
-}
-
-/** Creates a deck entity (assumes the name is not taken). */
-async function createDeckEntity(name: string, ownerId?: string): Promise<string> {
-  const now = Timestamp.now();
-  const docRef = getDb().collection(DECKS_COLLECTION).doc();
-  const deck: Record<string, unknown> = { name, createdAt: now, updatedAt: now };
-  if (ownerId !== undefined) deck.ownerId = ownerId;
-  await docRef.set(deck);
-  return docRef.id;
-}
-
 /**
- * Finds or creates the deck entity for every distinct leaf name referenced
- * by the imported cards. This product has ONE deck level; an Anki deck PATH
- * (`A::B::C`) is stored as a single deck whose name is the full path (so
- * re-export keeps the hierarchy), matching `createFlashcard`'s find-or-
- * create-by-name semantics. Returns leaf name → stable deck id.
+ * Finds or creates the canonical owner-scoped deck entity for every distinct
+ * Anki path. Anki's `A::B::C` hierarchy is stored as one deck name so export
+ * preserves the original path.
  */
-async function ensureDecksForPaths(paths: Array<string | null>, ownerId?: string): Promise<Map<string, string>> {
+async function ensureDecksForPaths(paths: Array<string | null>, ownerId: string): Promise<Map<string, string>> {
   const leaves = new Set<string>();
   for (const path of paths) {
     if (path === null || path.trim() === '') continue;
@@ -104,16 +92,22 @@ async function ensureDecksForPaths(paths: Array<string | null>, ownerId?: string
   }
   const out = new Map<string, string>();
   for (const leaf of [...leaves].sort()) {
-    const existing = await findDeckIdByExactName(leaf, ownerId);
-    out.set(leaf, existing !== null ? existing : await createDeckEntity(leaf, ownerId));
+    const deck = await getOrCreateOwnedDeck(ownerId, leaf);
+    out.set(leaf, deck.id);
   }
   return out;
 }
 
-/** Builds the Firestore payload for one imported card. */
-function cardToWrite(card: ImportedCard, deckRefs: Map<string, string>, now: Timestamp, ownerId?: string): Record<string, unknown> {
+/** Builds the Firestore payload for one imported card using the current deck name. */
+function cardToWrite(
+  card: ImportedCard,
+  deckRefs: Map<string, string>,
+  deckNames: Map<string, string>,
+  now: Timestamp,
+  ownerId: string,
+): Record<string, unknown> {
   const data: Record<string, unknown> = {
-    ...(ownerId !== undefined ? { ownerId } : {}),
+    ownerId,
     front: card.front,
     back: card.back,
     tags: card.tags,
@@ -133,43 +127,79 @@ function cardToWrite(card: ImportedCard, deckRefs: Map<string, string>, now: Tim
     const deckId = deckRefs.get(card.deckPath.trim());
     if (deckId !== undefined) {
       data.deckId = deckId;
-      data.deck = card.deckPath.trim();
+      data.deck = deckNames.get(deckId)!;
     }
   }
   return data;
 }
 
 /**
- * Imports parsed cards into Firestore with ≤500-write batches. Deck
- * entities are ensured first (standalone writes outside batches), then all
- * cards are written. Returns atomicity facts for the response.
+ * Imports parsed cards in count- and byte-bounded transactions. JSON escaping
+ * is conservatively budgeted at six bytes per UTF-16 code unit; fixed
+ * per-document overhead reserves space for Firestore field/protobuf framing.
  */
-export async function writeImportedCards(cards: ImportedCard[], ownerId?: string): Promise<{ atomic: boolean; batchCount: number }> {
+function estimateImportWriteBytes(card: ImportedCard, ownerId: string): number {
+  let codeUnits = ownerId.length + card.front.length + card.back.length;
+  if (card.deckPath !== null && card.deckPath.trim() !== '') codeUnits += ANKI_DECK_PATH_MAX;
+  for (const tag of card.tags) codeUnits += tag.length;
+  return 2_048 + codeUnits * 6;
+}
+
+export async function writeImportedCards(cards: ImportedCard[], ownerId: string): Promise<{ atomic: boolean; batchCount: number }> {
   if (cards.length === 0) return { atomic: true, batchCount: 0 };
   const deckRefs = await ensureDecksForPaths(cards.map((c) => c.deckPath), ownerId);
   const now = Timestamp.now();
-  const atomic = cards.length <= BATCH_WRITE_LIMIT;
   let batchCount = 0;
-  for (let i = 0; i < cards.length; i += BATCH_WRITE_LIMIT) {
-    const chunk = cards.slice(i, i + BATCH_WRITE_LIMIT);
-    const batch = getDb().batch();
-    for (const card of chunk) {
-      const docRef = getDb().collection(COLLECTION).doc();
-      batch.set(docRef, cardToWrite(card, deckRefs, now, ownerId));
-    }
-    await batch.commit();
+  let requestBytes = 0;
+  let writes: Array<{ card: ImportedCard; ref: FirebaseFirestore.DocumentReference }> = [];
+
+  const commitChunk = async (): Promise<void> => {
+    if (writes.length === 0) return;
+    const chunk = writes;
+    writes = [];
+    requestBytes = 0;
+    await getDb().runTransaction(async (transaction) => {
+      const deckNames = new Map<string, string>();
+      for (const { card } of chunk) {
+        if (card.deckPath === null || card.deckPath.trim() === '') continue;
+        const deckId = deckRefs.get(card.deckPath.trim());
+        if (deckId !== undefined && !deckNames.has(deckId)) {
+          const deck = await readOwnedDeckInTransaction(transaction, deckId, ownerId);
+          deckNames.set(deckId, deck.name);
+        }
+      }
+      for (const { card, ref } of chunk) {
+        transaction.create(ref, cardToWrite(card, deckRefs, deckNames, now, ownerId));
+      }
+    });
     batchCount += 1;
+  };
+
+  for (const card of cards) {
+    const estimatedBytes = estimateImportWriteBytes(card, ownerId);
+    if (estimatedBytes > ANKI_IMPORT_TRANSACTION_MAX_BYTES) {
+      throw new ApkgImportError('An imported card exceeds the safe Firestore write size');
+    }
+    if (writes.length >= BATCH_WRITE_LIMIT
+      || requestBytes + estimatedBytes > ANKI_IMPORT_TRANSACTION_MAX_BYTES) {
+      await commitChunk();
+    }
+    writes.push({ card, ref: getDb().collection(COLLECTION).doc() });
+    requestBytes += estimatedBytes;
   }
-  return { atomic, batchCount };
+  await commitChunk();
+  return { atomic: batchCount <= 1, batchCount };
 }
+
 
 /**
  * Imports one base64 .apkg into the library. End-to-end: envelope decode →
  * ZIP/SQLite parse (bounded, validated) → optional deckPath override →
- * deck resolution → chunked atomic writes. Throws ApkgImportError for any
- * client-visible problem (malformed package, over-limit, invalid base64).
+ * deck resolution → chunked owner-scoped card transactions. Each card
+ * transaction re-reads the current owned deck name before writing cards.
+ * Throws ApkgImportError for client-visible package input problems.
  */
-export async function importApkg(input: ImportApkgInput, ownerId?: string): Promise<ImportApkgResponse> {
+export async function importApkg(input: ImportApkgInput, ownerId: string): Promise<ImportApkgResponse> {
   if (typeof input?.package !== 'string' || input.package === '') {
     throw new ApkgImportError('package is required (base64-encoded .apkg)');
   }
@@ -190,8 +220,26 @@ export async function importApkg(input: ImportApkgInput, ownerId?: string): Prom
     }
     parsed = { ...parsed, cards: parsed.cards.map((c) => ({ ...c, deckPath: normalized })) };
   }
-  const overLimit = Math.max(0, parsed.cards.length - ANKI_IMPORT_CARD_LIMIT);
-  const bounded = parsed.cards.slice(0, ANKI_IMPORT_CARD_LIMIT);
+  const overLimit = parsed.skippedOverLimit;
+  const bounded = parsed.cards;
+  // Preflight the complete returned object before deck resolution or writes.
+  // The actual write plan is computed by writeImportedCards; conservatively
+  // budget its maximum possible transaction count and atomic flag here.
+  const emptyResponse: ImportApkgResponse = {
+    cards: [],
+    skippedNotes: parsed.skippedNotes,
+    skippedEmpty: parsed.skippedEmpty,
+    skippedOverLimit: overLimit,
+    atomic: bounded.length === 0,
+    batchCount: bounded.length,
+  };
+  const responseBytes = Buffer.byteLength(JSON.stringify(emptyResponse), 'utf8')
+    + jsonArrayByteLength(bounded) - 2;
+  if (responseBytes > ANKI_MAX_APKG_RESPONSE_BYTES) {
+    throw new ApkgImportError(
+      'Import response exceeds the 32 MB response size limit; reduce the number or size of imported cards',
+    );
+  }
   const write = await writeImportedCards(bounded, ownerId);
   return {
     cards: bounded,
@@ -207,13 +255,17 @@ export async function importApkg(input: ImportApkgInput, ownerId?: string): Prom
 /* Export                                                              */
 /* ------------------------------------------------------------------ */
 
+/** Export encoding consumes its own view; media hydration needs only this
+ * owner-scoped snapshot alongside it. */
+type OwnedExportCard = ExportCard & Pick<FlashcardType, 'id' | 'images'> & { ownerId: string };
+
 /** Maps a card snapshot to the export view (same read defaults as the
  * service's docToFlashcard, minus fields Anki cannot represent). */
-function docToExportCard(doc: FirebaseFirestore.DocumentSnapshot): ExportCard {
+function docToExportCard(doc: FirebaseFirestore.DocumentSnapshot): OwnedExportCard {
   const d = doc.data();
   if (!d) {
     return {
-      id: doc.id, front: '', back: '', deckPath: null, tags: [],
+      id: doc.id, ownerId: '', images: [], front: '', back: '', deckPath: null, tags: [],
       createdAtMs: 0, updatedAtMs: 0, dueMs: 0, state: 0, stability: 0,
       difficulty: 0, reps: 0, lapses: 0, reviewLog: [],
     };
@@ -225,19 +277,24 @@ function docToExportCard(doc: FirebaseFirestore.DocumentSnapshot): ExportCard {
     return 0;
   };
   const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const optionalNum = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
   const numArray = Array.isArray(d.reviewLog)
-    ? (d.reviewLog as Array<Record<string, unknown>>).map((e) => ({
-      rating: num(e.rating), state: num(e.state), reviewMs: ms(e.review), dueMs: ms(e.due),
-      stability: num(e.stability), difficulty: num(e.difficulty), reps: num(e.reps), lapses: num(e.lapses),
-    })).filter((e) => e.reviewMs > 0 || e.rating > 0)
+    ? (d.reviewLog as Array<Record<string, unknown>>).map((e) => {
+      const learningStepsAfter = optionalNum(e.learningStepsAfter);
+      return {
+        rating: num(e.rating), state: num(e.state), reviewMs: ms(e.review), dueMs: ms(e.due),
+        stability: num(e.stability), difficulty: num(e.difficulty), reps: num(e.reps), lapses: num(e.lapses),
+        ...(learningStepsAfter !== undefined ? { learningStepsAfter } : {}),
+      };
+    }).filter((e) => e.reviewMs > 0 || e.rating > 0)
     : [];
+  const learningSteps = optionalNum(d.learningSteps);
   return {
     id: doc.id,
-    ...(typeof d.ownerId === 'string' ? { ownerId: d.ownerId } : {}),
+    ownerId: typeof d.ownerId === 'string' ? d.ownerId : '',
+    images: Array.isArray(d.images) ? d.images as CardImage[] : [],
     front: typeof d.front === 'string' ? d.front : '',
     back: typeof d.back === 'string' ? d.back : '',
-    // The stored `deck` is the deck path (leaf = full path in this product;
-    // import writes full `A::B` paths as the deck name).
     deckPath: typeof d.deck === 'string' && d.deck !== '' ? d.deck : null,
     tags: Array.isArray(d.tags) ? d.tags.filter((t): t is string => typeof t === 'string') : [],
     suspended: d.suspended === true,
@@ -250,6 +307,7 @@ function docToExportCard(doc: FirebaseFirestore.DocumentSnapshot): ExportCard {
     reps: num(d.reps),
     lapses: num(d.lapses),
     ...(d.lastReview !== undefined ? { lastReviewMs: ms(d.lastReview) } : {}),
+    ...(learningSteps !== undefined ? { learningSteps } : {}),
     reviewLog: numArray,
   };
 }
@@ -259,13 +317,13 @@ function docToExportCard(doc: FirebaseFirestore.DocumentSnapshot): ExportCard {
  * until `limit` are collected or the collection is exhausted. Used for
  * whole-library export (with optional in-memory deck filtering).
  */
-async function scanExportCards(limit: number, ownerId?: string): Promise<ExportCard[]> {
-  const out: ExportCard[] = [];
+async function scanExportCards(limit: number, ownerId: string): Promise<OwnedExportCard[]> {
+  const out: OwnedExportCard[] = [];
   let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | null = null;
   for (;;) {
     if (out.length >= limit) break;
     let q: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = getDb().collection(COLLECTION);
-    if (ownerId !== undefined) q = q.where('ownerId', '==', ownerId);
+    q = q.where('ownerId', '==', ownerId);
     q = q.orderBy('createdAt', 'desc')
       .orderBy(FieldPath.documentId());
     if (lastDoc) q = q.startAfter(lastDoc);
@@ -290,10 +348,10 @@ async function scanExportCards(limit: number, ownerId?: string): Promise<ExportC
 async function scanExportCardsByDeck(
   deck: string,
   limit: number,
-  ownerId?: string,
-): Promise<ExportCard[]> {
+  ownerId: string,
+): Promise<OwnedExportCard[]> {
   const seen = new Set<string>();
-  const out: ExportCard[] = [];
+  const out: OwnedExportCard[] = [];
   const collect = (docs: FirebaseFirestore.QueryDocumentSnapshot[]) => {
     for (const doc of docs) {
       if (seen.has(doc.id)) continue;
@@ -303,37 +361,29 @@ async function scanExportCardsByDeck(
     }
   };
 
-  // Pass 1: exact deck-path match (uses the composite index
-  // (ownerId, deck, createdAt DESC) directly — no __name__ tiebreaker
-  // needed because startAfter on a document snapshot is sufficient for
-  // stable pagination within the same deck).
   let q1: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = getDb().collection(COLLECTION);
-  if (ownerId !== undefined) q1 = q1.where('ownerId', '==', ownerId);
-  q1 = q1.where('deck', '==', deck)
+  q1 = q1.where('ownerId', '==', ownerId).where('deck', '==', deck)
     .orderBy('createdAt', 'desc');
   let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | null = null;
   for (;;) {
     if (out.length >= limit) break;
     const base: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = lastDoc ? q1.startAfter(lastDoc) : q1;
-    const snap = await base.limit(SCAN_PAGE).get();
+    const snap: FirebaseFirestore.QuerySnapshot<FirebaseFirestore.DocumentData> = await base.limit(SCAN_PAGE).get();
     if (snap.docs.length === 0) break;
     collect(snap.docs);
     lastDoc = snap.docs[snap.docs.length - 1];
   }
 
-  // Pass 2: leaf-name match (e.g. user passes "Verbs" but stored path is
-  // "Spanish::Verbs"). Only needed when the leaf differs from the full path.
   const leaf = deck.split('::').pop()?.trim();
   if (leaf !== undefined && leaf !== deck && out.length < limit) {
     let q2: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = getDb().collection(COLLECTION);
-    if (ownerId !== undefined) q2 = q2.where('ownerId', '==', ownerId);
-    q2 = q2.where('deck', '==', leaf)
+    q2 = q2.where('ownerId', '==', ownerId).where('deck', '==', leaf)
       .orderBy('createdAt', 'desc');
     lastDoc = null;
     for (;;) {
       if (out.length >= limit) break;
       const base: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = lastDoc ? q2.startAfter(lastDoc) : q2;
-      const snap = await base.limit(SCAN_PAGE).get();
+      const snap: FirebaseFirestore.QuerySnapshot<FirebaseFirestore.DocumentData> = await base.limit(SCAN_PAGE).get();
       if (snap.docs.length === 0) break;
       collect(snap.docs);
       lastDoc = snap.docs[snap.docs.length - 1];
@@ -351,8 +401,9 @@ async function scanExportCardsByDeck(
  */
 export async function selectExportCards(
   input: ExportApkgInput,
-  ownerId?: string,
-): Promise<{ selected: ExportCard[]; filtered: number; total: number }> {
+  ownerId: string,
+): Promise<{ selected: OwnedExportCard[]; filtered: number; total: number }> {
+  if (!ownerId) throw new ApkgExportError('An owner is required for export');
   const deck = typeof input?.deck === 'string' ? input.deck.trim() : undefined;
   const ids = Array.isArray(input.cardIds)
     ? [...new Set(input.cardIds.filter((x): x is string => typeof x === 'string' && x !== ''))]
@@ -364,13 +415,13 @@ export async function selectExportCards(
     if (ids.length > ANKI_EXPORT_CARD_LIMIT) {
       throw new ApkgExportError(`Too many card ids (${ids.length} > ${ANKI_EXPORT_CARD_LIMIT})`);
     }
-    const selected: ExportCard[] = [];
+    const selected: OwnedExportCard[] = [];
     const missing: string[] = [];
     for (const id of ids) {
       const doc = await getDb().collection(COLLECTION).doc(id).get();
       // Owner-scoped export never leaks another tenant's card: an id that is
       // missing OR not owned by the caller is omitted (never exported).
-      if (!doc.exists || (ownerId !== undefined && doc.data()?.ownerId !== ownerId)) { missing.push(id); continue; }
+      if (!doc.exists || doc.data()?.ownerId !== ownerId) { missing.push(id); continue; }
       selected.push(docToExportCard(doc));
     }
     return { selected, filtered: missing.length, total: selected.length + missing.length };
@@ -392,94 +443,191 @@ export async function selectExportCards(
 }
 
 /** Fetches image URLs of a card (best-effort; never throws). */
-async function imageUrlsForCard(cardId: string): Promise<string[]> {
+async function imageUrlsForCard(card: OwnedExportCard, ownerId: string): Promise<string[]> {
   try {
-    const doc = await getDb().collection(COLLECTION).doc(cardId).get();
-    const data = doc.data();
-    if (!data || !Array.isArray(data.images)) return [];
-    const urls: string[] = [];
-    for (const img of data.images as Array<Record<string, unknown>>) {
-      const u = typeof img?.downloadUrl === 'string' && img.downloadUrl !== ''
-        ? img.downloadUrl
-        : (typeof img?.url === 'string' ? img.url : '');
-      if (u !== '') urls.push(u);
-    }
-    return urls;
+    const refreshed = await refreshOwnedCardImageUrls({
+      id: card.id,
+      ownerId: card.ownerId,
+      images: card.images,
+    }, ownerId);
+    return refreshed.images.flatMap((image) => {
+      const url = image.downloadUrl && image.downloadUrl !== '' ? image.downloadUrl : image.url;
+      return url === '' ? [] : [url];
+    });
   } catch {
-    return [];
+    return card.images.flatMap((image) => {
+      const url = image.downloadUrl && image.downloadUrl !== '' ? image.downloadUrl : image.url;
+      return url === '' ? [] : [url];
+    });
   }
 }
 
+function mediaUrlsSharePath(first: string, second: string): boolean {
+  try {
+    const firstUrl = new URL(first);
+    const secondUrl = new URL(second);
+    return firstUrl.origin === secondUrl.origin && firstUrl.pathname === secondUrl.pathname;
+  } catch {
+    return false;
+  }
+}
+
+const ANKI_MEDIA_EXTENSION_BY_MIME: Readonly<Record<string, string>> = {
+  'image/avif': '.avif',
+  'image/bmp': '.bmp',
+  'image/gif': '.gif',
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/svg+xml': '.svg',
+  'image/webp': '.webp',
+};
+
+function safeMediaFileName(url: string, successIndex: number, card: OwnedExportCard): string {
+  let mimeType: string | undefined;
+  for (const image of card.images) {
+    if (image.downloadUrl === url || image.url === url
+      || (image.downloadUrl !== undefined && mediaUrlsSharePath(image.downloadUrl, url))
+      || mediaUrlsSharePath(image.url, url)) {
+      mimeType = image.mimeType?.split(';', 1)[0]?.trim().toLowerCase();
+      break;
+    }
+  }
+  let extension = mimeType && Object.hasOwn(ANKI_MEDIA_EXTENSION_BY_MIME, mimeType)
+    ? ANKI_MEDIA_EXTENSION_BY_MIME[mimeType]
+    : '';
+  if (extension === '') {
+    try {
+      const pathname = new URL(url).pathname;
+      const basename = pathname.slice(pathname.lastIndexOf('/') + 1);
+      const dot = basename.lastIndexOf('.');
+      const suffix = dot > 0 ? basename.slice(dot).toLowerCase() : '';
+      if (/^\.(avif|bmp|gif|jpe?g|png|svg|webp)$/.test(suffix)) extension = suffix;
+    } catch {
+      // Invalid URLs remain subject to safeMediaFetch's typed refusal.
+    }
+  }
+  return `image-${successIndex + 1}${extension}`;
+}
+
+function snapshotImageUrls(card: OwnedExportCard): string[] {
+  return card.images.flatMap((image) => {
+    const url = image.downloadUrl && image.downloadUrl !== '' ? image.downloadUrl : image.url;
+    return url === '' ? [] : [url];
+  });
+}
+
 /**
- * Fetches and validates embeddable media bytes for the export card set.
- * Sequential (bounded concurrency); each image is fetched with a timeout,
- * size-checked, and capped in aggregate. Never throws — failures are
- * reported per-URL in `skipped`.
+ * Fetches owner-projected media sequentially under aggregate byte/deadline
+ * budgets. A failed request consumes its full bounded allowance, conservatively
+ * limiting retries. Once a budget is exhausted, only snapshot URL associations
+ * are used; no further URL signing or fetch is started.
  */
-async function collectExportMedia(cards: ExportCard[]): Promise<{
+async function collectExportMedia(cards: OwnedExportCard[], ownerId: string): Promise<{
   media: ExportedMedia[];
   skipped: Array<{ url: string; reason: string }>;
+  cardMediaRefs: Map<string, string[]>;
 }> {
   const media: ExportedMedia[] = [];
   const skipped: Array<{ url: string; reason: string }> = [];
-  let totalBytes = 0;
-  const seen = new Set<string>();
-  const MAX_FETCH_MS = 8000;
+  const cardMediaRefs = new Map<string, string[]>();
+  const fileNameByUrl = new Map<string, string>();
+  const attempted = new Set<string>();
+  let remainingBytes = ANKI_MAX_TOTAL_MEDIA_BYTES;
+  const deadline = Date.now() + 8000;
+
+  const attach = (cardId: string, fileName: string): void => {
+    const refs = cardMediaRefs.get(cardId) ?? [];
+    if (!refs.includes(fileName)) refs.push(fileName);
+    cardMediaRefs.set(cardId, refs);
+  };
+  const budgetStopReason = (): string | null => {
+    if (media.length >= ANKI_MAX_MEDIA_COUNT) return `media count cap reached (${ANKI_MAX_MEDIA_COUNT})`;
+    if (remainingBytes <= 0) return 'total media byte budget exhausted';
+    if (Date.now() >= deadline) return 'total media time budget exhausted';
+    return null;
+  };
+  const useSnapshotUrls = (card: OwnedExportCard, reason: string): void => {
+    for (const url of snapshotImageUrls(card)) {
+      const existing = fileNameByUrl.get(url);
+      if (existing !== undefined) {
+        attach(card.id, existing);
+      } else if (!attempted.has(url)) {
+        attempted.add(url);
+        skipped.push({ url, reason });
+      }
+    }
+  };
+
   for (const card of cards) {
-    const urls = await imageUrlsForCard(card.id);
+    const snapshotUrls = snapshotImageUrls(card);
+    for (const url of snapshotUrls) {
+      const existing = fileNameByUrl.get(url);
+      if (existing !== undefined) attach(card.id, existing);
+    }
+    const stopReason = budgetStopReason();
+    if (stopReason !== null) {
+      useSnapshotUrls(card, stopReason);
+      continue;
+    }
+    if (snapshotUrls.length === 0 || snapshotUrls.every((url) => fileNameByUrl.has(url))) continue;
+
+    const urls = await imageUrlsForCard(card, ownerId);
     for (const url of urls) {
-      if (seen.has(url)) continue;
-      seen.add(url);
-      // SSRF guard: a card's image URL is user-controlled (attachImage
-      // stores an arbitrary http(s) URL; uploadImage stores a Firebase
-      // Storage signed URL). The fetch is PINNED and redirect-safe:
-      // https-only, every DNS answer validated public before the socket
-      // connects (the connect lookup hands Node only validated addresses —
-      // no check/connect re-resolution race), and redirects are followed
-      // manually with each Location re-validated (a 3xx to a private/
-      // link-local/metadata/loopback target or to plaintext http is
-      // refused). Failures are reported, never fetched.
-      if (media.length >= ANKI_MAX_MEDIA_COUNT) {
-        skipped.push({ url, reason: `media count cap reached (${ANKI_MAX_MEDIA_COUNT})` });
+      const existing = fileNameByUrl.get(url);
+      if (existing !== undefined) {
+        attach(card.id, existing);
         continue;
       }
-      const fileNameRaw = (() => {
-        try {
-          const p = new URL(url);
-          return (p.pathname.split('/').pop() || '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
-        } catch {
-          return '';
-        }
-      })();
-      const fileName = fileNameRaw === '' ? `image-${media.length}` : fileNameRaw;
+      if (attempted.has(url)) continue;
+      attempted.add(url);
+      const fetchStopReason = budgetStopReason();
+      if (fetchStopReason !== null) {
+        skipped.push({ url, reason: fetchStopReason });
+        continue;
+      }
+      const remainingTimeMs = deadline - Date.now();
+      const maxBytes = Math.min(ANKI_MAX_MEDIA_BYTES, remainingBytes);
       const fetched = await safeMediaFetch(url, {
-        maxBytes: ANKI_MAX_MEDIA_BYTES,
-        timeoutMs: MAX_FETCH_MS,
+        maxBytes,
+        timeoutMs: Math.min(8000, remainingTimeMs),
         maxRedirects: 3,
       });
       if (!fetched.ok) {
+        remainingBytes -= maxBytes;
         skipped.push({ url, reason: fetched.reason });
         continue;
       }
       const bytes = fetched.bytes;
       const size = bytes.byteLength;
       if (size === 0) {
+        remainingBytes -= maxBytes;
         skipped.push({ url, reason: 'empty response' });
         continue;
       }
-      if (size > ANKI_MAX_MEDIA_BYTES) {
-        skipped.push({ url, reason: `too large (${size} bytes > ${ANKI_MAX_MEDIA_BYTES})` });
+      if (size > ANKI_MAX_MEDIA_BYTES || size > maxBytes) {
+        remainingBytes -= maxBytes;
+        skipped.push({ url, reason: `too large (${size} bytes > ${maxBytes})` });
         continue;
       }
-      if (totalBytes + size > ANKI_MAX_TOTAL_MEDIA_BYTES) {
-        skipped.push({ url, reason: 'total media cap reached' });
-        continue;
-      }
-      totalBytes += size;
+      remainingBytes -= size;
+      const fileName = safeMediaFileName(url, media.length, card);
+      fileNameByUrl.set(url, fileName);
       media.push({ fileName, data: bytes, sourceUrl: url });
+      attach(card.id, fileName);
     }
   }
-  return { media, skipped };
+  return { media, skipped, cardMediaRefs };
+}
+
+function jsonArrayByteLength(values: readonly unknown[]): number {
+  let bytes = 2;
+  for (let index = 0; index < values.length; index += 1) {
+    if (index > 0) bytes += 1;
+    const encoded = JSON.stringify(values[index]);
+    if (encoded === undefined) throw new TypeError('APKG response contains a non-JSON value');
+    bytes += Buffer.byteLength(encoded, 'utf8');
+  }
+  return bytes;
 }
 
 /**
@@ -489,24 +637,69 @@ async function collectExportMedia(cards: ExportCard[]): Promise<{
  * - no filter: the newest ANKI_EXPORT_CARD_LIMIT cards (older cards are
  *   counted in `filteredCards` — exports never silently truncate).
  */
-export async function exportApkg(input: ExportApkgInput, ownerId?: string): Promise<ExportApkgResponse> {
+export async function exportApkg(input: ExportApkgInput, ownerId: string): Promise<ExportApkgResponse> {
   const { selected, filtered, total } = await selectExportCards(input, ownerId);
   if (selected.length === 0) {
     throw new ApkgExportError('No cards match the export selection');
   }
   const nowMs = Date.now();
-  const collection = await buildCollectionBytes(selected, nowMs);
-  const { media, skipped } = await collectExportMedia(selected);
+  const stepConfig = getFSRSStepConfiguration();
+  const progressByCardId = new Map<string, number>();
+  try {
+    for (const card of selected) {
+      if (card.state === 1 || card.state === 3) {
+        progressByCardId.set(card.id, reconstructLearningSteps({
+          state: card.state,
+          learningSteps: card.learningSteps,
+          reviewLog: card.reviewLog,
+        }));
+      }
+    }
+  } catch (error) {
+    if (error instanceof LearningProgressUnavailableError) throw new ApkgExportError(error.message);
+    throw error;
+  }
+  const schedulerSteps: ExportSchedulerSteps = { ...stepConfig, progressByCardId };
+  const { media, skipped, cardMediaRefs } = await collectExportMedia(selected, ownerId);
+  let collection: Uint8Array;
+  try {
+    collection = await buildCollectionBytes(selected, nowMs, cardMediaRefs, schedulerSteps);
+  } catch (error) {
+    if (error instanceof ApkgFormatError) throw new ApkgExportError(error.message);
+    throw error;
+  }
   const pkg = await assembleApkgBytes(collection, media);
   const decks = [...new Set(selected.map((c) => c.deckPath ?? null))];
   const schedulingExported = selected.some((c) => c.reps > 0 || c.reviewLog.length > 0);
+  const mediaSummary = media.map((m) => ({ fileName: m.fileName, sourceUrl: m.sourceUrl }));
+  const responseBase64Length = 4 * Math.ceil(pkg.byteLength / 3);
+  const emptyResponse = {
+    package: '',
+    cardCount: selected.length,
+    filteredCards: filtered,
+    decks: [],
+    media: [],
+    mediaSkipped: [],
+    schedulingExported,
+  };
+  const responseBytes = Buffer.byteLength(JSON.stringify(emptyResponse), 'utf8')
+    + responseBase64Length
+    + jsonArrayByteLength(decks) - 2
+    + jsonArrayByteLength(mediaSummary) - 2
+    + jsonArrayByteLength(skipped) - 2;
+  if (responseBytes > ANKI_MAX_APKG_RESPONSE_BYTES) {
+    throw new ApkgExportError(
+      'Export response exceeds the 32 MB response size limit; reduce selected cards or image references',
+    );
+  }
   void total;
+  const packageBase64 = Buffer.from(pkg.buffer as ArrayBuffer, pkg.byteOffset, pkg.byteLength).toString('base64');
   return {
-    package: Buffer.from(pkg).toString('base64'),
+    package: packageBase64,
     cardCount: selected.length,
     filteredCards: filtered,
     decks,
-    media: media.map((m) => ({ fileName: m.fileName, sourceUrl: m.sourceUrl })),
+    media: mediaSummary,
     mediaSkipped: skipped,
     schedulingExported,
   };

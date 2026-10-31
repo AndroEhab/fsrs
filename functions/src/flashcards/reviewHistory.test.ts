@@ -8,7 +8,7 @@
  */
 
 import {
-  buildEventBody, trimEmbeddedReviewLog, legacySessionEventId,
+  buildEventBody, trimEmbeddedReviewLog, sessionEventId,
   cardFromSnapshot, frontSnapshot,
 } from './reviewHistory';
 import {
@@ -127,7 +127,10 @@ describe('buildEventBody (corrected schema)', () => {
     const session = buildEventBody(baseContext({ sessionId: 'sess-1', requestId: 'req-abc' }) as never);
     expect(session.sessionId).toBe('sess-1');
     expect(session.requestId).toBe('req-abc');
-    expect(legacySessionEventId('req-abc')).toBe('evt-req-abc');
+    expect(sessionEventId('owner-1', 'session-a', 'req-abc')).toMatch(/^evt-[a-f0-9]{64}$/);
+    expect(sessionEventId('owner-1', 'session-a', 'req-abc')).toBe(sessionEventId('owner-1', 'session-a', 'req-abc'));
+    expect(sessionEventId('owner-1', 'session-a', 'req-abc')).not.toBe(sessionEventId('owner-2', 'session-a', 'req-abc'));
+    expect(sessionEventId('owner-1', 'session-a', 'req-abc')).not.toBe(sessionEventId('owner-1', 'session-b', 'req-abc'));
     const direct = buildEventBody(baseContext() as never);
     expect(direct.sessionId).toBeUndefined();
     expect(direct.requestId).toBeUndefined();

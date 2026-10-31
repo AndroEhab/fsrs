@@ -2,12 +2,10 @@
  * Pure helpers for the rich flashcard query (`searchCards`).
  *
  * Why a dedicated module: the rich query needs deterministic pagination that
- * survives data changes between pages (cursor = last card id + its sort key
- * + a fingerprint of the ACTIVE FILTERS), and cross-field validation rules
- * (mutually exclusive tag modes; token/filter pairing). All of that logic is
- * shared between the query validator (`validators.ts`), the query service
- * (`service.ts`), and their tests — so it lives here, dependency-free except
- * for `types.ts`.
+ * survives data changes between pages (cursor = last card id + exact sort key
+ * + canonical filter fingerprint), and cross-field validation rules (tag modes
+ * are mutually exclusive; tokens must pair with their filters). Filter and
+ * token helpers are shared with validators and the query service.
  *
  * Firestore cannot express the full filter set natively (case-insensitive
  * substring search, ALL/NOT tag semantics, review-state predicates,
@@ -17,6 +15,7 @@
  * with this module. That is the documented "safe in-memory filtering" path.
  */
 
+import { canonicalScopeFingerprint, isValidFirestoreDocumentId, isValidFirestoreTimestamp } from './documentPageTokens';
 import { SearchCardsQuery, SearchReviewFilter } from './types';
 
 /**
@@ -47,6 +46,12 @@ export interface SearchFilters {
  * `Flashcard` objects (Timestamp fields expose `toMillis()`) and lightweight
  * test fixtures can be matched without importing Firestore.
  */
+export interface SearchTimestamp {
+  toMillis(): number;
+  seconds?: number;
+  nanoseconds?: number;
+}
+
 export interface SearchableCard {
   id: string;
   front: string;
@@ -56,41 +61,57 @@ export interface SearchableCard {
   tags: string[];
   topic?: string;
   suspended?: boolean;
-  createdAt: { toMillis(): number } | number;
-  updatedAt: { toMillis(): number } | number;
-  due: { toMillis(): number } | number;
+  createdAt: SearchTimestamp | number;
+  updatedAt: SearchTimestamp | number;
+  due: SearchTimestamp | number;
   state?: number;
   reps?: number;
 }
 
 /**
- * Parses an accepted date bound.
- * - YYYY-MM-DD → UTC midnight of that day (`endOfDay` → the LAST millisecond
- *   of that UTC day, so an upper bound like `createdTo: 2026-08-31` includes
- *   the whole day).
- * - Full ISO 8601 date-times pass through Date.parse unchanged.
+ * Parses a documented date bound as an ISO date-time or YYYY-MM-DD.
+ * Date-only values are UTC; upper date-only bounds mean the last millisecond
+ * of that UTC day. Date-time values retain Date.parse's millisecond precision.
  */
 export function parseSearchBound(value: string | undefined, endOfDay = false): number | undefined {
   if (value === undefined) return undefined;
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (m) {
-    const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
-    const day = Date.UTC(y, mo - 1, d);
-    // Reject invalid calendar dates (e.g. 2026-02-31) that Date.UTC would
-    // silently normalize.
-    const check = new Date(day);
-    if (Number.isNaN(day) || check.getUTCFullYear() !== y || check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d) {
+  const date = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  let ms: number;
+  if (date) {
+    const dayStart = utcDayStart(Number(date[1]), Number(date[2]), Number(date[3]));
+    if (dayStart === undefined) return undefined;
+    ms = endOfDay ? dayStart + 86_400_000 - 1 : dayStart;
+  } else {
+    const dateTime = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$/.exec(value);
+    if (!dateTime || utcDayStart(Number(dateTime[1]), Number(dateTime[2]), Number(dateTime[3])) === undefined) {
       return undefined;
     }
-    return endOfDay ? day + 86_400_000 - 1 : day;
+    ms = Date.parse(value);
+    if (Number.isNaN(ms)) return undefined;
   }
-  const ms = Date.parse(value);
-  return Number.isNaN(ms) ? undefined : ms;
+  const seconds = Math.floor(ms / 1000);
+  const nanoseconds = (ms - seconds * 1000) * 1_000_000;
+  return isValidFirestoreTimestamp(seconds, nanoseconds) ? ms : undefined;
+}
+
+function utcDayStart(year: number, month: number, day: number): number | undefined {
+  if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31) return undefined;
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(0, 0, 0, 0);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    return undefined;
+  }
+  return date.getTime();
 }
 
 /** Normalizes a validated query into its canonical filter form. */
 export function normalizeSearchFilters(query: SearchCardsQuery): SearchFilters {
   const uniqSorted = (xs: string[] | undefined): string[] => [...new Set(xs ?? [])].sort();
+  const createdFromMs = parseSearchBound(query.createdFrom);
+  const createdToMs = parseSearchBound(query.createdTo, true);
+  const updatedFromMs = parseSearchBound(query.updatedFrom);
+  const updatedToMs = parseSearchBound(query.updatedTo, true);
   return {
     ...(query.search !== undefined && query.search.trim() !== '' ? { search: query.search.trim().toLowerCase() } : {}),
     tagsAny: uniqSorted(query.tagsAny),
@@ -100,16 +121,16 @@ export function normalizeSearchFilters(query: SearchCardsQuery): SearchFilters {
     decks: uniqSorted(query.decks),
     deckNames: uniqSorted(query.deckNames),
     ...(query.suspended !== undefined ? { suspended: query.suspended } : {}),
-    ...(parseSearchBound(query.createdFrom) !== undefined ? { createdFromMs: parseSearchBound(query.createdFrom) } : {}),
-    ...(parseSearchBound(query.createdTo, true) !== undefined ? { createdToMs: parseSearchBound(query.createdTo, true) } : {}),
-    ...(parseSearchBound(query.updatedFrom) !== undefined ? { updatedFromMs: parseSearchBound(query.updatedFrom) } : {}),
-    ...(parseSearchBound(query.updatedTo, true) !== undefined ? { updatedToMs: parseSearchBound(query.updatedTo, true) } : {}),
+    ...(createdFromMs !== undefined ? { createdFromMs } : {}),
+    ...(createdToMs !== undefined ? { createdToMs } : {}),
+    ...(updatedFromMs !== undefined ? { updatedFromMs } : {}),
+    ...(updatedToMs !== undefined ? { updatedToMs } : {}),
   };
 }
 
-/** Canonical JSON key of a filter set — two sets are "the same" iff keys match. */
+/** Fixed-size SHA-256 fingerprint of the canonical active filter set. */
 export function searchFiltersKey(filters: SearchFilters): string {
-  return JSON.stringify({
+  return canonicalScopeFingerprint({
     search: filters.search ?? null,
     tagsAny: filters.tagsAny,
     tagsAll: filters.tagsAll,
@@ -134,28 +155,49 @@ export function searchFiltersEqual(a: SearchFilters, b: SearchFilters): boolean 
 export interface SearchTokenPayload {
   /** Canonical filter fingerprint the token was minted for. */
   filtersKey: string;
-  /** Id of the last card of the previous page (resume-after point). */
+  /** Owner binding keeps cursors private to their authenticated library. */
+  ownerKey: string;
+  kind: 'searchCards';
   lastId: string;
-  /** createdAt (ms, UTC) of the last card of the previous page (sort key). */
-  lastCreatedAtMs: number;
+  lastCreatedAtSeconds: number;
+  lastCreatedAtNanoseconds: number;
 }
 
-/** Encodes a cursor token: base64url(JSON{ filtersKey, lastId, lastCreatedAtMs }). */
-export function makeSearchPageToken(filters: SearchFilters, lastId: string, lastCreatedAtMs: number): string {
+function searchOwnerKey(ownerId: string): string {
+  return canonicalScopeFingerprint(['searchCards', ownerId]);
+}
+
+/** Encodes a bounded base64url cursor with canonical filter and exact sort keys. */
+export function makeSearchPageToken(
+  filters: SearchFilters,
+  ownerId: string,
+  lastId: string,
+  lastCreatedAtSeconds: number,
+  lastCreatedAtNanoseconds: number,
+): string {
   const payload: SearchTokenPayload = {
     filtersKey: searchFiltersKey(filters),
+    ownerKey: searchOwnerKey(ownerId),
+    kind: 'searchCards',
     lastId,
-    lastCreatedAtMs,
+    lastCreatedAtSeconds,
+    lastCreatedAtNanoseconds,
   };
   return Buffer.from(JSON.stringify(payload)).toString('base64url');
 }
 
-/** Decodes a cursor token; returns null when malformed. */
+/** Decodes a bounded cursor token; returns null when malformed. */
 export function readSearchPageToken(token: string): SearchTokenPayload | null {
+  if (token.length > 3000) return null;
   try {
-    const raw = Buffer.from(token, 'base64url').toString('utf8');
-    const parsed = JSON.parse(raw) as Partial<SearchTokenPayload>;
-    if (typeof parsed.filtersKey !== 'string' || typeof parsed.lastId !== 'string' || typeof parsed.lastCreatedAtMs !== 'number') {
+    const parsed = JSON.parse(Buffer.from(token, 'base64url').toString('utf8')) as Partial<SearchTokenPayload>;
+    if (
+      typeof parsed.filtersKey !== 'string'
+      || typeof parsed.ownerKey !== 'string'
+      || parsed.kind !== 'searchCards'
+      || !isValidFirestoreDocumentId(parsed.lastId)
+      || !isValidFirestoreTimestamp(parsed.lastCreatedAtSeconds, parsed.lastCreatedAtNanoseconds)
+    ) {
       return null;
     }
     return parsed as SearchTokenPayload;
@@ -164,8 +206,17 @@ export function readSearchPageToken(token: string): SearchTokenPayload | null {
   }
 }
 
-function msOf(value: { toMillis(): number } | number): number {
+function msOf(value: SearchTimestamp | number): number {
   return typeof value === 'number' ? value : value.toMillis();
+}
+/** Date filters are millisecond-precision; avoid fractional/rounded toMillis values. */
+function dateBoundMsOf(value: SearchTimestamp | number): number {
+  if (typeof value === 'number') return Math.floor(value);
+  if (typeof value.seconds === 'number' && Number.isSafeInteger(value.seconds)
+      && typeof value.nanoseconds === 'number' && Number.isInteger(value.nanoseconds)) {
+    return value.seconds * 1000 + Math.floor(value.nanoseconds / 1_000_000);
+  }
+  return Math.floor(value.toMillis());
 }
 
 /**
@@ -228,8 +279,8 @@ export function cardMatchesFilters(card: SearchableCard, filters: SearchFilters,
   if (filters.suspended === false && card.suspended === true) return false;
 
   // Date bounds (inclusive).
-  const createdMs = msOf(card.createdAt);
-  const updatedMs = msOf(card.updatedAt);
+  const createdMs = dateBoundMsOf(card.createdAt);
+  const updatedMs = dateBoundMsOf(card.updatedAt);
   if (filters.createdFromMs !== undefined && createdMs < filters.createdFromMs) return false;
   if (filters.createdToMs !== undefined && createdMs > filters.createdToMs) return false;
   if (filters.updatedFromMs !== undefined && updatedMs < filters.updatedFromMs) return false;
@@ -238,25 +289,3 @@ export function cardMatchesFilters(card: SearchableCard, filters: SearchFilters,
   return true;
 }
 
-/**
- * Deterministic result order: createdAt DESCENDING, ties by card id
- * ASCENDING — the SAME total order Firestore applies natively when a query
- * is `orderBy('createdAt', 'desc')` (document id is Firestore's implicit
- * secondary sort key, ascending). The service adds an explicit
- * `orderBy(FieldPath.documentId())` so Firestore cursors (`startAfter`) skip
- * exactly the cards the in-memory matcher and the page token agree on — no
- * same-timestamp page can skip or duplicate a card.
- */
-export function compareCardsDesc(a: SearchableCard, b: SearchableCard): number {
-  const da = msOf(a.createdAt);
-  const db = msOf(b.createdAt);
-  if (da !== db) return db - da;
-  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-}
-
-/** True when the card sorts strictly AFTER the cursor (createdAt desc, id asc). */
-export function cardAfterCursor(card: SearchableCard, lastId: string, lastCreatedAtMs: number): boolean {
-  const createdMs = msOf(card.createdAt);
-  if (createdMs !== lastCreatedAtMs) return createdMs < lastCreatedAtMs;
-  return card.id > lastId;
-}

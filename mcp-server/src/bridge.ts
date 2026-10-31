@@ -26,10 +26,9 @@ export interface BridgeOptions {
   fetchFn?: typeof fetch;
   /**
    * Request-scoped verified Auth0 Bearer token, forwarded verbatim to the
-   * backend as the `Authorization` header on every call this bridge makes.
-   * Set per request (see `scoped()`) — NEVER stored globally or shared
-   * across requests. When absent (stdio/local emulator or the public
-   * /health route) no Authorization header is sent.
+   * backend as the `Authorization` header for one caller only. Never stored
+   * globally/shared across per-user HTTP requests. In trusted static/stdio
+   * mode this may instead be the explicitly configured process-level backend
    */
   bearerToken?: string;
 }
@@ -102,11 +101,15 @@ export class FirebaseBridge {
     });
   }
 
-  private buildUrl(path: string, query?: Record<string, string | undefined>): string {
+  private buildUrl(path: string, query?: Record<string, string | string[] | undefined>): string {
     const url = new URL(`${this.baseUrl}${path}`);
     if (query) {
       for (const [key, value] of Object.entries(query)) {
-        if (value !== undefined && value !== '') url.searchParams.set(key, value);
+        if (Array.isArray(value)) {
+          for (const item of value) url.searchParams.append(key, item);
+        } else if (value !== undefined && value !== '') {
+          url.searchParams.set(key, value);
+        }
       }
     }
     return url.toString();
@@ -123,7 +126,7 @@ export class FirebaseBridge {
   }
 
   private async request<T>(method: string, path: string, opts: {
-    query?: Record<string, string | undefined>;
+    query?: Record<string, string | string[] | undefined>;
     body?: unknown;
     /** Override the default fetch timeout for this request (ms). */
     timeoutMs?: number;
@@ -140,8 +143,10 @@ export class FirebaseBridge {
     }
 
     let res: Response;
+    let text: string;
     try {
       res = await this.fetchFn(url, init);
+      text = await res.text();
     } catch (err) {
       if (err instanceof Error && err.name === 'TimeoutError') {
         throw new FirebaseBridgeError('The flashcard service timed out. Try again.', 0, { timeout: true });
@@ -153,7 +158,6 @@ export class FirebaseBridge {
       );
     }
 
-    const text = await res.text();
     let data: unknown = null;
     if (text) {
       try {
@@ -162,7 +166,6 @@ export class FirebaseBridge {
         data = text;
       }
     }
-
     if (!res.ok) {
       const message = typeof data === 'object' && data !== null && 'error' in data && typeof (data as { error?: unknown }).error === 'string'
         ? (data as { error: string }).error
@@ -223,18 +226,17 @@ export class FirebaseBridge {
     });
   }
 
-  /** GET /searchCardsHandler — rich query. Arrays are comma-joined. */
+  /** GET /searchCardsHandler — rich query. Filter arrays use repeated query parameters. */
   async searchCards(query: SearchCardsQuery = {}): Promise<SearchCardsResponse> {
-    const join = (xs: string[] | undefined): string | undefined => (xs && xs.length > 0 ? xs.join(',') : undefined);
     return this.request<SearchCardsResponse>('GET', '/searchCardsHandler', {
       query: {
         search: query.search,
-        tagsAny: join(query.tagsAny),
-        tagsAll: join(query.tagsAll),
-        tagsNot: join(query.tagsNot),
+        tagsAny: query.tagsAny,
+        tagsAll: query.tagsAll,
+        tagsNot: query.tagsNot,
         review: query.review,
-        decks: join(query.decks),
-        deckNames: join(query.deckNames),
+        decks: query.decks,
+        deckNames: query.deckNames,
         suspended: query.suspended === undefined ? undefined : String(query.suspended),
         createdFrom: query.createdFrom,
         createdTo: query.createdTo,
@@ -565,7 +567,7 @@ export const searchCardsQuerySchema = z.object({
   /** Stable deck ids, ANY-of (unions with deckNames within the deck family). */
   decks: z.array(z.string().min(1).max(100)).max(20).optional(),
   /** Legacy deck names, ANY-of. */
-  deckNames: z.array(z.string().min(1).max(100)).max(20).optional(),
+  deckNames: z.array(z.string().min(1).max(300)).max(20).optional(),
   /** true = suspended only, false = active only; absent = both. */
   suspended: z.boolean().optional(),
   /** Inclusive lower bound on createdAt (ISO 8601 or YYYY-MM-DD). */
@@ -659,6 +661,7 @@ export const reviewLogItemSchema = z.object({
   difficulty: z.number(),
   reps: z.number(),
   lapses: z.number(),
+  learningStepsAfter: z.number().optional(),
 });
 export type ReviewLogItem = z.infer<typeof reviewLogItemSchema>;
 
@@ -702,6 +705,7 @@ export const flashcardSchema = z.object({
   difficulty: z.number().optional(),
   reps: z.number().optional(),
   lapses: z.number().optional(),
+  learningSteps: z.number().optional(),
   lastReview: z.unknown().optional(),
   reviewLog: z.array(reviewLogItemSchema).optional(),
   /** Image attachments (external URL refs and cloud upload metadata; bounded by MAX_CARD_IMAGES=5). */
@@ -1032,14 +1036,14 @@ export const sessionRatingCountsSchema = z.object({
   good: z.number(),
   easy: z.number(),
   /** The same counters keyed by FSRS rating number (1..4). */
-  ratingCounts: z.record(z.number()),
+  ratingCounts: z.record(z.string(), z.number()),
 });
 export type SessionRatingCounts = z.infer<typeof sessionRatingCountsSchema>;
 
 export const reviewSessionSchema = z.object({
   id: z.string(),
-  /** The API key name that started the session. */
-  apiKeyName: z.string(),
+  /** Authenticated owner id; optional only for quarantined ownerless legacy roots. */
+  ownerId: z.string().optional(),
   /** Lifecycle status: active | completed | ended | failed (build failed / not reviewable). */
   status: z.union([z.literal('active'), z.literal('completed'), z.literal('ended'), z.literal('failed')]),
   /** Session mode; currently always 'spaced_repetition'. */
@@ -1269,6 +1273,8 @@ export interface MigrateReviewEventsInput {
 export const ANKI_MAX_APKG_BYTES = 20 * 1024 * 1024;
 /** Import package base64 string cap (≈ decoded cap × 4/3 + slack). */
 export const ANKI_IMPORT_PACKAGE_MAX = Math.ceil((ANKI_MAX_APKG_BYTES * 4) / 3) + 8;
+/** HTTP JSON-RPC body bound covers the largest declared tool input plus framing. */
+export const MCP_HTTP_MAX_REQUEST_BODY_SIZE = ANKI_IMPORT_PACKAGE_MAX + 4096;
 /** Card cap per import/export (mirrors ANKI_IMPORT_CARD_LIMIT). */
 export const ANKI_CARD_LIMIT = 1000;
 

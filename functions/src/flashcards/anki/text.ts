@@ -15,13 +15,23 @@
  */
 import { ANKI_TEXT_MAX } from './types';
 
-const BLOCK_TAG_RE = /<\s*\/?\s*(br|div|p|li|tr|h1|h2|h3|h4|h5|h6)\b[^>]*>/gi;
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  nbsp: ' ', copy: '©', reg: '®', trade: '™', hellip: '…', mdash: '—', ndash: '–',
+  lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', bull: '•', deg: '°', times: '×',
+  divide: '÷', plusmn: '±', frac12: '½', frac14: '¼', frac34: '¾', micro: 'µ',
+  para: '¶', sect: '§', middot: '·', laquo: '«', raquo: '»', eacute: 'é', egrave: 'è',
+  agrave: 'à', ugrave: 'ù', oacute: 'ó', ograve: 'ò', iacute: 'í', igrave: 'ì',
+  aacute: 'á', uacute: 'ú', ccedil: 'ç', ntilde: 'ñ', szlig: 'ß', yacute: 'ý',
+  uuml: 'ü', ouml: 'ö', auml: 'ä', euml: 'ë', iuml: 'ï', aring: 'å', aelig: 'æ',
+  oslash: 'ø', eth: 'ð', thorn: 'þ', iexcl: '¡', iquest: '¿', shy: '',
+};
 
-/** Whitespace runs → single space; newline runs → single newline. Adjacent
- * block tags (`</div><div>`) collapse to one line break. */
+/** Whitespace runs → single space; newline runs → single newline. */
 function collapseSpaces(value: string): string {
   return value.replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{2,}/g, '\n');
 }
+
 
 /**
  * Converts an Anki field (HTML) to this product's plain-text form.
@@ -31,19 +41,57 @@ function collapseSpaces(value: string): string {
  * - Text is trimmed; interior whitespace collapses (lines keep ≤1 blank).
  */
 export function ankiHtmlToPlainText(html: string): string {
-  if (html === "") return "";
-  // 1. Normalize block tags to a newline token. <br> may be <br>, <br/>,
-  //    <br />; div/p boundaries always close. Lists: each <li> starts on
-  //    its own line; nested content follows inline.
-  let out = html.replace(/\r\n?/g, "\n").replace(BLOCK_TAG_RE, "\n");
-  // 2. Drop every remaining well-formed tag; keep its inner content.
-  //    Escaped markup (&lt;b&gt;) is NOT a tag and survives this pass.
-  out = out.replace(/<\/?[a-zA-Z][a-zA-Z0-9]*[^>]*>/g, "");
-  // 3. Decode entities LAST so literal escaped text (&lt;, &amp;) becomes
-  //    real characters (<, &) and cannot be mistaken for markup.
-  out = decodeHtmlEntities(out);
-  // 4. Collapse spaces/newlines deterministically.
-  return collapseSpaces(out).trim();
+  if (html === '') return '';
+  const out: string[] = [];
+  const normalized = html;
+  let index = 0;
+  let textStart = 0;
+  while (index < normalized.length) {
+    if (normalized[index] === '\r') {
+      if (index > textStart) out.push(normalized.slice(textStart, index));
+      out.push('\n');
+      index += normalized[index + 1] === '\n' ? 2 : 1;
+      textStart = index;
+      continue;
+    }
+    if (normalized[index] !== '<') { index += 1; continue; }
+    let cursor = index + 1;
+    while (cursor < normalized.length && /\s/.test(normalized[cursor])) cursor += 1;
+    if (cursor < normalized.length && normalized[cursor] === '/') cursor += 1;
+    while (cursor < normalized.length && /\s/.test(normalized[cursor])) cursor += 1;
+    if (cursor >= normalized.length || !/[a-z]/i.test(normalized[cursor])) { index += 1; continue; }
+    const nameStart = cursor;
+    cursor += 1;
+    while (cursor < normalized.length && /[a-z0-9]/i.test(normalized[cursor])) cursor += 1;
+    let end = cursor;
+    let quote: '"' | "'" | null = null;
+    while (end < normalized.length) {
+      const character = normalized[end];
+      if (quote !== null) {
+        if (character === quote) quote = null;
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === '>') {
+        break;
+      }
+      end += 1;
+    }
+    if (end === normalized.length) {
+      out.push(normalized.slice(textStart));
+      textStart = end;
+      break;
+    }
+    if (index > textStart) out.push(normalized.slice(textStart, index));
+    const name = normalized.slice(nameStart, cursor).toLowerCase();
+    if (name === 'br' || name === 'div' || name === 'p' || name === 'li' || name === 'tr'
+      || name === 'h1' || name === 'h2' || name === 'h3' || name === 'h4' || name === 'h5' || name === 'h6') {
+      out.push('\n');
+    }
+    index = end + 1;
+    textStart = index;
+  }
+  if (textStart < normalized.length) out.push(normalized.slice(textStart));
+  return collapseSpaces(decodeHtmlEntities(out.join(''))).trim();
 }
 
 /**
@@ -52,43 +100,28 @@ export function ankiHtmlToPlainText(html: string): string {
  * the generic numeric/known-name table below; unknown entities stay literal.
  */
 export function decodeHtmlEntities(value: string): string {
-  const NAMED: Record<string, string> = {
-    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
-    nbsp: ' ', copy: '©', reg: '®', trade: '™', hellip: '…', mdash: '—', ndash: '–',
-    lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', bull: '•', deg: '°', times: '×',
-    divide: '÷', plusmn: '±', frac12: '½', frac14: '¼', frac34: '¾', micro: 'µ',
-    para: '¶', sect: '§', middot: '·', laquo: '«', raquo: '»', eacute: 'é', egrave: 'è',
-    agrave: 'à', ugrave: 'ù', oacute: 'ó', ograve: 'ò', iacute: 'í', igrave: 'ì',
-    aacute: 'á', uacute: 'ú', ccedil: 'ç', ntilde: 'ñ', szlig: 'ß', yacute: 'ý',
-    uuml: 'ü', ouml: 'ö', auml: 'ä', euml: 'ë', iuml: 'ï', aring: 'å', aelig: 'æ',
-    oslash: 'ø', eth: 'ð', thorn: 'þ', iexcl: '¡', iquest: '¿', shy: '',
-  };
-  return value.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (whole, body: string) => {
+  return value.replace(/&(#(?:[xX][0-9a-fA-F]+|[0-9]+)|[a-zA-Z][a-zA-Z0-9]*);/g, (whole, body: string) => {
     if (body[0] === '#') {
-      const code = body[1] === 'x' || body[1] === 'X'
-        ? Number.parseInt(body.slice(2), 16)
-        : Number.parseInt(body.slice(1), 10);
-      if (Number.isNaN(code) || code < 0 || code > 0x10ffff) return whole;
-      try {
-        return String.fromCodePoint(code);
-      } catch {
-        return whole;
-      }
+      const hexadecimal = body[1] === 'x' || body[1] === 'X';
+      const code = Number.parseInt(body.slice(hexadecimal ? 2 : 1), hexadecimal ? 16 : 10);
+      if (!Number.isSafeInteger(code) || code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return whole;
+      return String.fromCodePoint(code);
     }
-    const named = NAMED[body];
-    return named !== undefined ? named : whole;
+    if (!Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, body)) return whole;
+    return NAMED_ENTITIES[body];
   });
 }
 
 /**
- * Escapes text for inclusion as an Anki field (HTML). Entities first, then
- * angle brackets, so the result is safe inside Anki's HTML fields.
+ * Escapes text for inclusion as an Anki HTML field. Ampersands are escaped
+ * first, then tag delimiters, then the literal U+001F `flds` separator.
  */
 export function escapeHtmlText(value: string): string {
   return value
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replaceAll('\x1f', '&#31;');
 }
 
 /**
@@ -110,7 +143,18 @@ export function plainTextToAnkiHtml(value: string, clozeOrd?: number): string {
   return escaped.replace(/\n/g, '<br>');
 }
 
-/** The Anki cloze-deletion marker in a card's stored text. */
+export function splitAnkiTags(tagsField: string, maxTags = Number.POSITIVE_INFINITY): string[] {
+  const tags: string[] = [];
+  let index = 0;
+  while (index < tagsField.length && tags.length < maxTags) {
+    while (index < tagsField.length && /\s/.test(tagsField[index])) index += 1;
+    if (index >= tagsField.length) break;
+    const start = index;
+    while (index < tagsField.length && !/\s/.test(tagsField[index])) index += 1;
+    tags.push(tagsField.slice(start, index));
+  }
+  return tags;
+}
 const CLOZE_MARKER_RE = /\[([^[\]]+)\]/;
 
 /**
@@ -123,18 +167,6 @@ export function isClozeFront(front: string): boolean {
   return CLOZE_MARKER_RE.test(front);
 }
 
-/**
- * A deterministic hash (FNV-1a over UTF-8) used to derive stable, safe
- * identifiers (deck ids, note guids) from names — never for security.
- */
-export function stableHash(value: string): number {
-  let hash = 0x811c9dc5;
-  for (const byte of Buffer.from(value, 'utf8')) {
-    hash ^= byte;
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
 
 /** Normalizes a tag (trim, collapse spaces) and length-validates it. */
 export function normalizeTag(tag: string, maxLength: number): string | null {
@@ -144,10 +176,6 @@ export function normalizeTag(tag: string, maxLength: number): string | null {
   return t;
 }
 
-/** Splits an Anki tag string (`" tag1 tag2 "`) into trimmed tags. */
-export function splitAnkiTags(tagsField: string): string[] {
-  return tagsField.split(/\s+/).map((t) => t.trim()).filter((t) => t !== '');
-}
 
 /** Normalizes a plain-text field for storage: trims and collapses lines. */
 export function normalizePlainText(value: string): string {
